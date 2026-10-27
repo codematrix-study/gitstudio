@@ -590,6 +590,9 @@ class App {
    *  enable rule, which used to gate on the message text alone and offered a
    *  live Commit button over a clean tree. */
   private changesHaveWork = false;
+  /** Whether anything is STAGED. A commit takes only staged files, so this —
+   *  not `changesHaveWork` — is what the Commit buttons wait for. */
+  private changesHaveStaged = false;
   private syncCommitEnabled: (() => void) | undefined;
   /** True while a fetch/pull/push is in flight — locks the sync trigger. */
   private syncing = false;
@@ -7111,7 +7114,9 @@ class App {
       // accent control that could only ever produce git's "nothing to commit",
       // because it gated on the text alone. Amend is the exception and a real
       // one: rewording the last commit needs no changes at all.
-      const somethingToCommit = amend || this.changesHaveWork;
+      // Only STAGED files are committed, so unstaged work alone is not
+      // something to commit.
+      const somethingToCommit = amend || this.changesHaveStaged;
       const ready = written && somethingToCommit;
       for (const b of [commitBtn, pushBtn]) {
         b.toggleAttribute("disabled", !ready);
@@ -7119,7 +7124,9 @@ class App {
           ? l10n.t("Write a commit message first")
           : somethingToCommit
             ? ""
-            : l10n.t("Nothing to commit — the working tree is clean");
+            : this.changesHaveWork
+              ? l10n.t("Nothing is staged. Stage the files you want to commit first.")
+              : l10n.t("Nothing to commit — the working tree is clean");
       }
     };
     this.syncCommitEnabled = syncCommitEnabled;
@@ -7134,27 +7141,6 @@ class App {
     const tTitle = el("span", "dc-toolbar-title");
     tTitle.textContent = l10n.t("Changes");
     const tSpacer = el("div", "topbar-spacer");
-    // Switch how this view presents staging (issue #16): the staged/unstaged
-    // split, or one list with a tick per file. A preference, not a migration —
-    // the split stays the default because the separation is clearer to read.
-    const modelBtn = el("button", "mini-btn dc-model");
-    const syncModelBtn = (): void => {
-      const checks = this.stagingModel() === "checkboxes";
-      modelBtn.replaceChildren(
-        glyph(checks ? "list-selection" : "list-flat"),
-        span(checks ? l10n.t("Checkboxes") : l10n.t("Staged / Unstaged")),
-      );
-      modelBtn.title = checks
-        ? l10n.t("Showing one list with a tick per file — click for the staged/unstaged split")
-        : l10n.t("Showing the staged/unstaged split — click for one list with checkboxes");
-    };
-    syncModelBtn();
-    modelBtn.addEventListener("click", () => {
-      this.stagingModelPref = this.stagingModel() === "checkboxes" ? "split" : "checkboxes";
-      this.persist();
-      syncModelBtn();
-      void this.showChangesView();
-    });
 
     const stageAllBtn = el("button", "mini-btn");
     stageAllBtn.append(glyph("check-all"), span(l10n.t("Stage all")));
@@ -7285,7 +7271,7 @@ class App {
       void this.stashPaths(stashScope).then(() => this.clearSelection(lists, selBar));
     });
 
-    toolbar.append(tTitle, tSpacer, modelBtn, reviewBtn, createPrBtn, stageLinesBtn, wsBtn, stashBtn, stageAllBtn, refreshBtn);
+    toolbar.append(tTitle, tSpacer, reviewBtn, createPrBtn, stageLinesBtn, wsBtn, stashBtn, stageAllBtn, refreshBtn);
 
     const body = el("div", "dc-body");
     const lists = el("div", "dc-lists");
@@ -7713,6 +7699,7 @@ class App {
     // What the composer's enable rule needs to know: is there anything here to
     // commit at all. Set on every render, before the empty-tree early return.
     this.changesHaveWork = files.length > 0;
+    this.changesHaveStaged = staged.length > 0;
     this.syncCommitEnabled?.();
     // Rebuilt with the rows below, so a shift-range always covers what is on
     // screen rather than what was there before the last stage.
@@ -8029,7 +8016,10 @@ class App {
   }
 
   private stagingModel(): "split" | "checkboxes" {
-    return this.stagingModelPref;
+    // Always the staged/unstaged split. The toggle is gone from the toolbar, and
+    // a "checkboxes" saved by an earlier build must not strand anyone in a view
+    // they can no longer switch out of.
+    return "split";
   }
 
   private async openWorkingFile(diffPanel: DiffPanel, path: string): Promise<void> {
@@ -8895,36 +8885,18 @@ class App {
     for (const b of pair) b.disabled = true;
     btn.classList.add("is-busy");
     try {
-      // Nothing staged, but there IS work? Offer to commit all of it rather than
-      // refusing (issue #16) — VS Code and JetBrains both do this. The
-      // confirmation is the point: you see what is about to be included first.
+      // A commit takes the STAGED files and nothing else. Unstaged work is never
+      // pulled in on the commit's behalf — not even when nothing is staged —
+      // so what lands is exactly what the Staged region showed.
       if (!opts?.amend) {
         const status = await host.invoke("status", undefined);
-        const stagedNow = status.filter((f) => f.staged);
-        const unstagedNow = status.filter((f) => !f.staged);
-        if (stagedNow.length === 0 && unstagedNow.length > 0) {
-          const n = unstagedNow.length;
-          const yes = await confirmDialog({
-            title: n === 1 ? l10n.t("Commit all 1 changed file?") : l10n.t("Commit all {0} changed files?", n),
-            message: l10n.t(
-              "Nothing is staged, so everything currently changed will be included — new files too. Stage individually first if you only want some of it.",
-            ),
-            confirmLabel: n === 1 ? l10n.t("Commit all 1") : l10n.t("Commit all {0}", n),
-          });
-          if (!yes) {
-            for (const b of pair) b.disabled = false;
-            btn.classList.remove("is-busy");
-            return;
-          }
-          // Stage for real rather than using commit -a: -a skips untracked files
-          // and bypasses the index, so what landed would not match the list.
-          const staged = await host.invoke("stageAll", undefined);
-          if (!staged.ok) {
-            toast(staged.message || l10n.t("Couldn't stage the changes."), "error");
-            for (const b of pair) b.disabled = false;
-            btn.classList.remove("is-busy");
-            return;
-          }
+        if (!status.some((f) => f.staged)) {
+          toast(l10n.t("Nothing is staged. Stage the files you want to commit first."), "info");
+          for (const b of pair) b.disabled = false;
+          btn.classList.remove("is-busy");
+          bust("status");
+          if (this.currentView === "changes") void this.showChangesView();
+          return;
         }
       }
       const r = await host.invoke("commit", { message, amend: opts?.amend });

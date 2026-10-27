@@ -2924,6 +2924,7 @@
  "Nothing is staged — the only changes are new files git isn't tracking yet. Stage them to include them in a commit.": "没有已暂存的内容 — 唯一的更改是 git 尚未跟踪的新文件。请暂存它们以包含在提交中。",
  "Nothing is staged, so everything currently changed will be included — new files too. ": "没有任何内容被暂存，因此当前所有已更改的内容都会被包含 — 新文件也一样。",
  "Nothing is staged, so everything currently changed will be included — new files too. Stage individually first if you only want some of it.": "没有任何内容已暂存，因此当前所有更改都会被包含 — 新文件也是如此。如果你只想包含部分内容，请先单独暂存。",
+ "Nothing is staged. Stage the files you want to commit first.": "尚未暂存任何文件。请先暂存要提交的文件。",
  "Nothing is waiting to be reviewed or merged.": "没有等待审查或合并的内容。",
  "Nothing is written to it until you choose.": "在你选择之前不会写入任何内容。",
  "Nothing left to stage.": "没有待暂存的文件。",
