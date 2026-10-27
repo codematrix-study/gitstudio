@@ -151,6 +151,7 @@ import { renderExplore } from "./views/explore";
 import { parseRepoRoute, repoRouteId, searchTargetId } from "./exploreRoutes";
 import { renderOrgs, setPeekNav } from "./views/orgs";
 import { renderProjects } from "./views/projects";
+import { renderMavenDeploy } from "./views/mavenDeploy";
 import { renderGists } from "./views/gists";
 import { renderRepositories } from "./views/repositories";
 import { renderDashboard } from "./views/dashboard";
@@ -550,6 +551,7 @@ class App {
    */
   private static readonly NEEDS_REPO = new Set([
     "changes",
+    "deploy",
     "graph",
     "branches",
     "compare",
@@ -1127,6 +1129,7 @@ class App {
     // says so — the rail's principle is where the data lives: this machine,
     // then this repository, then this repository on GitHub, then your account.
     { id: "changes", label: l10n.t("Changes"), icon: "diff-multiple", divider: true, dividerLabel: "This repository" },
+    { id: "deploy", label: l10n.t("Deploy"), icon: "play-circle" },
     { id: "graph", label: l10n.t("Commits"), icon: "git-commit" },
     { id: "branches", label: l10n.t("Branches"), icon: "git-branch" },
     { id: "compare", label: l10n.t("Compare"), icon: "git-compare" },
@@ -1168,6 +1171,7 @@ class App {
     dashboard: l10n.t("Home"),
     repositories: l10n.t("Repositories"),
     changes: l10n.t("Changes"),
+    deploy: l10n.t("Deploy"),
     graph: l10n.t("Commits"),
     branches: l10n.t("Branches"),
     compare: l10n.t("Compare"),
@@ -1992,6 +1996,8 @@ class App {
       void this.showBranchesView(target?.ref, target?.lens, target?.refKind);
     } else if (id === "changes") {
       void this.showChangesView();
+    } else if (id === "deploy") {
+      this.mountSection(renderMavenDeploy);
     } else if (id === "compare") {
       void this.showCompareView();
     } else if (id === "rebase") {

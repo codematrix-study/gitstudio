@@ -19,6 +19,8 @@
     "check-types": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.renderer.json"
   },
   "dependencies": {
+    "@xmldom/xmldom": "^0.8.15",
+    "cross-spawn": "^7.0.6",
     "node-pty": "^1.1.0"
   },
   "devDependencies": {

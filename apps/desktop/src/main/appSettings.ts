@@ -2,13 +2,33 @@
 // tolerant-JSON pattern as errorReporter's store). Electron-free by design —
 // every path is injected — so the store unit-tests under plain node.
 //
-// Today it holds the clone preferences (the "Repositories" Settings card):
+// It holds clone preferences (the "Repositories" Settings card) and Maven
+// defaults/overrides for the desktop Deploy view:
 //   • cloneDir           — where one-click opens and clones land by default
 //   • askWhereEveryTime  — force the destination sheet on every clone/open
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { AppSettingsView } from "../shared/ipc";
+import type { AppSettingsView, MavenPaths, MavenSettingsView } from "../shared/ipc";
+
+const EMPTY_MAVEN: MavenPaths = { mavenHome: "", settings: "", javaHome: "" };
+
+export function resolveMavenPaths(project: MavenPaths, global: MavenPaths, env: NodeJS.ProcessEnv): MavenPaths {
+  return {
+    mavenHome: project.mavenHome.trim() || global.mavenHome.trim() || env.MAVEN_HOME || "",
+    settings: project.settings.trim() || global.settings.trim() || env.MAVEN_SETTINGS || "",
+    javaHome: project.javaHome.trim() || global.javaHome.trim() || env.JAVA_HOME || "",
+  };
+}
+
+function mavenPaths(value: unknown): MavenPaths {
+  const r = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  return {
+    mavenHome: typeof r.mavenHome === "string" ? r.mavenHome : "",
+    settings: typeof r.settings === "string" ? r.settings : "",
+    javaHome: typeof r.javaHome === "string" ? r.javaHome : "",
+  };
+}
 
 interface Persisted {
   cloneDir?: string;
@@ -26,6 +46,8 @@ interface Persisted {
   /** The Commit Graph's branch filter (issue #30), per repository root:
    *  fully-qualified ref names. A repo with no entry shows every branch. */
   graphRefFilters?: Record<string, string[]>;
+  mavenGlobal?: MavenPaths;
+  mavenProjects?: Record<string, MavenPaths>;
 }
 
 export class AppSettings {
@@ -84,6 +106,15 @@ export class AppSettings {
             const names = refs.filter((x): x is string => typeof x === "string" && !!x);
             if (names.length) data.graphRefFilters[root] = names;
           }
+        }
+        if (r.mavenGlobal && typeof r.mavenGlobal === "object" && !Array.isArray(r.mavenGlobal)) {
+          data.mavenGlobal = mavenPaths(r.mavenGlobal);
+        }
+        const projects = r.mavenProjects;
+        if (projects && typeof projects === "object" && !Array.isArray(projects)) {
+          data.mavenProjects = Object.fromEntries(
+            Object.entries(projects).map(([root, value]) => [root, mavenPaths(value)]),
+          );
         }
       }
     } catch {
@@ -188,6 +219,27 @@ export class AppSettings {
     if (Object.keys(all).length > 0) this.data.graphRefFilters = all;
     else delete this.data.graphRefFilters;
     await this.persist();
+  }
+
+  mavenSettings(root: string, env: NodeJS.ProcessEnv = process.env): MavenSettingsView {
+    const global = { ...EMPTY_MAVEN, ...this.data.mavenGlobal };
+    const project = { ...EMPTY_MAVEN, ...this.data.mavenProjects?.[resolve(root)] };
+    return { global, project, effective: resolveMavenPaths(project, global, env) };
+  }
+
+  async setMavenSettings(root: string, scope: "global" | "project", patch: Partial<MavenPaths>): Promise<MavenSettingsView> {
+    const clean = Object.fromEntries(
+      (Object.keys(EMPTY_MAVEN) as Array<keyof MavenPaths>)
+        .filter((key) => typeof patch[key] === "string")
+        .map((key) => [key, patch[key]!.trim()]),
+    ) as Partial<MavenPaths>;
+    if (scope === "global") this.data.mavenGlobal = { ...EMPTY_MAVEN, ...this.data.mavenGlobal, ...clean };
+    else {
+      const key = resolve(root);
+      this.data.mavenProjects = { ...this.data.mavenProjects, [key]: { ...EMPTY_MAVEN, ...this.data.mavenProjects?.[key], ...clean } };
+    }
+    await this.persist();
+    return this.mavenSettings(root);
   }
 
   private async persist(): Promise<void> {

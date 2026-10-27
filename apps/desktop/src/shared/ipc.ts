@@ -1710,6 +1710,50 @@ export interface AppSettingsView {
   askWhereEveryTime: boolean;
 }
 
+/** Desktop-only Maven settings. Empty project fields inherit the global value. */
+export interface MavenPaths {
+  mavenHome: string;
+  settings: string;
+  javaHome: string;
+}
+
+export interface MavenSettingsView {
+  global: MavenPaths;
+  project: MavenPaths;
+  effective: MavenPaths;
+}
+
+export interface MavenModule {
+  artifactId: string;
+  /** Path relative to the opened repository; the root is ".". */
+  path: string;
+  warning?: string;
+  children: MavenModule[];
+}
+
+export type MavenGoal = "clean" | "compile" | "deploy";
+export interface MavenTaskState {
+  root: string;
+  id: string;
+  goal: MavenGoal;
+  status: "running" | "success" | "failed" | "stopped";
+  startedAt: number;
+  endedAt?: number;
+  exitCode?: number;
+  command: string;
+  settings?: string;
+  javaHome?: string;
+  mavenHome?: string;
+}
+
+export interface MavenLogChunk {
+  root: string;
+  id: string;
+  seq: number;
+  stream: "stdout" | "stderr" | "system";
+  text: string;
+}
+
 /** Connection state for the GitHub-backed views. */
 export interface GitHubStatus {
   connected: boolean;
@@ -2495,6 +2539,16 @@ export interface IpcChannels {
   "settings:update": [{ cloneDir?: string | null; askWhereEveryTime?: boolean }, AppSettingsView];
   /** Native picker for the default clone folder; persists on choice. */
   "settings:pickCloneDir": [void, AppSettingsView | undefined];
+  // ── Desktop Maven deployment ──
+  "maven:modules": [void, MavenModule | undefined];
+  "maven:settings": [void, MavenSettingsView];
+  "maven:saveSettings": [{ scope: "global" | "project"; patch: Partial<MavenPaths> }, MavenSettingsView];
+  "maven:pickPath": [{ kind: keyof MavenPaths }, string | undefined];
+  "maven:test": [void, { ok: boolean; output: string }];
+  "maven:state": [void, MavenTaskState | undefined];
+  "maven:logs": [void, MavenLogChunk[]];
+  "maven:start": [{ goal: MavenGoal; paths: string[]; skipTests: boolean }, { ok: boolean; message?: string; expected?: boolean; state?: MavenTaskState }];
+  "maven:stop": [void, boolean];
   // ── Accounts (Explore profile pages) ──
   "users:repos": [string, OrgRepo[]];
   "users:orgs": [string, OrgInfo[]];
@@ -2979,6 +3033,8 @@ export interface IpcEvents {
   "terminal:data": TerminalData;
   /** A PTY session ended. */
   "terminal:exit": TerminalExit;
+  "maven:log": MavenLogChunk;
+  "maven:state": MavenTaskState;
   /** Progress during an in-flight clone. */
   "clone:progress": CloneProgress;
   /** A git command the app ran — streamed to the terminal dock's Output tab. */

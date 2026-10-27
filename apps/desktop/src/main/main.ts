@@ -40,6 +40,8 @@ import { AiBridge } from "./aiBridge";
 import { TerminalBridge } from "./terminalBridge";
 import { pickCloneDir, startClone, listGhRepos, killActiveClones } from "./cloneBridge";
 import { AppSettings } from "./appSettings";
+import { MavenBridge } from "./mavenBridge";
+import { discoverMavenModules } from "./mavenModules";
 import { MergeSettingsStore } from "./mergeSettings";
 import {
   visibleRepoFolders,
@@ -103,6 +105,7 @@ let github: GitHubBridge;
 let rebase: RebaseBridge;
 let ai: AiBridge;
 let terminal: TerminalBridge;
+let maven: MavenBridge;
 /** Filesystem watcher for the open repo; re-created whenever the repo changes. */
 let repoWatcher: RepoWatcher | undefined;
 
@@ -331,6 +334,7 @@ async function createWindow(): Promise<void> {
   mainWindow.webContents.on("did-finish-load", () => updates?.windowReady());
   mainWindow.on("closed", () => {
     terminal?.killAll();
+    maven?.stopAll();
     // Nothing left to notify, and holding a recursive watch on a directory after
     // the window is gone is how a quit ends up waiting on the filesystem.
     repoWatcher?.dispose();
@@ -1212,6 +1216,43 @@ function registerIpc(): void {
     if (r.canceled || !r.filePaths[0]) return undefined;
     return appSettings.update({ cloneDir: r.filePaths[0] });
   });
+  handle("maven:modules", async () => {
+    const root = repos.current()?.root;
+    return root ? discoverMavenModules(root) : undefined;
+  });
+  handle("maven:settings", async () => appSettings.mavenSettings(repos.current()?.root || ""));
+  handle("maven:saveSettings", async ({ scope, patch }) => {
+    const root = repos.current()?.root;
+    if (!root && scope === "project") return appSettings.mavenSettings("");
+    return appSettings.setMavenSettings(root || "", scope, patch);
+  });
+  handle("maven:pickPath", async ({ kind }) => {
+    const picked = await dialog.showOpenDialog({
+      title: kind === "settings" ? l10n.t("Choose settings.xml") : kind === "javaHome" ? l10n.t("Choose JAVA_HOME") : l10n.t("Choose Maven directory"),
+      properties: kind === "settings" ? ["openFile"] : ["openDirectory"],
+    });
+    return picked.canceled ? undefined : picked.filePaths[0];
+  });
+  handle("maven:test", async () => {
+    const root = repos.current()?.root;
+    return root ? maven.test(root) : { ok: false, output: l10n.t("Open a repository first") };
+  });
+  handle("maven:state", async () => {
+    const root = repos.current()?.root;
+    return root ? maven.state(root) : undefined;
+  });
+  handle("maven:logs", async () => {
+    const root = repos.current()?.root;
+    return root ? maven.logSnapshot(root) : [];
+  });
+  handle("maven:start", async ({ goal, paths, skipTests }) => {
+    const root = repos.current()?.root;
+    return root ? maven.start(root, goal, paths, skipTests) : { ok: false, expected: true, message: l10n.t("Open a repository first") };
+  });
+  handle("maven:stop", async () => {
+    const root = repos.current()?.root;
+    return root ? maven.stop(root) : false;
+  });
   handle("update:check", async () =>
     updates
       ? updates.check(true)
@@ -1560,6 +1601,10 @@ async function boot(): Promise<void> {
   appSettings = await AppSettings.load(app.getPath("userData"), {
     defaultCloneDir: managedReposDir(),
     home: app.getPath("home"),
+  });
+  maven = new MavenBridge((root) => appSettings.mavenSettings(root).effective, (event, data) => {
+    if (event === "maven:log") send("maven:log", data as IpcEvents["maven:log"]);
+    else send("maven:state", data as IpcEvents["maven:state"]);
   });
   // Settings ▸ Merge, persisted by this process in userData.
   mergeSettings = await MergeSettingsStore.load(app.getPath("userData"));
