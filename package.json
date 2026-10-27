@@ -24,7 +24,8 @@
     "i18n": "node scripts/i18n/manifest-nls.mjs && node scripts/i18n/manifest-nls.mjs --app apps/merge-studio && node scripts/i18n/bundle-nls.mjs",
     "build": "npm run package --workspace apps/extension",
     "package": "npm run package --workspace apps/extension",
-    "watch": "npm run watch --workspace apps/extension"
+    "watch": "npm run watch --workspace apps/extension",
+    "desktop": "npm run dist --workspace apps/desktop"
   },
   "devDependencies": {
     "esbuild": "^0.28.1",
