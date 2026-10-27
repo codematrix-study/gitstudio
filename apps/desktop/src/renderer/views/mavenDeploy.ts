@@ -1,15 +1,10 @@
 import * as l10n from "@vscode/l10n";
 import { host, currentSession } from "../bridge";
-import { confirmDialog, toast } from "../dialogs";
-import { copyText, el, emptyState, settingsCard } from "../ui";
-import type { MavenGoal, MavenLogChunk, MavenModule, MavenPaths, MavenSettingsView, MavenTaskState } from "../../shared/ipc";
+import { confirmDialog, openModal, toast } from "../dialogs";
+import { copyText, el, emptyState, glyph, settingsCard } from "../ui";
+import type { MavenLogChunk, MavenModule, MavenSettingsView, MavenTaskState } from "../../shared/ipc";
 import type { SectionRender } from "./common";
-
-const fields: Array<{ key: keyof MavenPaths; label: string }> = [
-  { key: "mavenHome", label: "MAVEN_HOME" },
-  { key: "settings", label: "settings.xml" },
-  { key: "javaHome", label: "JAVA_HOME" },
-];
+import { mavenConfigPanel, mavenSummary, type MavenConfigPanel } from "./mavenConfigFields";
 
 function button(label: string, className = "mini-btn"): HTMLButtonElement {
   const node = el("button", className) as HTMLButtonElement;
@@ -28,9 +23,19 @@ async function mount(wrap: HTMLElement): Promise<void> {
   const root = currentSession()?.root;
   if (!root) return;
   const view = el("div", "maven-page");
+  const header = el("div", "maven-header");
+  const heading = el("div", "maven-heading");
   const title = el("h1", "maven-title");
   title.textContent = l10n.t("Deploy");
-  view.append(title);
+  const summary = el("div", "maven-summary");
+  heading.append(title, summary);
+  const gearBtn = el("button", "icon-btn maven-gear") as HTMLButtonElement;
+  gearBtn.type = "button";
+  gearBtn.append(glyph("gear"));
+  gearBtn.title = l10n.t("Project Maven settings");
+  gearBtn.setAttribute("aria-label", l10n.t("Project Maven settings"));
+  header.append(heading, gearBtn);
+  view.append(header);
 
   const moduleCard = settingsCard(l10n.t("Maven modules"), "package");
   const moduleTools = el("div", "maven-tools");
@@ -60,10 +65,6 @@ async function mount(wrap: HTMLElement): Promise<void> {
   const hint = el("div", "settings-sub");
   hint.textContent = l10n.t("Select a module to run Maven.");
   operationCard.body.append(actionRow, skipLabel, hint);
-  const configTitle = el("h2", "maven-config-heading");
-  configTitle.textContent = l10n.t("Maven configuration");
-  const settingsContent = el("div", "maven-config");
-  operationCard.body.append(configTitle, settingsContent);
   view.append(operationCard.card);
 
   const logCard = settingsCard(l10n.t("Maven log"), "output");
@@ -82,8 +83,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
   let tree: MavenModule | undefined;
   let config: MavenSettingsView | undefined;
   let task: MavenTaskState | undefined;
-  let testing = false;
-  let savePending: Promise<void> = Promise.resolve();
+  let panel: MavenConfigPanel | undefined;
   let taskId = "";
   let seenSeq = 0;
   let initializing = true;
@@ -96,7 +96,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
 
   const updateButtons = (): void => {
     const running = task?.status === "running";
-    const busy = running || testing;
+    const busy = running;
     for (const action of actions) {
       action.button.disabled = busy || selected.size === 0;
       action.button.title = selected.size === 0 ? l10n.t("Select a module") : "";
@@ -108,9 +108,8 @@ async function mount(wrap: HTMLElement): Promise<void> {
     moduleList.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach((box) => {
       box.disabled = busy || box.dataset.warning === "true";
     });
-    settingsContent.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((control) => {
-      control.disabled = busy;
-    });
+    gearBtn.disabled = busy;
+    panel?.setDisabled(busy);
     hint.hidden = selected.size > 0;
   };
 
@@ -232,58 +231,40 @@ async function mount(wrap: HTMLElement): Promise<void> {
   noneBtn.addEventListener("click", () => { selected.clear(); paintModules(); });
   refreshBtn.addEventListener("click", () => void refreshModules());
 
-  const paintSettings = (): void => {
-    if (!config) return;
-    settingsContent.replaceChildren();
-    for (const scope of ["global", "project"] as const) {
-      const heading = el("h3", "maven-config-heading");
-      heading.textContent = scope === "global" ? l10n.t("Global settings") : l10n.t("Project overrides");
-      settingsContent.append(heading);
-      for (const field of fields) {
-        const row = el("div", "maven-config-row");
-        const label = el("label", "settings-field-label");
-        label.textContent = field.label;
-        const input = document.createElement("input");
-        input.className = "settings-input";
-        input.value = config[scope][field.key];
-        input.placeholder = scope === "project" ? l10n.t("Use global setting") : l10n.t("Use system environment");
-        label.append(input);
-        const pick = button(l10n.t("Browse…"));
-        const save = (value: string): Promise<void> => {
-          savePending = savePending.then(async () => {
-            try {
-              config = await host.invoke("maven:saveSettings", { scope, patch: { [field.key]: value } });
-              paintSettings();
-            } catch (error) { toast(String(error), "error"); }
-          });
-          return savePending;
-        };
-        input.addEventListener("change", () => void save(input.value));
-        pick.addEventListener("click", () => void host.invoke("maven:pickPath", { kind: field.key }).then((value) => {
-          if (value) void save(value);
-        }));
-        row.append(label, pick);
-        settingsContent.append(row);
-      }
-    }
-    const effective = el("div", "settings-sub");
-    effective.textContent = l10n.t("Empty project fields use global settings; empty global fields use the system environment.");
-    settingsContent.append(effective);
-    const testBtn = button(l10n.t("Test Maven (-v)"));
-    const version = el("pre", "maven-version");
-    testBtn.addEventListener("click", () => void (async () => {
-      testing = true;
-      updateButtons();
-      try {
-        await savePending;
-        const result = await host.invoke("maven:test", undefined);
-        version.textContent = result.output || (result.ok ? l10n.t("Maven is available") : l10n.t("Maven could not start"));
-      } catch (error) { version.textContent = String(error); }
-      finally { testing = false; updateButtons(); }
-    })());
-    settingsContent.append(testBtn, version);
+  const applyConfig = (next: MavenSettingsView): void => {
+    config = next;
+    summary.textContent = mavenSummary(next);
+    summary.title = summary.textContent;
+  };
+
+  /** The gear: this repository's overrides, in a dialog. */
+  const openProjectSettings = (): void => {
+    if (task?.status === "running") return;
+    const card = el("div", "modal-card modal-card-form maven-settings-dialog");
+    const head = el("div", "maven-dialog-head");
+    const h = el("div", "modal-title");
+    h.textContent = l10n.t("Project Maven settings");
+    const closeBtn = el("button", "icon-btn") as HTMLButtonElement;
+    closeBtn.type = "button";
+    closeBtn.append(glyph("close"));
+    closeBtn.title = l10n.t("Close (Esc)");
+    closeBtn.setAttribute("aria-label", l10n.t("Close"));
+    head.append(h, closeBtn);
+    panel = mavenConfigPanel("project", applyConfig, config);
+    card.append(head, panel.node);
+    const opened = panel;
+    openModal((close) => {
+      closeBtn.addEventListener("click", close);
+      return {
+        card,
+        focusEl: closeBtn,
+        label: l10n.t("Project Maven settings"),
+        onClose: () => { if (panel === opened) panel = undefined; },
+      };
+    });
     updateButtons();
   };
+  gearBtn.addEventListener("click", openProjectSettings);
 
   const applyTask = (next: MavenTaskState): void => {
     if (next.root !== root) return;
@@ -299,7 +280,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
   for (const { goal, button: action } of actions) {
     action.addEventListener("click", () => void (async () => {
       if (!selected.size || task?.status === "running") return;
-      await savePending;
+      await panel?.settled();
       if (goal === "deploy") {
         const names = [...selected].map((path) => `${available.get(path)?.artifactId || path} (${path})`).join("\n");
         const settings = config?.effective.settings || l10n.t("Maven default settings");
@@ -338,7 +319,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
   try {
     [modules, settings, current, logs] = await Promise.all([
       host.invoke("maven:modules", undefined),
-      host.invoke("maven:settings", undefined),
+      host.invoke("maven:settings", { scope: "project" }),
       host.invoke("maven:state", undefined),
       host.invoke("maven:logs", undefined),
     ]);
@@ -348,9 +329,8 @@ async function mount(wrap: HTMLElement): Promise<void> {
   }
   if (!wrap.isConnected) return;
   tree = modules;
-  config = settings;
+  applyConfig(settings);
   paintModules();
-  paintSettings();
   if (current) applyTask(current);
   for (const log of logs) queueLog(log);
   initializing = false;

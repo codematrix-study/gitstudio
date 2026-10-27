@@ -41,6 +41,9 @@ import { TerminalBridge } from "./terminalBridge";
 import { pickCloneDir, startClone, listGhRepos, killActiveClones } from "./cloneBridge";
 import { AppSettings } from "./appSettings";
 import { MavenBridge } from "./mavenBridge";
+import { launchPaths } from "./mavenCommand";
+import { mavenDetection, mavenWrapper } from "./mavenDetect";
+import type { MavenScope, MavenSettingsView } from "../shared/ipc";
 import { discoverMavenModules } from "./mavenModules";
 import { MergeSettingsStore } from "./mergeSettings";
 import {
@@ -106,6 +109,16 @@ let rebase: RebaseBridge;
 let ai: AiBridge;
 let terminal: TerminalBridge;
 let maven: MavenBridge;
+
+/** Maven settings for a repository, or the global layer alone (no root). */
+async function mavenSettingsFor(root: string | undefined): Promise<MavenSettingsView> {
+  return appSettings.mavenSettings(root, await mavenDetection(), !!root && !!mavenWrapper(root));
+}
+
+/** Settings ▸ Maven sees the global scope; Deploy's gear the open repository. */
+function mavenView(scope: MavenScope): Promise<MavenSettingsView> {
+  return mavenSettingsFor(scope === "project" ? repos.current()?.root : undefined);
+}
 /** Filesystem watcher for the open repo; re-created whenever the repo changes. */
 let repoWatcher: RepoWatcher | undefined;
 
@@ -1220,20 +1233,27 @@ function registerIpc(): void {
     const root = repos.current()?.root;
     return root ? discoverMavenModules(root) : undefined;
   });
-  handle("maven:settings", async () => appSettings.mavenSettings(repos.current()?.root || ""));
+  handle("maven:settings", async ({ scope }) => mavenView(scope));
   handle("maven:saveSettings", async ({ scope, patch }) => {
-    const root = repos.current()?.root;
-    if (!root && scope === "project") return appSettings.mavenSettings("");
-    return appSettings.setMavenSettings(root || "", scope, patch);
+    await appSettings.setMavenSettings(scope === "project" ? repos.current()?.root : undefined, scope, patch);
+    return mavenView(scope);
+  });
+  handle("maven:detect", async ({ scope }) => {
+    await mavenDetection(true);
+    return mavenView(scope);
   });
   handle("maven:pickPath", async ({ kind }) => {
     const picked = await dialog.showOpenDialog({
-      title: kind === "settings" ? l10n.t("Choose settings.xml") : kind === "javaHome" ? l10n.t("Choose JAVA_HOME") : l10n.t("Choose Maven directory"),
-      properties: kind === "settings" ? ["openFile"] : ["openDirectory"],
+      title: kind === "settings" ? l10n.t("Choose settings.xml")
+        : kind === "javaHome" ? l10n.t("Choose JAVA_HOME")
+        : kind === "localRepository" ? l10n.t("Choose the local repository")
+        : l10n.t("Choose Maven directory"),
+      properties: kind === "settings" ? ["openFile"] : kind === "localRepository" ? ["openDirectory", "createDirectory"] : ["openDirectory"],
     });
     return picked.canceled ? undefined : picked.filePaths[0];
   });
-  handle("maven:test", async () => {
+  handle("maven:test", async ({ scope }) => {
+    if (scope === "global") return maven.test(undefined);
     const root = repos.current()?.root;
     return root ? maven.test(root) : { ok: false, output: l10n.t("Open a repository first") };
   });
@@ -1602,10 +1622,16 @@ async function boot(): Promise<void> {
     defaultCloneDir: managedReposDir(),
     home: app.getPath("home"),
   });
-  maven = new MavenBridge((root) => appSettings.mavenSettings(root).effective, (event, data) => {
+  maven = new MavenBridge(async (root) => {
+    const view = await mavenSettingsFor(root);
+    return { paths: launchPaths(view), wrapper: root && view.wrapper ? mavenWrapper(root) : undefined };
+  }, (event, data) => {
     if (event === "maven:log") send("maven:log", data as IpcEvents["maven:log"]);
     else send("maven:state", data as IpcEvents["maven:state"]);
   });
+  // Detection asks the login shell once (~100 ms+); start it now so Settings
+  // and Deploy open on a warm cache.
+  void mavenDetection();
   // Settings ▸ Merge, persisted by this process in userData.
   mergeSettings = await MergeSettingsStore.load(app.getPath("userData"));
   bridge = new GitBridge(

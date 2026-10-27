@@ -152,6 +152,7 @@ import { parseRepoRoute, repoRouteId, searchTargetId } from "./exploreRoutes";
 import { renderOrgs, setPeekNav } from "./views/orgs";
 import { renderProjects } from "./views/projects";
 import { renderMavenDeploy } from "./views/mavenDeploy";
+import { mavenSettingsCard } from "./views/mavenSettingsCard";
 import { renderGists } from "./views/gists";
 import { renderRepositories } from "./views/repositories";
 import { renderDashboard } from "./views/dashboard";
@@ -5592,6 +5593,7 @@ class App {
       this.settingsRepositoriesCard(),
       editorsCard(),
       mergeSettingsCard(),
+      mavenSettingsCard(),
       aiModelsCard(),
       agentAccessCard(),
       this.settingsIdentityCard(),

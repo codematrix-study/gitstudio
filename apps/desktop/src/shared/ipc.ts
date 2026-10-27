@@ -1710,18 +1710,38 @@ export interface AppSettingsView {
   askWhereEveryTime: boolean;
 }
 
-/** Desktop-only Maven settings. Empty project fields inherit the global value. */
+/** Desktop-only Maven settings. Empty project fields inherit the global value;
+ *  empty global fields inherit what was detected on this machine. */
 export interface MavenPaths {
   mavenHome: string;
   settings: string;
+  localRepository: string;
   javaHome: string;
+}
+
+/** What the machine's own Maven setup looks like (the IDEA-style defaults),
+ *  with where each value came from ("MAVEN_HOME", "PATH", "~/.m2", …). */
+export interface MavenDetected {
+  paths: MavenPaths;
+  sources: Record<keyof MavenPaths, string>;
 }
 
 export interface MavenSettingsView {
   global: MavenPaths;
-  project: MavenPaths;
+  /** Absent for the global scope (Settings), which has no repository. */
+  project?: MavenPaths;
+  detected: MavenDetected;
+  /** Project → global → detected, field by field. */
   effective: MavenPaths;
+  /** The repository has mvnw (mvnw.cmd on Windows) at its root. */
+  wrapperAvailable: boolean;
+  /** The stored choice; undefined means "use it when it is there". */
+  useWrapper?: boolean;
+  /** The wrapper is what will run. */
+  wrapper: boolean;
 }
+
+export type MavenScope = "global" | "project";
 
 export interface MavenModule {
   artifactId: string;
@@ -2541,10 +2561,14 @@ export interface IpcChannels {
   "settings:pickCloneDir": [void, AppSettingsView | undefined];
   // ── Desktop Maven deployment ──
   "maven:modules": [void, MavenModule | undefined];
-  "maven:settings": [void, MavenSettingsView];
-  "maven:saveSettings": [{ scope: "global" | "project"; patch: Partial<MavenPaths> }, MavenSettingsView];
+  "maven:settings": [{ scope: MavenScope }, MavenSettingsView];
+  /** `useWrapper: null` forgets the choice (back to "when available"). */
+  "maven:saveSettings": [{ scope: MavenScope; patch: Partial<MavenPaths> & { useWrapper?: boolean | null } }, MavenSettingsView];
+  /** Forget the cached detection, look again, and return the scope's view. */
+  "maven:detect": [{ scope: MavenScope }, MavenSettingsView];
   "maven:pickPath": [{ kind: keyof MavenPaths }, string | undefined];
-  "maven:test": [void, { ok: boolean; output: string }];
+  /** `mvn -v` with the scope's settings (global: no project overrides). */
+  "maven:test": [{ scope: MavenScope }, { ok: boolean; output: string }];
   "maven:state": [void, MavenTaskState | undefined];
   "maven:logs": [void, MavenLogChunk[]];
   "maven:start": [{ goal: MavenGoal; paths: string[]; skipTests: boolean }, { ok: boolean; message?: string; expected?: boolean; state?: MavenTaskState }];

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import * as l10n from "@vscode/l10n";
-import type { MavenGoal, MavenModule, MavenPaths } from "../shared/ipc";
+import type { MavenGoal, MavenModule, MavenPaths, MavenSettingsView } from "../shared/ipc";
 
 export function selectablePaths(tree: MavenModule | undefined): string[] {
   if (!tree) return [];
@@ -19,22 +19,42 @@ export function buildMavenArgs(goal: MavenGoal, selected: string[], all: string[
   return args;
 }
 
-export function mavenLaunch(paths: MavenPaths, platform: NodeJS.Platform, env: NodeJS.ProcessEnv): {
+/**
+ * What a run actually uses. Maven home and JDK take the detected values too —
+ * a GUI app's PATH has neither — but settings.xml and the local repository are
+ * passed only when someone chose them: what detection finds there is exactly
+ * what Maven reads by default, and `-s` would demote a global conf/settings.xml
+ * to user settings.
+ */
+export function launchPaths(view: MavenSettingsView): MavenPaths {
+  const chosen = (key: keyof MavenPaths): string => view.project?.[key].trim() || view.global[key].trim();
+  return {
+    mavenHome: view.effective.mavenHome,
+    javaHome: view.effective.javaHome,
+    settings: chosen("settings"),
+    localRepository: chosen("localRepository"),
+  };
+}
+
+/** `wrapper`: the repository's mvnw, which then runs instead of Maven home. */
+export function mavenLaunch(paths: MavenPaths, platform: NodeJS.Platform, env: NodeJS.ProcessEnv, wrapper?: string): {
   command: string;
   env: NodeJS.ProcessEnv;
 } {
-  const command = paths.mavenHome
-    ? join(paths.mavenHome, "bin", platform === "win32" ? "mvn.cmd" : "mvn")
-    : platform === "win32" ? "mvn.cmd" : "mvn";
+  const mavenHome = wrapper ? "" : paths.mavenHome;
+  const command = wrapper
+    || (mavenHome ? join(mavenHome, "bin", platform === "win32" ? "mvn.cmd" : "mvn") : platform === "win32" ? "mvn.cmd" : "mvn");
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") || "PATH";
-  const prefixes = [paths.mavenHome && join(paths.mavenHome, "bin"), paths.javaHome && join(paths.javaHome, "bin")].filter(Boolean);
+  const prefixes = [mavenHome && join(mavenHome, "bin"), paths.javaHome && join(paths.javaHome, "bin")].filter(Boolean);
   const next = { ...env };
-  if (paths.mavenHome) next.MAVEN_HOME = paths.mavenHome;
+  if (mavenHome) next.MAVEN_HOME = mavenHome;
   if (paths.javaHome) next.JAVA_HOME = paths.javaHome;
   if (prefixes.length) next[pathKey] = [...prefixes, env[pathKey] || ""].join(platform === "win32" ? ";" : ":");
   return { command, env: next };
 }
 
-export function argsWithSettings(args: string[], settings: string): string[] {
-  return settings ? [...args, "-s", settings] : args;
+export function argsWithSettings(args: string[], settings: string, localRepository = ""): string[] {
+  const out = settings ? [...args, "-s", settings] : [...args];
+  if (localRepository) out.push(`-Dmaven.repo.local=${localRepository}`);
+  return out;
 }

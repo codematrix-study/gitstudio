@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import * as l10n from "@vscode/l10n";
 import type { MavenGoal, MavenLogChunk, MavenModule, MavenPaths, MavenTaskState } from "../shared/ipc";
@@ -46,8 +47,9 @@ async function isFile(path: string): Promise<boolean> {
   try { return (await stat(path)).isFile(); } catch { return false; }
 }
 
-async function validate(paths: MavenPaths): Promise<string | undefined> {
-  if (paths.mavenHome && !(await isFile(join(paths.mavenHome, "bin", process.platform === "win32" ? "mvn.cmd" : "mvn")))) {
+async function validate({ paths, wrapper }: MavenLaunchConfig): Promise<string | undefined> {
+  if (wrapper && !(await isFile(wrapper))) return l10n.t("The Maven wrapper (mvnw) is missing");
+  if (!wrapper && paths.mavenHome && !(await isFile(join(paths.mavenHome, "bin", process.platform === "win32" ? "mvn.cmd" : "mvn")))) {
     return l10n.t("Maven directory must contain bin/mvn (bin/mvn.cmd on Windows)");
   }
   if (paths.settings && !(await isFile(paths.settings))) return l10n.t("settings.xml file does not exist");
@@ -59,6 +61,12 @@ async function validate(paths: MavenPaths): Promise<string | undefined> {
 
 function hasWarning(node: MavenModule): boolean {
   return !!node.warning || node.children.some(hasWarning);
+}
+
+/** The paths a run uses, plus the repository's mvnw when that is what runs. */
+export interface MavenLaunchConfig {
+  paths: MavenPaths;
+  wrapper?: string;
 }
 
 interface Running {
@@ -78,27 +86,29 @@ export class MavenBridge {
   private nextLog = 0;
 
   constructor(
-    private readonly settings: (root: string) => MavenPaths,
+    /** The launch config for a repository, or the global one (no root). */
+    private readonly settings: (root: string | undefined) => Promise<MavenLaunchConfig>,
     private readonly send: (event: "maven:log" | "maven:state", data: MavenLogChunk | MavenTaskState) => void,
   ) {}
 
   state(root: string): MavenTaskState | undefined { return this.states.get(resolve(root)); }
   logSnapshot(root: string): MavenLogChunk[] { return [...(this.logs.get(resolve(root)) || [])]; }
 
-  async test(root: string): Promise<{ ok: boolean; output: string }> {
-    root = resolve(root);
-    if (this.running.has(root) || this.starting.has(root) || this.testing.has(root)) {
+  /** `mvn -v` for a repository, or — without one — with the global settings. */
+  async test(project: string | undefined): Promise<{ ok: boolean; output: string }> {
+    const root = project ? resolve(project) : "";
+    if (root && (this.running.has(root) || this.starting.has(root)) || this.testing.has(root)) {
       return { ok: false, output: l10n.t("A Maven task is already running") };
     }
     this.testing.add(root);
     try {
-      const paths = this.settings(root);
-      const problem = await validate(paths);
+      const config = await this.settings(root || undefined);
+      const problem = await validate(config);
       if (problem) return { ok: false, output: problem };
-      const launch = mavenLaunch(paths, process.platform, process.env);
+      const launch = mavenLaunch(config.paths, process.platform, process.env, config.wrapper);
       return await new Promise((done) => {
         const child = crossSpawn(launch.command, ["-v"], {
-          cwd: root, env: launch.env, windowsHide: true, detached: process.platform !== "win32",
+          cwd: root || homedir(), env: launch.env, windowsHide: true, detached: process.platform !== "win32",
         });
         const stdout = new ConsoleDecoder();
         const stderr = new ConsoleDecoder();
@@ -139,16 +149,17 @@ export class MavenBridge {
       let args: string[];
       try { args = buildMavenArgs(goal, selected, all, skipTests, !!tree && !hasWarning(tree)); }
       catch (error) { return { ok: false, expected: true, message: (error as Error).message }; }
-      const paths = this.settings(root);
-      const problem = await validate(paths);
+      const config = await this.settings(root);
+      const { paths, wrapper } = config;
+      const problem = await validate(config);
       if (problem) return { ok: false, expected: true, message: problem };
-      args = argsWithSettings(args, paths.settings);
-      const launch = mavenLaunch(paths, process.platform, process.env);
+      args = argsWithSettings(args, paths.settings, paths.localRepository);
+      const launch = mavenLaunch(paths, process.platform, process.env, wrapper);
       const id = `m${++this.nextId}`;
       const state: MavenTaskState = {
         root, id, goal, status: "running", startedAt: Date.now(),
         command: [launch.command, ...args].map((arg) => /\s/.test(arg) ? JSON.stringify(arg) : arg).join(" "),
-        settings: paths.settings || undefined, javaHome: paths.javaHome || undefined, mavenHome: paths.mavenHome || undefined,
+        settings: paths.settings || undefined, javaHome: paths.javaHome || undefined, mavenHome: wrapper || paths.mavenHome || undefined,
       };
       let child: ChildProcessWithoutNullStreams;
       try {
@@ -163,7 +174,7 @@ export class MavenBridge {
       this.logs.set(root, []);
       this.logChars.set(root, 0);
       this.send("maven:state", { ...state });
-      this.log({ root, id, seq: 0, stream: "system", text: `${state.command}\nMAVEN_HOME=${paths.mavenHome || "PATH"}  JAVA_HOME=${paths.javaHome || "environment"}  settings=${paths.settings || "Maven default"}\n` });
+      this.log({ root, id, seq: 0, stream: "system", text: `${state.command}\n${wrapper ? "mvnw" : `MAVEN_HOME=${paths.mavenHome || "PATH"}`}  JAVA_HOME=${paths.javaHome || "environment"}  settings=${paths.settings || "Maven default"}  localRepository=${paths.localRepository || "Maven default"}\n` });
       const decoders = { stdout: new ConsoleDecoder(), stderr: new ConsoleDecoder() };
       const pending = { stdout: "", stderr: "" };
       let flushTimer: ReturnType<typeof setTimeout> | undefined;

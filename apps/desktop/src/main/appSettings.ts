@@ -9,25 +9,31 @@
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { AppSettingsView, MavenPaths, MavenSettingsView } from "../shared/ipc";
+import type { AppSettingsView, MavenDetected, MavenPaths, MavenScope, MavenSettingsView } from "../shared/ipc";
 
-const EMPTY_MAVEN: MavenPaths = { mavenHome: "", settings: "", javaHome: "" };
+export const EMPTY_MAVEN: MavenPaths = { mavenHome: "", settings: "", localRepository: "", javaHome: "" };
+const MAVEN_KEYS = Object.keys(EMPTY_MAVEN) as Array<keyof MavenPaths>;
 
-export function resolveMavenPaths(project: MavenPaths, global: MavenPaths, env: NodeJS.ProcessEnv): MavenPaths {
-  return {
-    mavenHome: project.mavenHome.trim() || global.mavenHome.trim() || env.MAVEN_HOME || "",
-    settings: project.settings.trim() || global.settings.trim() || env.MAVEN_SETTINGS || "",
-    javaHome: project.javaHome.trim() || global.javaHome.trim() || env.JAVA_HOME || "",
-  };
+type MavenProject = MavenPaths & { useWrapper?: boolean };
+
+/** Field by field: the project's value, else the global one, else `fallback`
+ *  (what was detected on this machine). */
+export function resolveMavenPaths(project: MavenPaths, global: MavenPaths, fallback: MavenPaths): MavenPaths {
+  const out = { ...EMPTY_MAVEN };
+  for (const key of MAVEN_KEYS) out[key] = project[key].trim() || global[key].trim() || fallback[key];
+  return out;
 }
 
 function mavenPaths(value: unknown): MavenPaths {
   const r = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  return {
-    mavenHome: typeof r.mavenHome === "string" ? r.mavenHome : "",
-    settings: typeof r.settings === "string" ? r.settings : "",
-    javaHome: typeof r.javaHome === "string" ? r.javaHome : "",
-  };
+  const out = { ...EMPTY_MAVEN };
+  for (const key of MAVEN_KEYS) out[key] = typeof r[key] === "string" ? r[key] as string : "";
+  return out;
+}
+
+function mavenProject(value: unknown): MavenProject {
+  const useWrapper = value && typeof value === "object" ? (value as Record<string, unknown>).useWrapper : undefined;
+  return typeof useWrapper === "boolean" ? { ...mavenPaths(value), useWrapper } : mavenPaths(value);
 }
 
 interface Persisted {
@@ -47,7 +53,7 @@ interface Persisted {
    *  fully-qualified ref names. A repo with no entry shows every branch. */
   graphRefFilters?: Record<string, string[]>;
   mavenGlobal?: MavenPaths;
-  mavenProjects?: Record<string, MavenPaths>;
+  mavenProjects?: Record<string, MavenProject>;
 }
 
 export class AppSettings {
@@ -113,7 +119,7 @@ export class AppSettings {
         const projects = r.mavenProjects;
         if (projects && typeof projects === "object" && !Array.isArray(projects)) {
           data.mavenProjects = Object.fromEntries(
-            Object.entries(projects).map(([root, value]) => [root, mavenPaths(value)]),
+            Object.entries(projects).map(([root, value]) => [root, mavenProject(value)]),
           );
         }
       }
@@ -221,25 +227,42 @@ export class AppSettings {
     await this.persist();
   }
 
-  mavenSettings(root: string, env: NodeJS.ProcessEnv = process.env): MavenSettingsView {
-    const global = { ...EMPTY_MAVEN, ...this.data.mavenGlobal };
-    const project = { ...EMPTY_MAVEN, ...this.data.mavenProjects?.[resolve(root)] };
-    return { global, project, effective: resolveMavenPaths(project, global, env) };
+  /**
+   * The Maven settings as one scope sees them. Without a `root` (Settings, or
+   * no repository open) there is no project layer and no wrapper.
+   */
+  mavenSettings(root: string | undefined, detected: MavenDetected, wrapperAvailable = false): MavenSettingsView {
+    const global = mavenPaths(this.data.mavenGlobal);
+    const stored = root ? this.data.mavenProjects?.[resolve(root)] : undefined;
+    const project = root ? mavenPaths(stored) : undefined;
+    const useWrapper = stored?.useWrapper;
+    return {
+      global,
+      project,
+      detected,
+      effective: resolveMavenPaths(project ?? EMPTY_MAVEN, global, detected.paths),
+      wrapperAvailable,
+      useWrapper,
+      wrapper: wrapperAvailable && useWrapper !== false,
+    };
   }
 
-  async setMavenSettings(root: string, scope: "global" | "project", patch: Partial<MavenPaths>): Promise<MavenSettingsView> {
-    const clean = Object.fromEntries(
-      (Object.keys(EMPTY_MAVEN) as Array<keyof MavenPaths>)
-        .filter((key) => typeof patch[key] === "string")
-        .map((key) => [key, patch[key]!.trim()]),
-    ) as Partial<MavenPaths>;
-    if (scope === "global") this.data.mavenGlobal = { ...EMPTY_MAVEN, ...this.data.mavenGlobal, ...clean };
-    else {
+  async setMavenSettings(
+    root: string | undefined,
+    scope: MavenScope,
+    patch: Partial<MavenPaths> & { useWrapper?: boolean | null },
+  ): Promise<void> {
+    const clean: Partial<MavenPaths> = {};
+    for (const key of MAVEN_KEYS) if (typeof patch[key] === "string") clean[key] = patch[key]!.trim();
+    if (scope === "global") this.data.mavenGlobal = { ...mavenPaths(this.data.mavenGlobal), ...clean };
+    else if (root) {
       const key = resolve(root);
-      this.data.mavenProjects = { ...this.data.mavenProjects, [key]: { ...EMPTY_MAVEN, ...this.data.mavenProjects?.[key], ...clean } };
-    }
+      const next: MavenProject = { ...mavenProject(this.data.mavenProjects?.[key]), ...clean };
+      if (patch.useWrapper === null) delete next.useWrapper;
+      else if (typeof patch.useWrapper === "boolean") next.useWrapper = patch.useWrapper;
+      this.data.mavenProjects = { ...this.data.mavenProjects, [key]: next };
+    } else return;
     await this.persist();
-    return this.mavenSettings(root);
   }
 
   private async persist(): Promise<void> {

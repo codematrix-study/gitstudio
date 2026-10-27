@@ -13867,7 +13867,23 @@ body.vscode-light .repo-tab.is-active {
   flex-direction: column;
   gap: var(--sp-4);
 }
+.maven-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); }
+.maven-heading { min-width: 0; }
 .maven-title { margin: 0; font-size: var(--text-2xl); }
+.maven-summary {
+  margin-top: var(--sp-1);
+  color: var(--app-muted);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.maven-gear { flex: none; }
+.maven-dialog-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.maven-dialog-head .modal-title { margin: 0; }
+.maven-config .maven-tools { margin-top: var(--sp-2); }
+.maven-config-row .maven-config-field { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.maven-config-row .mini-btn[hidden] { display: none; }
 .maven-tools, .maven-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
 .maven-tools .maven-status { margin-left: auto; color: var(--app-muted); font-size: var(--text-sm); }
 .maven-actions .btn-danger[hidden] { display: none; }
@@ -13878,9 +13894,7 @@ body.vscode-light .repo-tab.is-active {
 .maven-module-label { display: flex; align-items: center; gap: var(--sp-2); cursor: pointer; }
 .maven-module-label small { color: var(--app-muted); overflow-wrap: anywhere; }
 .maven-warning { color: var(--vscode-gitDecoration-modifiedResourceForeground, #c89b3c); margin-left: var(--sp-5); }
-.maven-config-heading { margin: var(--sp-3) 0 var(--sp-1); font-size: var(--text-md); }
 .maven-config-row { display: flex; align-items: end; gap: var(--sp-2); margin-bottom: var(--sp-2); }
-.maven-config-row .settings-field-label { flex: 1 1 auto; min-width: 0; }
 .maven-config-row .settings-input { width: 100%; margin-top: var(--sp-1); }
 .maven-version { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-sm); }
 .maven-log-scroll {

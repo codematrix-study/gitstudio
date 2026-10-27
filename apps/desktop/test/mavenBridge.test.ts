@@ -28,7 +28,7 @@ test("stop ends Maven and its child in a path with spaces and Chinese", { skip: 
   await chmod(executable, 0o755);
   const logs: MavenLogChunk[] = [];
   const states: MavenTaskState[] = [];
-  const bridge = new MavenBridge(() => ({ mavenHome: home, settings: "", javaHome: "" }), (event, data) => {
+  const bridge = new MavenBridge(async () => ({ paths: { mavenHome: home, settings: "", localRepository: "", javaHome: "" } }), (event, data) => {
     if (event === "maven:log") logs.push(data as MavenLogChunk);
     else states.push(data as MavenTaskState);
   });
@@ -71,7 +71,8 @@ test("the spawned command receives module, test and settings arguments as separa
   const executable = join(home, "bin", "mvn");
   await writeFile(executable, "#!/bin/sh\nprintf 'ARG:%s\\n' \"$@\"\nprintf 'JAVA:%s\\n' \"$JAVA_HOME\"\n");
   await chmod(executable, 0o755);
-  const bridge = new MavenBridge(() => ({ mavenHome: home, settings, javaHome }), () => {});
+  const localRepository = join(root, "local repo");
+  const bridge = new MavenBridge(async () => ({ paths: { mavenHome: home, settings, localRepository, javaHome } }), () => {});
   const finished = async (): Promise<void> => {
     const deadline = Date.now() + 5000;
     while (bridge.state(root)?.status === "running" && Date.now() < deadline) await delay(25);
@@ -84,12 +85,35 @@ test("the spawned command receives module, test and settings arguments as separa
     assert.match(partial, /ARG:-pl\nARG:one\n/);
     assert.match(partial, /ARG:-DskipTests\n/);
     assert.match(partial, new RegExp(`ARG:-s\\nARG:${settings.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n`));
+    assert.ok(partial.includes(`ARG:-Dmaven.repo.local=${localRepository}\n`));
     assert.ok(partial.includes(`JAVA:${javaHome}`));
     assert.equal((await bridge.start(root, "clean", [".", "one", "two"], false)).ok, true);
     await finished();
     const all = bridge.logSnapshot(root).map((line) => line.text).join("");
     assert.doesNotMatch(all, /ARG:-pl\n/);
     assert.match(all, /ARG:clean\n/);
+  } finally {
+    bridge.stopAll();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the project's mvnw runs instead of Maven home when it is the chosen launcher", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "maven wrapper "));
+  await writeFile(join(root, "pom.xml"), "<project><artifactId>demo</artifactId></project>");
+  const wrapper = join(root, "mvnw");
+  await writeFile(wrapper, "#!/bin/sh\necho WRAPPER:$1\n");
+  await chmod(wrapper, 0o755);
+  const bridge = new MavenBridge(
+    async () => ({ paths: { mavenHome: join(root, "missing"), settings: "", localRepository: "", javaHome: "" }, wrapper }),
+    () => {},
+  );
+  try {
+    assert.equal((await bridge.start(root, "compile", ["."], false)).ok, true);
+    const deadline = Date.now() + 5000;
+    while (bridge.state(root)?.status === "running" && Date.now() < deadline) await delay(25);
+    assert.equal(bridge.state(root)?.status, "success");
+    assert.match(bridge.logSnapshot(root).map((line) => line.text).join(""), /WRAPPER:-B\n/);
   } finally {
     bridge.stopAll();
     await rm(root, { recursive: true, force: true });
