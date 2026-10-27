@@ -284,6 +284,8 @@ class App {
    */
   private changesOpenKey?: string;
   private changesScroll = 0;
+  /** Split model: each region scrolls on its own, so each keeps its own place. */
+  private changesRegionScroll: Record<"staged" | "unstaged", number> = { staged: 0, unstaged: 0 };
   /**
    * The conflicts dashboard's controller. App-lifetime, not view-lifetime: the
    * Changes view is rebuilt on every repaint, and the outcome of a Continue,
@@ -603,6 +605,9 @@ class App {
   private railCollapsed = false;
   /** Changes view: persisted width (px) of the file list pane. */
   private changesListW = 340;
+  /** Changes view, split model: the share (%) of the list height the Unstaged
+   *  region gets; Staged takes the rest. Persisted. */
+  private changesSplitPct = 60;
   private railEl?: HTMLElement;
   private railToggleEl?: HTMLElement;
   private mainStackEl?: HTMLElement;
@@ -770,6 +775,9 @@ class App {
       }
       if (typeof prefs.changesListW === "number" && prefs.changesListW >= 220) {
         this.changesListW = prefs.changesListW;
+      }
+      if (typeof prefs.changesSplitPct === "number" && prefs.changesSplitPct >= 15 && prefs.changesSplitPct <= 85) {
+        this.changesSplitPct = prefs.changesSplitPct;
       }
       if (typeof prefs.terminalOpen === "boolean") this.terminalExpanded = prefs.terminalOpen;
       if (typeof prefs.terminalHeight === "number" && prefs.terminalHeight >= 120) {
@@ -1468,6 +1476,7 @@ class App {
       railWidth: this.railWidth,
       railCollapsed: this.railCollapsed,
       changesListW: this.changesListW,
+      changesSplitPct: this.changesSplitPct,
       terminalOpen: this.terminalExpanded,
       terminalHeight: this.terminalHeight,
     });
@@ -7837,21 +7846,91 @@ class App {
       // diff away on every tick, in the one model whose whole interaction is
       // "tick boxes while reading the diff".
     } else {
-      if (staged.length) {
-        lists.appendChild(
-          this.sectionHeader(l10n.t("Staged ({0})", staged.length), "staged", staged, lists, selBar),
-        );
-        staged.forEach((f) => lists.appendChild(fileRow(f, "staged")));
-      }
-      if (unstaged.length) {
-        lists.appendChild(
-          // "Changes" already names the view and the pane; this group is the
-          // UNSTAGED half, and calling it "Changes" beside "Staged" made the two
-          // read as unrelated rather than as a pair.
-          this.sectionHeader(l10n.t("Unstaged ({0})", unstaged.length), "unstaged", unstaged, lists, selBar),
-        );
-        unstaged.forEach((f) => lists.appendChild(fileRow(f, "unstaged")));
-      }
+      // TWO REGIONS, the way IDEA's commit window lays them out: what is still
+      // to stage on top, what is staged below, each with its own header and its
+      // own scroll, and a divider between them. As one list the Staged group
+      // scrolled away under a long Unstaged one, so "what will this commit
+      // contain" was off screen exactly when the tree was busiest.
+      //
+      // Both regions are always present — an empty one says so — so the layout
+      // does not jump as files move from one side to the other.
+      lists.classList.add("is-split");
+      const region = (
+        kind: "staged" | "unstaged",
+        items: ChangedFile[],
+        title: string,
+        empty: string,
+      ): { box: HTMLElement; scroller: HTMLElement } => {
+        const box = el("div", `dc-region dc-region-${kind}`);
+        const head = this.sectionHeader(title, kind, items, lists, selBar);
+        const scroller = el("div", "dc-region-body");
+        if (items.length) items.forEach((f) => scroller.appendChild(fileRow(f, kind)));
+        else scroller.appendChild(span(empty, "dc-region-empty"));
+        scroller.addEventListener("scroll", () => {
+          this.changesRegionScroll[kind] = scroller.scrollTop;
+        });
+        box.append(head, scroller);
+        return { box, scroller };
+      };
+      // "Changes" already names the view and the pane; this group is the
+      // UNSTAGED half, and calling it "Changes" beside "Staged" made the two
+      // read as unrelated rather than as a pair.
+      const top = region(
+        "unstaged",
+        unstaged,
+        l10n.t("Unstaged ({0})", unstaged.length),
+        l10n.t("Nothing left to stage."),
+      );
+      const bottom = region(
+        "staged",
+        staged,
+        l10n.t("Staged ({0})", staged.length),
+        l10n.t("Nothing staged yet."),
+      );
+      const applySplit = (): void => {
+        top.box.style.flex = `${this.changesSplitPct} 1 0`;
+        bottom.box.style.flex = `${100 - this.changesSplitPct} 1 0`;
+      };
+      applySplit();
+
+      const hsplit = el("div", "dc-hsplit");
+      hsplit.append(el("div", "dc-hsplit-grip"));
+      wireResizerKeys(hsplit, {
+        orientation: "horizontal",
+        label: l10n.t("Resize staged and unstaged lists"),
+        min: 15,
+        max: () => 85,
+        step: 5,
+        get: () => this.changesSplitPct,
+        set: (v) => {
+          this.changesSplitPct = v;
+          applySplit();
+        },
+        onCommit: () => this.persist(),
+      });
+      hsplit.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        document.body.classList.add("resizing-v");
+        const rect = lists.getBoundingClientRect();
+        const move = (ev: PointerEvent): void => {
+          if (rect.height <= 0) return;
+          const pct = ((ev.clientY - rect.top) / rect.height) * 100;
+          this.changesSplitPct = Math.round(Math.max(15, Math.min(85, pct)));
+          applySplit();
+        };
+        const up = (): void => {
+          document.body.classList.remove("resizing-v");
+          window.removeEventListener("pointermove", move);
+          window.removeEventListener("pointerup", up);
+          this.persist();
+        };
+        window.addEventListener("pointermove", move);
+        window.addEventListener("pointerup", up);
+      });
+
+      lists.append(top.box, hsplit, bottom.box);
+      top.scroller.scrollTop = this.changesRegionScroll.unstaged;
+      bottom.scroller.scrollTop = this.changesRegionScroll.staged;
     }
     this.reconcileSelection(lists, selBar);
 
