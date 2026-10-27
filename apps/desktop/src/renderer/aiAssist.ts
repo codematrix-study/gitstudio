@@ -1,0 +1,160 @@
+// Reusable inline-AI affordances surfaced across the app (Changes, Compare, PRs,
+// Issues): a ✨ chip button, a helper that opens a named, conversational AI chat
+// tab in the footer dock (Explain / Review / Analyze / Draft a comment), and a
+// "stream straight into a textarea" helper (commit messages / comment drafts).
+// The chat tabs run on the persistent agent backend (ai:chat*); the textarea
+// helper runs the one-shot ai:task. Both reuse the Assistant's model + keys.
+
+import { host } from "./bridge";
+import { el, span, glyph, cleanErr } from "./ui";
+import { toast } from "./dialogs";
+import type { AssistantTabRequest } from "./terminalDock";
+import type { AiTaskInput, AiTaskName } from "../shared/ipc";
+import * as l10n from "@vscode/l10n";
+
+let enabledCache: boolean | undefined;
+
+/** Whether any AI model is connected (gates the ✨ affordances). Cached. */
+export async function aiEnabled(): Promise<boolean> {
+  if (enabledCache !== undefined) return enabledCache;
+  try {
+    // `?? false`, not a bare read: an answer that arrives without `enabled`
+    // assigned `undefined` to the cache, which is the ONE value that means "not
+    // cached yet" — so the memo never took and every view that gates on AI
+    // re-asked over IPC on every single route. A memo you can poison with a
+    // malformed answer is not a memo.
+    enabledCache = (await host.invoke("ai:settings", undefined))?.enabled ?? false;
+  } catch {
+    enabledCache = false;
+  }
+  return enabledCache;
+}
+
+/** Drop the cached enabled-state so the next aiEnabled() re-checks. Call after any
+ *  change to model connections (connect / remove / set key) so the ✨ affordances
+ *  appear or disappear without a full reload. */
+export function invalidateAiEnabled(): void {
+  enabledCache = undefined;
+}
+
+/** A small ✨ action chip. */
+export function aiChip(label: string, onClick: () => void, icon = "sparkle"): HTMLElement {
+  const b = el("button", "ai-chip");
+  b.append(glyph(icon), span(label));
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+/** Run a task, streaming text deltas through onDelta; resolves with the outcome. */
+export async function streamTask(
+  task: AiTaskName,
+  input: AiTaskInput,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; text?: string; message?: string }> {
+  const requestId = crypto.randomUUID();
+  const off = host.on("ai:delta", (e) => {
+    if (e.requestId === requestId) onDelta(e.delta);
+  });
+  if (signal) {
+    signal.addEventListener("abort", () => void host.invoke("ai:cancel", { requestId }), { once: true });
+  }
+  try {
+    return await host.invoke("ai:task", { requestId, task, input });
+  } catch (e) {
+    return { ok: false, message: cleanErr(e) };
+  } finally {
+    off();
+  }
+}
+
+// ── Footer AI chat tabs ──────────────────────────────────────────────────────
+// The ✨ Explain / Review / Analyze / Draft actions open a named, conversational
+// tab in the footer dock instead of a dead-end modal. aiAssist stays decoupled
+// from the dock: the shell registers the opener once the dock is mounted.
+
+let tabOpener: ((req: AssistantTabRequest) => void) | undefined;
+
+/** Register the footer-dock opener. The shell calls this once after creating the
+ *  TerminalDock, so aiAssist need not import it (avoids a layering cycle). */
+export function registerAssistantTab(open: (req: AssistantTabRequest) => void): void {
+  tabOpener = open;
+}
+
+/** Open a named, seeded AI chat tab in the footer dock. Falls back to a toast if
+ *  no dock is mounted yet (e.g. before a repository is open). */
+export function openAssistantTab(req: AssistantTabRequest): void {
+  if (tabOpener) tabOpener(req);
+  else toast(l10n.t("Open a repository to use the Assistant."), "info");
+}
+
+/**
+ * Stream a task's result directly into a textarea (commit messages, comment
+ * drafts). Disables the trigger button while running; replaces the field's text.
+ */
+export async function streamInto(
+  task: AiTaskName,
+  input: AiTaskInput,
+  textarea: HTMLTextAreaElement,
+  btn?: HTMLButtonElement,
+): Promise<void> {
+  const original = btn?.innerHTML;
+  if (btn) {
+    btn.disabled = true;
+    btn.replaceChildren(glyph("loading"), span(l10n.t("Writing…")));
+  }
+  const prev = textarea.value;
+  // Through an `input` event, always. Every control that watches this box —
+  // both Commit buttons, the character counter — learns about it that way, and
+  // a bare assignment is invisible to all of them. So emptying the composer to
+  // stream a generated message into it left Commit fully enabled over a box
+  // with nothing in it, for as long as the model took to produce a first token.
+  const setComposer = (v: string): void => {
+    textarea.value = v;
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  setComposer("");
+  let got = false;
+  /**
+   * Stop the moment the box we are writing into leaves the document.
+   *
+   * A stream outlives a repo switch, a route change and a view rebuild — and it
+   * went on appending to a detached textarea, then dispatching `input` on it.
+   * For the commit composer that meant repo A's generated message being written
+   * into the draft while repo B was open, silently replacing whatever was
+   * typed there. What is on screen is the only thing worth writing to.
+   */
+  const gone = (): boolean => !textarea.isConnected;
+  const res = await streamTask(task, input, (d) => {
+    if (gone()) return;
+    got = true;
+    setComposer(textarea.value + d);
+  });
+  if (gone()) {
+    if (btn) {
+      btn.disabled = false;
+      if (original) btn.innerHTML = original;
+    }
+    return;
+  }
+  if (btn) {
+    btn.disabled = false;
+    if (original) btn.innerHTML = original;
+  }
+  if (!res.ok || (!got && !res.text)) {
+    // …and through the same helper. This one was a bare assignment, so putting
+    // the reader's message BACK after a failure left both Commit buttons
+    // disabled over it — the state the empty box had put them in.
+    setComposer(prev); // restore on failure
+    toast(res.message ?? l10n.t("Couldn't generate that."), "error");
+    return;
+  }
+  if (!got && res.text) {
+    setComposer(res.text);
+  }
+  // The trim is a programmatic write like any other: if the model returned
+  // only whitespace this empties the box, and without the event the commit
+  // buttons would stay enabled over an empty message.
+  setComposer(textarea.value.trim());
+  textarea.focus();
+}

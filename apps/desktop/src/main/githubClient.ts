@@ -1,0 +1,490 @@
+// A thin GitHub REST + GraphQL client for the desktop app's PRs / Issues /
+// Projects views. It runs in the Electron MAIN process over netFetch
+// (Chromium's network stack, so the system proxy applies), talks only to api.github.com, and returns typed results. Mirrors the
+// extension's githubApi.ts (the proven PR client) and adds Issues + Projects.
+// The token is supplied by the caller (GitHubBridge reads it from safeStorage).
+
+import { ExpectedError } from "./expectedError";
+import * as l10n from "@vscode/l10n";
+import {
+  githubHttpError,
+  graphqlError,
+  keepsPartialData,
+  networkError,
+  type GraphqlFailure,
+} from "./githubErrors";
+import { nextPagePath, PAGE_CAPS } from "./githubPaging";
+import { netFetch } from "./netFetch";
+import { mapIssue, mapPull, mapReactions, mapUser, type RawIssue, type RawPull, type RawUser } from "./github/maps";
+import type {
+  CheckRun,
+  GitHubUser,
+  IssueInfo,
+  PrComment,
+  PrCommitInfo,
+  PrFile,
+  PullRequest,
+  WorkflowRun,
+} from "../shared/ipc";
+
+const API_BASE = "https://api.github.com";
+const GRAPHQL = "https://api.github.com/graphql";
+
+interface CombinedStatus {
+  state: string;
+  totalCount: number;
+}
+
+export type TokenGetter = () => string | undefined;
+
+export class GitHubClient {
+  constructor(private readonly getToken: TokenGetter) {}
+
+  /** The shared fetch under `request`/`requestPaged`: auth headers, timeout,
+   *  network-error wrapping, non-2xx → githubHttpError. Returns the RESPONSE so
+   *  paged callers can read the `Link` header. */
+  private async fetchRes(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { accept?: string },
+  ): Promise<Response> {
+    const token = this.getToken();
+    if (!token) {
+      throw new ExpectedError(l10n.t("Not connected to GitHub."));
+    }
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+      // Some endpoints need a different media type to return the good stuff —
+      // code search only includes match fragments under text-match+json.
+      Accept: opts?.accept ?? "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "GitStudio",
+    };
+    if (body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
+    let res: Response;
+    try {
+      res = await netFetch(`${API_BASE}${path}`, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        // A hung request used to hang every gated section on its skeleton
+        // forever — the API must fail fast enough for the UI to say so.
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (e) {
+      throw networkError(e, `${API_BASE}${path}`);
+    }
+    if (!res.ok) {
+      throw await githubHttpError(res);
+    }
+    return res;
+  }
+
+  /** REST call returning the parsed JSON body. `body` (POST/PATCH/PUT) is sent as
+   *  JSON. Throws a clean Error on non-2xx or network failure. Public so the
+   *  per-section modules under ./github can call it. */
+  async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { accept?: string },
+  ): Promise<T> {
+    const res = await this.fetchRes(method, path, body, opts);
+    if (res.status === 204) return undefined as T;
+    const text = await res.text();
+    return (text.length > 0 ? JSON.parse(text) : undefined) as T;
+  }
+
+  /**
+   * GET an ARRAY-bodied list endpoint, following the `Link: rel="next"` chain
+   * up to `maxPages` pages and concatenating the results. The first page's
+   * failure throws; a FOLLOW-UP page's failure returns what was gathered so far
+   * (a partial long list beats an error state the user already had data for).
+   */
+  async requestPaged<T>(path: string, maxPages: number): Promise<T[]> {
+    const out: T[] = [];
+    let next: string | undefined = path;
+    for (let page = 0; next && page < maxPages; page++) {
+      let res: Response;
+      try {
+        res = await this.fetchRes("GET", next);
+      } catch (e) {
+        if (page === 0) throw e;
+        break;
+      }
+      const text = await res.text();
+      const chunk = (text.length > 0 ? JSON.parse(text) : []) as T[];
+      out.push(...chunk);
+      next = nextPagePath(res.headers.get("link"), API_BASE);
+    }
+    return out;
+  }
+
+  /**
+   * As {@link requestPaged}, for OBJECT-bodied list endpoints (`{ total_count,
+   * workflow_runs: [...] }` and friends) — `key` names the array to gather.
+   */
+  async requestPagedKey<T>(path: string, key: string, maxPages: number): Promise<T[]> {
+    const out: T[] = [];
+    let next: string | undefined = path;
+    for (let page = 0; next && page < maxPages; page++) {
+      let res: Response;
+      try {
+        res = await this.fetchRes("GET", next);
+      } catch (e) {
+        if (page === 0) throw e;
+        break;
+      }
+      const text = await res.text();
+      const body = (text.length > 0 ? JSON.parse(text) : {}) as Record<string, unknown>;
+      const chunk = body[key];
+      if (Array.isArray(chunk)) out.push(...(chunk as T[]));
+      next = nextPagePath(res.headers.get("link"), API_BASE);
+    }
+    return out;
+  }
+
+  /**
+   * Upload one release asset (binary) to uploads.github.com — a different host
+   * than the API base, hence its own fetch. Generous timeout: installers are
+   * hundreds of megabytes.
+   */
+  async uploadReleaseAsset(
+    owner: string,
+    repo: string,
+    releaseId: number,
+    name: string,
+    data: Uint8Array,
+    contentType: string,
+  ): Promise<void> {
+    const token = this.getToken();
+    if (!token) {
+      throw new ExpectedError(l10n.t("Not connected to GitHub."));
+    }
+    const uploadUrl = `https://uploads.github.com/repos/${enc(owner)}/${enc(repo)}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`;
+    let res: Response;
+    try {
+      res = await netFetch(
+        uploadUrl,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "GitStudio",
+            "Content-Type": contentType,
+          },
+          body: data as unknown as RequestInit["body"],
+          signal: AbortSignal.timeout(300_000),
+        },
+      );
+    } catch (e) {
+      throw networkError(e, uploadUrl);
+    }
+    if (!res.ok) {
+      throw await githubHttpError(res);
+    }
+  }
+
+  /** REST call that ignores the response body (fire-and-forget mutations). */
+  async requestBody(method: string, path: string, body: unknown): Promise<void> {
+    const token = this.getToken();
+    if (!token) {
+      throw new ExpectedError(l10n.t("Not connected to GitHub."));
+    }
+    // Wrapped for the same reason `request` is: an unwrapped fetch lets a bare
+    // `TypeError: fetch failed` escape to the crash reporter, so going offline
+    // filed a report instead of telling the user to check their connection.
+    let res: Response;
+    try {
+      res = await netFetch(`${API_BASE}${path}`, {
+        method,
+        signal: AbortSignal.timeout(30_000),
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "GitStudio",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      throw networkError(e, `${API_BASE}${path}`);
+    }
+    if (!res.ok) {
+      throw await githubHttpError(res);
+    }
+  }
+
+  /**
+   * GraphQL call (Projects v2 etc.). Public for the per-section modules.
+   *
+   * `opts.onPartial` is called when the response answered some of the query and
+   * reported the rest — see the `errors` handling below. A caller that does not
+   * pass it gets the partial data silently, which is the same answer it would
+   * have built from those fields anyway.
+   */
+  async graphql<T>(
+    query: string,
+    variables: unknown,
+    opts?: { onPartial?: (errors: GraphqlFailure[]) => void },
+  ): Promise<T> {
+    const token = this.getToken();
+    if (!token) {
+      throw new ExpectedError(l10n.t("Not connected to GitHub."));
+    }
+    let res: Response;
+    try {
+      res = await netFetch(GRAPHQL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "GitStudio",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch (e) {
+      throw networkError(e, GRAPHQL);
+    }
+    if (!res.ok) {
+      throw await githubHttpError(res);
+    }
+    const json = (await res.json()) as {
+      data?: T;
+      errors?: GraphqlFailure[];
+    };
+    const errors = json.errors ?? [];
+    if (errors.length) {
+      // GraphQL reports failure in a 200 body, so the status-code policy never
+      // sees it — a rate limit or a missing scope arrives here instead.
+      //
+      // But an `errors` array is NOT the same thing as a failed request. The
+      // server resolves every field it can and reports the rest, and throwing
+      // on errors[0] discarded everything that DID resolve: one repository the
+      // account can no longer see took the whole answer down. Keep what came
+      // back when it is safe to (see keepsPartialData), and tell the caller
+      // what was missing so it can say so rather than present a short list as
+      // the whole truth.
+      if (!keepsPartialData(json.data, errors)) {
+        throw graphqlError(errors[0]);
+      }
+      opts?.onPartial?.(errors);
+    }
+    return json.data as T;
+  }
+
+  // ── User ──
+  async currentLogin(): Promise<string | undefined> {
+    try {
+      const u = await this.request<{ login: string }>("GET", "/user");
+      return u.login;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ── Pull requests ──
+  /** `state` is GitHub's: open | closed | all. "merged" is not a state upstream
+   *  — a merged PR is closed with `merged_at` set — so the renderer asks for
+   *  `closed` and narrows locally. */
+  async listPulls(owner: string, repo: string, state: "open" | "closed" | "all" = "open"): Promise<PullRequest[]> {
+    const raw = await this.requestPaged<RawPull>(
+      `/repos/${enc(owner)}/${enc(repo)}/pulls?state=${state}&sort=updated&direction=desc&per_page=100`,
+      PAGE_CAPS.list,
+    );
+    return raw.map(mapPull);
+  }
+  async getPull(owner: string, repo: string, n: number): Promise<PullRequest> {
+    return mapPull(await this.request<RawPull>("GET", `/repos/${enc(owner)}/${enc(repo)}/pulls/${n}`));
+  }
+  async getPullFiles(owner: string, repo: string, n: number): Promise<PrFile[]> {
+    const raw = await this.requestPaged<RawFile>(
+      `/repos/${enc(owner)}/${enc(repo)}/pulls/${n}/files?per_page=100`,
+      PAGE_CAPS.detail,
+    );
+    return raw.map((f) => ({
+      filename: f.filename,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      // In the response already — dropping it left every rename unable to say
+      // what it was renamed from.
+      ...(f.previous_filename ? { previousFilename: f.previous_filename } : {}),
+    }));
+  }
+  async mergePull(owner: string, repo: string, n: number, method: "merge" | "squash" | "rebase"): Promise<void> {
+    await this.requestBody("PUT", `/repos/${enc(owner)}/${enc(repo)}/pulls/${n}/merge`, { merge_method: method });
+  }
+  async approvePull(owner: string, repo: string, n: number): Promise<void> {
+    await this.requestBody("POST", `/repos/${enc(owner)}/${enc(repo)}/pulls/${n}/reviews`, { event: "APPROVE" });
+  }
+  async listPrCommits(owner: string, repo: string, n: number): Promise<PrCommitInfo[]> {
+    const raw = await this.requestPaged<RawPrCommit>(
+      `/repos/${enc(owner)}/${enc(repo)}/pulls/${n}/commits?per_page=100`,
+      PAGE_CAPS.detail,
+    );
+    return raw.map((c) => {
+      const full = c.commit?.message ?? "";
+      const nl = full.indexOf("\n");
+      return {
+        sha: c.sha,
+        shortSha: c.sha.slice(0, 7),
+        message: nl < 0 ? full : full.slice(0, nl),
+        // The rest of the message, if there is any. GitHub's own commits list
+        // hangs a "…" on rows that have one and expands it in place; we threw
+        // the body away here and could not have offered it.
+        body: nl < 0 ? "" : full.slice(nl + 1).trim(),
+        author: c.commit?.author?.name ?? c.author?.login ?? "unknown",
+        login: c.author?.login,
+        avatarUrl: c.author?.avatar_url,
+        date: c.commit?.author?.date ?? "",
+        // GitHub shows a "Verified" badge on a signed commit; the flag was in
+        // this very response and dropped.
+        verified: c.commit?.verification?.verified === true,
+        // A merge has more than one parent, and reads completely differently
+        // from an ordinary commit in a list of them.
+        isMerge: (c.parents?.length ?? 0) > 1,
+      };
+    });
+  }
+  /** The conversation = issue comments + reviews, merged chronologically. */
+  async listConversation(owner: string, repo: string, n: number): Promise<PrComment[]> {
+    const [comments, reviews] = await Promise.all([
+      this.requestPaged<RawComment>(`/repos/${enc(owner)}/${enc(repo)}/issues/${n}/comments?per_page=100`, PAGE_CAPS.detail).catch(() => []),
+      this.requestPaged<RawReview>(`/repos/${enc(owner)}/${enc(repo)}/pulls/${n}/reviews?per_page=100`, PAGE_CAPS.detail).catch(() => []),
+    ]);
+    const out: PrComment[] = [];
+    for (const c of comments) {
+      out.push({
+        author: c.user?.login ?? "unknown",
+        body: c.body ?? "",
+        createdAt: c.created_at,
+        kind: "comment",
+        // The same fields an issue comment carries. They were on the wire and
+        // dropped here, which is why a PR conversation could not do anything an
+        // issue thread could.
+        id: c.id,
+        updatedAt: c.updated_at,
+        authorAssociation: c.author_association,
+        reactions: mapReactions(c.reactions),
+        htmlUrl: c.html_url,
+      });
+    }
+    for (const r of reviews) {
+      if (r.state === "PENDING") continue;
+      out.push({ author: r.user?.login ?? "unknown", body: r.body ?? "", createdAt: r.submitted_at ?? "", kind: "review", state: r.state });
+    }
+    out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    return out;
+  }
+  async listCheckRuns(owner: string, repo: string, ref: string): Promise<CheckRun[]> {
+    try {
+      const raw = await this.request<{ check_runs?: RawCheck[] }>(
+        "GET",
+        `/repos/${enc(owner)}/${enc(repo)}/commits/${enc(ref)}/check-runs?per_page=100`,
+      );
+      return (raw.check_runs ?? []).map((c) => ({
+        name: c.name,
+        status: c.status ?? "",
+        conclusion: c.conclusion ?? "",
+        detailsUrl: c.details_url ?? undefined,
+      }));
+    } catch {
+      return [];
+    }
+  }
+  async getCombinedStatus(owner: string, repo: string, ref: string): Promise<CombinedStatus> {
+    try {
+      const raw = await this.request<{ state?: string; total_count?: number }>(
+        "GET",
+        `/repos/${enc(owner)}/${enc(repo)}/commits/${enc(ref)}/status`,
+      );
+      return { state: raw.state ?? "", totalCount: raw.total_count ?? 0 };
+    } catch {
+      return { state: "", totalCount: 0 };
+    }
+  }
+
+  // ── Issues (the issues endpoint also returns PRs — filter them out) ──
+  async listOpenIssues(owner: string, repo: string): Promise<IssueInfo[]> {
+    const raw = await this.requestPaged<RawIssue>(
+      `/repos/${enc(owner)}/${enc(repo)}/issues?state=open&sort=updated&direction=desc&per_page=100`,
+      PAGE_CAPS.list,
+    );
+    return raw.filter((i) => !i.pull_request).map(mapIssue);
+  }
+  async getIssue(owner: string, repo: string, n: number): Promise<IssueInfo> {
+    return mapIssue(await this.request<RawIssue>("GET", `/repos/${enc(owner)}/${enc(repo)}/issues/${n}`));
+  }
+
+  // Projects (v2, via GraphQL) live in ./github/projects.ts, which is what
+  // `project:list` calls. A second copy used to sit here, unreachable, and it
+  // answered every failure with `return []` — the laundering this whole file
+  // exists to prevent, kept alive beside the code that prevents it. Deleted
+  // rather than fixed twice.
+}
+
+export function enc(part: string): string {
+  return encodeURIComponent(part);
+}
+
+// RawUser + mapUser live in github/maps.ts now (imported above) — re-exported
+// here so the per-section modules' existing `import { mapUser } from
+// "../githubClient"` keeps working.
+export { mapUser, type RawUser };
+interface RawRef {
+  ref: string;
+  sha: string;
+}
+interface RawFile {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  /** GitHub's own field name, present on renames and copies. */
+  previous_filename?: string;
+}
+interface RawPrCommit {
+  sha: string;
+  commit?: {
+    message?: string;
+    author?: { name?: string; email?: string; date?: string };
+    committer?: { name?: string; date?: string };
+    verification?: { verified?: boolean; reason?: string };
+  };
+  // The GitHub ACCOUNT behind the commit, when it matched one — this is where
+  // the avatar comes from. It was declared as `{login}` and everything else in
+  // the same object thrown away, so the rows had no faces on them.
+  author?: RawUser | null;
+  parents?: Array<{ sha: string }>;
+  html_url?: string;
+}
+interface RawComment {
+  id?: number;
+  user?: RawUser | null;
+  body?: string;
+  created_at: string;
+  updated_at?: string;
+  author_association?: string;
+  reactions?: { total_count?: number; [k: string]: unknown };
+  html_url?: string;
+}
+interface RawReview {
+  user?: RawUser | null;
+  body?: string;
+  state?: string;
+  submitted_at?: string;
+}
+interface RawCheck {
+  name: string;
+  status?: string;
+  conclusion?: string;
+  details_url?: string;
+}
+

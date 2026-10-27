@@ -1,0 +1,95 @@
+# Headless render harness
+
+Runs the WHOLE desktop renderer in plain headless Chrome against realistic
+fixtures — no Electron, no GitHub, no repo. This is how UI work on the desktop
+app gets **seen** before it ships: every view, both themes, list and detail
+states, driven by scripted scenes.
+
+```sh
+cd apps/desktop
+node esbuild.js          # build the renderer bundles
+harness/gen.sh           # assemble harness/page from dist + shim.js
+harness/shot.sh issues out/issues.png            # screenshot a scene
+harness/shot.sh 'issues~open31' out/detail.png   # …with driver steps
+harness/shot.sh 'prs~open106~click:.gh-subtab%5Bdata-sub%3Dfiles%5D' out/files.png
+harness/shot.sh issues out/light.png light       # light theme
+```
+
+The browser is `$GS_CHROME`, else Playwright's windowless
+`chrome-headless-shell` (the newest in its cache), else its Chrome for Testing,
+and only then a Chrome installed on the system. That order is
+`packages/webview-ui/test/findChrome.mjs`, shared with the webview-ui headless
+tests; every launcher here takes its browser from `chrome.mjs`, and
+`test/harnessChrome.test.ts` fails if one names a Chrome of its own. A run must
+never fall through to the owner's own `/Applications/Google Chrome.app` — one
+did, 111 times, before this.
+
+## Functional checks
+
+Screenshots prove a surface renders. They do not prove the count badge tracks
+the filter, that a disabled button is disabled, that a menu is dismissed on
+navigation, or that two columns share an x — those are assertions.
+
+```sh
+node harness/check.mjs                 # every case
+node harness/check.mjs count palette   # only cases matching these substrings
+```
+
+Each case names a scene and an assertion from `checks.js`, which runs INSIDE
+the page after the scene driver finishes and returns a list of failures. The
+runner exits non-zero if anything fails, so it can gate a commit. Add a case by
+writing the assertion in `checks.js` and listing `[id, scene]` in `check.mjs`.
+
+## Measuring, rather than asserting
+
+A check pins one named invariant. These three sweep every scene and report what
+is wrong, which is how you find the defects nobody thought to write a check for
+— and all three report things a screenshot review cannot see.
+
+```sh
+node harness/contrast.mjs --sweep --theme=light   # WCAG ratio for every text node
+node harness/affordance.mjs --sweep               # cursor, name, hit size, hover, focus
+node harness/fit.mjs --sweep                      # overflow, clipping, overlap, stranded space
+node harness/contrast.mjs issues --theme=light    # one scene
+```
+
+Each exits non-zero when it finds anything, so they gate a run too. Two traps
+worth knowing before trusting a result: headless Chrome's virtual clock leaves
+views mid-entrance-animation, so all three kill animations before measuring;
+and `document.styleSheets[].cssRules` throws on a `file://` page, which is why
+`affordance.mjs` reads the built stylesheet in node and passes the selectors in
+rather than scanning it from inside the page.
+
+All three also measure INSIDE shadow roots — the graph, the rail, the commit
+details and the rebase view are Lit elements that `querySelectorAll` never
+enters — and inject their animation-off style into every root, since a
+document stylesheet does not reach one either. `affordance.mjs` reads a
+component's own `:hover`/`:focus` rules from its constructed stylesheets (those
+are readable from the page). `affordance.mjs` and `fit.mjs` print how many
+elements they reached per component and take `--expect-shadow=<host>[@<sel>]`,
+which fails the run when nothing was measured in that component (inside `sel`,
+an open popover say): a clean report over nothing is not a pass.
+
+```sh
+node harness/affordance.mjs 'graph~click:.gh-branches' --expect-shadow=gitstudio-graph@.gh-branches-pop
+node harness/fit.mjs 'graph~click:.gh-branches' --expect-shadow=gitstudio-graph@.gh-branches-pop
+```
+
+Each gives Chrome a throwaway `--user-data-dir` so runs cannot share state, and
+removes it on the way out — on a clean finish, on Ctrl-C, and on the `pkill` a
+stalled sweep gets. Without that they accumulate: one night of sweeps left 380
+profiles and 2.2GB in the temp folder.
+
+`shim.js` fakes the preload's `window.gitstudio` bridge (see `shared/ipc.ts`)
+with fixtures for the GitStudio repo itself. Unstubbed channels log
+`[shim missing] <channel>` to the console and resolve safely — add a fixture
+when a view needs one. `harness/page/` and `harness/out/` are generated.
+
+Every scene starts the way the app does: under the launch screen, which
+`gen.sh` copies out of the built `dist/renderer/index.html` (its `launch:*`
+markers) so the two cannot drift. The shell's real hand-off takes it out of
+the way as the app comes up — no pointer events from its first frame of
+leaving, gone from the page a quarter second later, before any check
+measures; `the-launch-screen-covers-the-start-and-hands-off`
+checks the first frame (captured by `checks.js` before the bundle runs) and
+the hand-off, in both themes and under reduced motion.

@@ -1,0 +1,189 @@
+import * as vscode from "vscode";
+import type { Change } from "../git/git";
+import { EMPTY_TREE, openSidesDiff } from "../history/revisionContentProvider";
+import { nativeDiffSides, type NativeSide } from "./nativeDiffSides";
+import { openDiff } from "../merge/diffPlaces";
+import * as l10n from "@vscode/l10n";
+
+// Change-row helpers shared by the unified Commit webview (commitView.ts) and
+// the line/hunk-staging commands. The standalone "Changes" tree view was folded
+// into the Commit webview (which now renders the working-tree changes inline,
+// SCM-style), so the TreeDataProvider no longer lives here — only the diff
+// opener, the vscode.git Status → icon/letter mapping, and the relative-path
+// helper remain, reused verbatim by the webview's host side.
+
+// vscode.git's `Status` is an ambient enum in git.d.ts (types only — no runtime
+// value), so we mirror its numeric values here for the runtime switch. The order
+// matches microsoft/vscode's extensions/git/src/api/git.d.ts (API v1).
+const enum St {
+  INDEX_MODIFIED = 0,
+  INDEX_ADDED = 1,
+  INDEX_DELETED = 2,
+  INDEX_RENAMED = 3,
+  INDEX_COPIED = 4,
+  MODIFIED = 5,
+  DELETED = 6,
+  UNTRACKED = 7,
+  IGNORED = 8,
+  INTENT_TO_ADD = 9,
+  INTENT_TO_RENAME = 10,
+  TYPE_CHANGED = 11,
+  ADDED_BY_US = 12,
+  ADDED_BY_THEM = 13,
+  DELETED_BY_US = 14,
+  DELETED_BY_THEM = 15,
+  BOTH_ADDED = 16,
+  BOTH_DELETED = 17,
+  BOTH_MODIFIED = 18,
+}
+
+/** Which group a change belongs to (used by the diff opener + the webview). */
+export type GroupKind = "merge" | "staged" | "unstaged";
+
+const FILE_CONTEXT: Record<GroupKind, string> = {
+  merge: "gitstudio.change.merge",
+  staged: "gitstudio.change.staged",
+  unstaged: "gitstudio.change.unstaged",
+};
+
+/**
+ * A lightweight changed-file descriptor. Retained (instead of a TreeItem) so the
+ * Commit webview's host side can reuse `openChangeDiff` to open the same diffs
+ * without standing up a tree. Mirrors the fields the diff opener needs.
+ */
+export class ChangeFileNode {
+  readonly resourceUri: vscode.Uri;
+  readonly contextValue: string;
+
+  constructor(
+    readonly kind: GroupKind,
+    readonly root: string,
+    readonly change: Change,
+  ) {
+    this.resourceUri = change.uri;
+    this.contextValue = FILE_CONTEXT[kind];
+  }
+}
+
+/**
+ * Opens the appropriate diff for a change row: working-tree vs index for
+ * unstaged edits, index vs HEAD for staged edits, and working vs HEAD for merge
+ * entries. Reuses the `gitstudio-rev` content provider (rev "" = index,
+ * "HEAD" = committed) so no extra scheme is needed.
+ *
+ * With `gitUri` (vscode.git's URI maker) and a change vscode.git reported, a
+ * plain modification opens on vscode.git's own URIs instead, so VS Code's own
+ * selective staging works in the diff too — see nativeDiffSides.
+ */
+export async function openChangeDiff(
+  node: ChangeFileNode,
+  gitUri?: (uri: vscode.Uri, ref: string) => vscode.Uri | undefined,
+): Promise<void> {
+  const { root, change } = node;
+  const rel = relativePath(root, change.uri.fsPath);
+  const fileName = baseName(rel);
+
+  // The eager path's synthesized Change has no status, and keeps our own URIs.
+  const native = gitUri && nativeDiffSides(node.kind, change.status);
+  if (native && gitUri) {
+    const side = (s: NativeSide): vscode.Uri | undefined =>
+      s === "file" ? change.uri : gitUri(s.original ? change.originalUri ?? change.uri : change.uri, s.ref);
+    const left = side(native.left);
+    const right = side(native.right);
+    if (left && right && (await existsOnDisk(change.uri))) {
+      const label = node.kind === "staged" ? l10n.t("{0} (Staged)", fileName) : `${fileName} (${l10n.t("Working Tree")})`;
+      await openDiff(left, right, label, {
+        preview: true,
+      } satisfies vscode.TextDocumentShowOptions, "changes");
+      return;
+    }
+  }
+
+  if (node.kind === "staged") {
+    // A staged rename is read from HEAD under its OLD name: HEAD has no file
+    // at the new one, and reading it there showed the whole file as added.
+    const original = change.originalUri ? relativePath(root, change.originalUri.fsPath) : rel;
+    await openSidesDiff(
+      root,
+      rel,
+      { left: { rev: "HEAD", path: original }, right: { rev: "" } }, // "" = the index
+      l10n.t("{0} (Staged)", fileName),
+      "changes",
+    );
+    return;
+  }
+
+  // unstaged / merge: working tree (right) vs index or HEAD (left). A file
+  // deleted from the working tree has no right side; the file URI of a path
+  // that is not on disk is not an empty file, so it is read as nothing.
+  const baseRev = node.kind === "merge" ? "HEAD" : "";
+  const gone = !(await existsOnDisk(change.uri));
+  const label = node.kind === "merge" ? l10n.t("Working Tree vs HEAD") : l10n.t("Working Tree");
+  await openSidesDiff(
+    root,
+    rel,
+    { left: { rev: baseRev }, right: gone ? { rev: EMPTY_TREE } : { rev: undefined } },
+    `${fileName} (${gone ? l10n.t("Deleted") : label})`,
+    "changes",
+  );
+}
+
+async function existsOnDisk(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The single-letter status code (M/A/D/U/R/!/I/T) for a vscode.git Status. */
+export function statusLetter(status: number): string {
+  switch (status) {
+    case St.INDEX_ADDED:
+    case St.INTENT_TO_ADD:
+      return "A";
+    case St.UNTRACKED:
+      return "U";
+    case St.INDEX_DELETED:
+    case St.DELETED:
+      return "D";
+    case St.INDEX_RENAMED:
+    case St.INDEX_COPIED:
+      return "R";
+    case St.BOTH_MODIFIED:
+    case St.BOTH_ADDED:
+    case St.ADDED_BY_US:
+    case St.ADDED_BY_THEM:
+    case St.DELETED_BY_US:
+    case St.DELETED_BY_THEM:
+    case St.BOTH_DELETED:
+      return "!";
+    case St.IGNORED:
+      return "I";
+    case St.TYPE_CHANGED:
+      return "T";
+    case St.INDEX_MODIFIED:
+    case St.MODIFIED:
+    default:
+      return "M";
+  }
+}
+
+/** Repo-root-relative, forward-slashed path. */
+export function relativePath(root: string, fsPath: string): string {
+  const normRoot = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normPath = fsPath.replace(/\\/g, "/");
+  if (normPath === normRoot) {
+    return "";
+  }
+  if (normPath.startsWith(normRoot + "/")) {
+    return normPath.slice(normRoot.length + 1);
+  }
+  return normPath;
+}
+
+function baseName(rel: string): string {
+  const parts = rel.split("/");
+  return parts[parts.length - 1] || rel;
+}

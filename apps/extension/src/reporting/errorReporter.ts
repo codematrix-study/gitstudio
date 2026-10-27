@@ -1,0 +1,257 @@
+import * as vscode from "vscode";
+import * as os from "node:os";
+import * as https from "node:https";
+import * as http from "node:http";
+import { URL } from "node:url";
+import { randomId, safeShort, scrub, scrubExtra, scrubGitMessage } from "@gitstudio/host-bridge/scrub";
+
+/**
+ * Anonymous, PII-scrubbed crash reporting — so during the beta we hear about
+ * commands that fail on users' machines without waiting for someone to file a
+ * report, and never learn who they are or what they're working on.
+ *
+ * On by default, but consent-gated — nothing is ever sent unless ALL hold:
+ *   1. VS Code's global telemetry is on (`vscode.env.isTelemetryEnabled`). This
+ *      is the OS-level opt-out; if a user turned VS Code telemetry off, we honor
+ *      it and send nothing.
+ *   2. GitStudio's own `gitstudio.errorReporting.enabled` setting is on (the
+ *      default) — a one-flip opt-out that's independent of #1.
+ *   3. A collector endpoint is set (`gitstudio.errorReporting.endpoint`, default
+ *      https://gitstudio.dev/api/errors). Blank it to disable sending entirely.
+ *
+ * What it captures: the SHAPE of a failure only — a scrubbed error name/message/
+ * stack, or the failed git operation + scrubbed stderr — tagged with a random,
+ * rotatable install id (never identity), the extension/editor versions, and the
+ * OS. Absolute paths, home dirs, emails, a remote URL's credentials and
+ * org/repo (its HOST is kept), tokens, and full SHAs are stripped before
+ * anything leaves the machine; git messages also lose file and branch names
+ * and commit subjects. Never repo contents. What is sent, and how to turn it
+ * off, is apps/extension/PRIVACY.md.
+ */
+
+const INSTALL_ID_KEY = "gitstudio.errorReporting.installId.v1";
+const MAX_EVENTS_PER_SESSION = 50;
+
+/**
+ * Can this rejection/exception be attributed to GitStudio?
+ *
+ * `process.on("unhandledRejection")` is PROCESS-wide, and the extension host is
+ * shared by every installed extension — so this handler sees their failures too.
+ * A stack that points into our own bundle is what tells the two apart.
+ *
+ * The subtle part, and the reason this is a function with a test: a rejection is
+ * only attributable when the reason is ALREADY an Error. Wrapping a non-Error in
+ * `new Error(String(reason))` synthesizes a stack rooted at the wrapping call —
+ * i.e. inside this file — so the ownership check then matches our own bundle and
+ * says yes to *everything*. That shipped, and it filed other extensions' crashes
+ * as ours, including one whose message carried a stranger's source code.
+ *
+ * A non-Error rejection carries no provenance whatsoever, so it cannot be shown
+ * to be ours and is dropped. Losing our own non-Error rejections is the right
+ * side of that trade: the alternative is transmitting other people's data.
+ *
+ * Exported for tests — the class itself needs a live vscode ExtensionContext.
+ */
+export function isAttributable(reason: unknown, extPath: string): reason is Error {
+  if (!(reason instanceof Error)) {
+    return false;
+  }
+  // Read the ORIGINAL stack. Never construct one here.
+  const stack = reason.stack ?? "";
+  if (!stack) {
+    return false;
+  }
+  // Match against the CALL FRAMES only.
+  //
+  // `.stack` begins with the message, and the message is attacker-shaped text we
+  // do not control — another extension's `ENOENT: ... '/Users/me/code/gitstudio/
+  // src/a.ts'` would otherwise be attributed to us purely because the user keeps
+  // a directory by that name. Provenance lives in the frames, never in the prose.
+  const frames = stack
+    .split("\n")
+    .filter((line) => /^\s+at\s/.test(line))
+    .join("\n");
+  if (!frames) {
+    return false;
+  }
+  return frames.includes(extPath) || /gitstudio\.gitstudio|[/\\]gitstudio[/\\]/i.test(frames);
+}
+
+export class ErrorReporter implements vscode.Disposable {
+  /** The active instance, so scattered call sites can report without threading. */
+  static current: ErrorReporter | undefined;
+
+  private readonly installId: string;
+  private readonly extVersion: string;
+  private enabled = false;
+  private endpoint: string | undefined;
+  private sent = 0;
+  private readonly seen = new Set<string>();
+  private readonly disposables: vscode.Disposable[] = [];
+  private readonly extPath: string;
+  private readonly onRejection: (reason: unknown) => void;
+  private readonly onException: (err: Error) => void;
+
+  constructor(context: vscode.ExtensionContext) {
+    this.extPath = context.extensionPath;
+    this.extVersion = (context.extension.packageJSON as { version?: string }).version ?? "0.0.0";
+    let id = context.globalState.get<string>(INSTALL_ID_KEY);
+    if (!id) {
+      id = randomId();
+      void context.globalState.update(INSTALL_ID_KEY, id);
+    }
+    this.installId = id;
+    this.refresh();
+
+    // React to consent/config changes live.
+    this.disposables.push(
+      vscode.env.onDidChangeTelemetryEnabled(() => this.refresh()),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration("gitstudio.errorReporting")) {
+          this.refresh();
+        }
+      }),
+    );
+
+    // Catch the failures that actually reach users: most commands run as
+    // fire-and-forget "void asyncFn()", so their rejections land here. We report
+    // ONLY errors whose stack points into GitStudio's own code, and never
+    // suppress or alter them — other extensions' errors pass through untouched.
+    this.onRejection = (reason) => {
+      if (isAttributable(reason, this.extPath)) {
+        this.captureError("unhandledRejection", reason);
+      }
+    };
+    this.onException = (err) => {
+      if (isAttributable(err, this.extPath)) {
+        this.captureError("uncaughtException", err);
+      }
+    };
+    process.on("unhandledRejection", this.onRejection);
+    process.on("uncaughtException", this.onException);
+
+    ErrorReporter.current = this;
+  }
+
+  private refresh(): void {
+    const cfg = vscode.workspace.getConfiguration("gitstudio.errorReporting");
+    this.enabled = vscode.env.isTelemetryEnabled && cfg.get<boolean>("enabled", true);
+    // A blank endpoint disables sending entirely (a second, explicit opt-out).
+    const ep = (cfg.get<string>("endpoint") ?? "").trim();
+    this.endpoint = ep || undefined;
+  }
+
+  /** Report a thrown/rejected error (from a command or internal op). */
+  captureError(where: string, err: unknown, extra?: Record<string, string>): void {
+    try {
+      const e = err instanceof Error ? err : new Error(String(err));
+      this.send("error", {
+        where: safeShort(where, 60),
+        name: safeShort(e.name || "Error", 60),
+        message: scrub(e.message || "").slice(0, 300),
+        stack: scrub(e.stack || "").slice(0, 1600),
+        ...scrubExtra(extra),
+      });
+    } catch {
+      // Crash reporting must never itself crash the host.
+    }
+  }
+
+  /** Report a git operation that failed (the common "it just failed"). `label`
+   *  is our own fixed English title (e.g. "git reset failed") — never user data. */
+  captureGitError(label: string, stderr: string): void {
+    try {
+      this.send("git-error", {
+        op: safeShort(label, 80),
+        // scrubGitMessage, not scrub: git stderr names FILES and BRANCHES, which
+        // PRIVACY.md promises never leave the machine. scrub() only covers
+        // absolute paths, emails, URLs, tokens and SHAs — all of which are
+        // repo-INdependent — so a repo-relative path or a quoted ref sailed
+        // straight through.
+        stderr: scrubGitMessage(stderr || "").slice(0, 600),
+      });
+    } catch {
+      // Crash reporting must never itself crash the host.
+    }
+  }
+
+  private send(event: string, fields: Record<string, string>): void {
+    if (!this.enabled || !this.endpoint) {
+      return;
+    }
+    if (this.sent >= MAX_EVENTS_PER_SESSION) {
+      return;
+    }
+    // Dedup identical failures within a session — one signal per distinct issue.
+    const sig = `${event}|${fields.where ?? fields.op ?? ""}|${fields.name ?? ""}|${(fields.message ?? fields.stderr ?? "").slice(0, 80)}`;
+    if (this.seen.has(sig)) {
+      return;
+    }
+    this.seen.add(sig);
+    this.sent++;
+
+    const payload = {
+      event,
+      installId: this.installId,
+      extVersion: this.extVersion,
+      // English on purpose: a field of the report we send ourselves.
+      engine: `VS Code ${vscode.version}`,
+      product: vscode.env.appName, // "Visual Studio Code" / "Cursor" / "VSCodium"
+      platform: process.platform,
+      arch: process.arch,
+      osRelease: os.release(),
+      ...fields,
+    };
+    postJson(this.endpoint, payload);
+  }
+
+  dispose(): void {
+    process.removeListener("unhandledRejection", this.onRejection);
+    process.removeListener("uncaughtException", this.onException);
+    for (const d of this.disposables) {
+      d.dispose();
+    }
+    if (ErrorReporter.current === this) {
+      ErrorReporter.current = undefined;
+    }
+  }
+}
+
+/** Fire-and-forget POST — short timeout, never throws, never blocks the editor. */
+function postJson(endpoint: string, payload: unknown): void {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return;
+  }
+  const mod = url.protocol === "https:" ? https : http;
+  try {
+    const body = Buffer.from(JSON.stringify(payload));
+    const req = mod.request(
+      {
+        method: "POST",
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: url.pathname + url.search,
+        headers: {
+          "content-type": "application/json",
+          "content-length": body.length,
+          "user-agent": "gitstudio-error-reporter",
+        },
+        timeout: 4000,
+      },
+      (res) => {
+        res.resume(); // drain
+      },
+    );
+    req.on("error", () => {});
+    req.on("timeout", () => req.destroy());
+    req.end(body);
+  } catch {
+    // Never let error reporting surface to the user.
+  }
+}

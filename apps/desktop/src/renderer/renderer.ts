@@ -1,0 +1,12128 @@
+// GitStudio desktop renderer — the app shell.
+//
+// Layout: a welcome / repo-picker screen, or — once a repo is open — a top bar
+// (brand mark, repo + branch switchers, refresh) above a main area that mounts
+// the shared <gitstudio-graph>. A commit selection opens a details + changed-
+// files panel; clicking a file opens the shared Monaco DiffView, or the 3-pane
+// MergeView for a conflict. Theme is supplied via the desktopTheme shim so every
+// shared component renders unchanged.
+
+// First: the language bundle the preload put on the page goes to @vscode/l10n
+// before any module builds a word (shared modules build some at import time).
+import "@gitstudio/l10n/webview";
+import "./l10nBoot";
+// Reuse the shared component stylesheets verbatim: the JetBrains diff/merge
+// palette + gutter chrome, and the graph host-page frame. The renderer carries
+// the same look as the extension because it ships the same CSS.
+import "@gitstudio/webview-ui/styles/diff.css";
+// The merge shell's chrome and the conflicts dashboard — the same stylesheets
+// the extensions ship, scoped to their own roots.
+import "@gitstudio/webview-ui/styles/shell.css";
+import "@gitstudio/webview-ui/styles/conflicts.css";
+import { ConflictsDashboard } from "@gitstudio/webview-ui/conflicts/dashboard";
+import type { ConflictsState } from "@gitstudio/host-bridge/conflictsProtocol";
+import { clickIntent, parseRowKey, rangeBetween, reconcile, rowKey, selectionEntries, selectionPaths } from "./selection";
+import { installNavStack } from "./navStack";
+import { didUndoable, dropUndoScope, installUndoKey, push as pushUndoable, redoOrText, setUndoScope, undoOrText } from "./undo";
+import { repoChanged, whileSameRepo } from "./repoEpoch";
+import { SettleLatest } from "@gitstudio/host-bridge/settleLatest";
+import {
+  currentSession,
+  endSession,
+  inOpenLanding,
+  onRunningChange,
+  runningOperation,
+  setActiveSession,
+  shellHost,
+  type TabSession,
+} from "./bridge";
+import { RepoTabStrip, type TabStripItem } from "./repoTabs";
+import { stepTab, tabAtDigit, tabKeyAction } from "./tabModel";
+import { TopbarRead } from "./topbarRead";
+import { saveDraftIn, takeDraftIn } from "./draftStore";
+import { renderCommit } from "./views/commit";
+import { renderJobLog } from "./views/jobLog";
+import { renderReleaseCompose } from "./views/releaseCompose";
+import { renderIssueCompose } from "./views/issueCompose";
+import { renderRefDetail } from "./views/refDetail";
+import "@gitstudio/webview-ui/styles/graph.css";
+import "@gitstudio/webview-ui/commit-details";
+import { gravatarUrl, setGravatarEnabled } from "@gitstudio/webview-ui/graph/avatar";
+import "./styles/app.css";
+// The COMPLETE codicon codepoint map from the real @vscode/codicons library —
+// imported last so its correct codepoints override any legacy hand-typed one.
+import "./styles/codicons-full.css";
+import { host } from "./bridge";
+import { applyDarkStyle, applyTheme, followSystemTheme, resolveTheme } from "./desktopTheme";
+import { DARK_STYLES, DEFAULT_DARK_STYLE, parseDarkStyle, previewIconFor, type DarkStyle } from "../shared/darkStyle";
+import { LANGUAGES, type LanguageSetting } from "../shared/languages";
+import * as l10n from "@vscode/l10n";
+import type { AppTheme, ThemeMode, LogoMode } from "./desktopTheme";
+import { dismissLaunchScreen } from "./launchScreen";
+import { GraphMount } from "./graphMount";
+import { DiffPanel, type ConflictHandlers } from "./diffPanel";
+import {
+  DesktopConflicts,
+  opIndicator,
+  stripText,
+} from "./mergeParity";
+import { mergeSettingsCard } from "./views/mergeSettingsCard";
+import { ReadonlyFileView } from "./readonlyFileView";
+import { renderMarkdown } from "./markdown";
+import { renderAssistant, seedAssistantGoal } from "./assistant";
+import { aiModelsCard, agentAccessCard } from "./aiSettings";
+import { openInButton, REVEAL_LABEL } from "./openIn";
+import { waitForGit } from "./noGit";
+import { editorsCard } from "./views/editorsCard";
+import { aiChip, openAssistantTab, registerAssistantTab, streamInto, aiEnabled } from "./aiAssist";
+import { toast, clearToasts, confirmDialog, promptInline, promptChoice, promptMessage, openModal, type ToastAction } from "./dialogs";
+import { refLabel, revealCandidate, storedFilterOf, withRef } from "@gitstudio/host-bridge/graphRefFilter";
+import { worktreeRemovalQuestion, worktreeRemovalRefusal } from "@gitstudio/host-bridge/worktreeRemoval";
+import { checkedOutElsewhereMessage } from "@gitstudio/host-bridge/branchElsewhere";
+import { createBranchFlow } from "./branchCreate";
+import type { BranchStart } from "../shared/branchStart";
+import { SUPPORT_LINKS, supportSentence } from "../shared/support";
+import { TerminalDock } from "./terminalDock";
+import { openCloneDialog } from "./cloneDialog";
+import { gget, peek, bust, bustEverywhere, dropCacheScope, setCacheScope, swr, sameData} from "./cache";
+import { dropTabState } from "./tabState";
+import {
+  el,
+  span,
+  glyph,
+  relTime,
+  absTime,
+  relTimeISO,
+  initials,
+  avatarHue,
+  avatarInk,
+  avatar,
+  fileIcon,
+  formatBytes,
+  textBtn,
+  groupLabel,
+  pill,
+  emptyState,
+  loadingState,
+  skeletonList,
+  errorState,
+  settingsCard,
+  settingsField,
+  copyText,
+  cleanErr,
+  isBenignError,
+  brandMark,
+  openMenu,
+  closeMenu,
+  wireResizerKeys,
+  middleTruncate,
+  markSegment,
+  statusWord,
+} from "./ui";
+import type { MenuItem } from "./ui";
+import { plural } from "./textFit";
+import { dismissLayers, isModalOpen, openLayerCount, pageOwnsKeys } from "./overlays";
+import { setFocusScope, setFocusTab, dropFocusTab } from "./focusReturn";
+import { closePeek } from "./peek";
+import type { GitPeekHost } from "./peeks";
+import { CommitContextMenu, askForCommitAction, commitActionItem, manyMenuRows, type ManyAction } from "./contextMenu";
+import { dropCommitFlow } from "./dropCommit";
+import { runManyAction } from "./multiCommit";
+import { askPullMode, pullWithChoice, pullVerdict, type PullOutcome, type PullVerdict } from "./pullFlow";
+import { resetItemLabel, resetToUpstream } from "./resetToUpstream";
+import { installInTheWayAsker } from "./inTheWayAsk";
+import { refCheckoutRequest, refDisplay, type RowRef } from "./refMenuItems";
+import { branchName, isRemoteHead, remoteRefParts, tagName, upstreamLabel, upstreamParts } from "./branchRequests";
+import { explainRefusedCheckout } from "./optionLikeRename";
+import { wireListNav, commitList, ghHeader, searchField, segmented, secRow, facetBar, parkScreen, releaseScreen } from "./views/common";
+import { resolveRelative, wireProseNav } from "./proseNav";
+import { refreshHighlightTheme } from "./highlight";
+import { openCommandPalette, paletteIsOpen } from "./commandPalette";
+import type { PaletteGroup, PaletteItem } from "./commandPalette";
+import type { SectionRender, SectionTarget } from "./views/common";
+import type { FacetSpec, FacetState } from "./facetModel";
+import { renderIssues, openNewIssue } from "./views/issues";
+import { renderMyWork } from "./views/mywork";
+import { renderPrs, openCreatePr } from "./views/prs";
+import { renderActions } from "./views/actions";
+import { renderReleases } from "./views/releases";
+import { openNotificationsPanel, fetchUnreadCount, renderNotifications } from "./views/notifications";
+import { renderExplore } from "./views/explore";
+import { parseRepoRoute, repoRouteId, searchTargetId } from "./exploreRoutes";
+import { renderOrgs, setPeekNav } from "./views/orgs";
+import { renderProjects } from "./views/projects";
+import { renderGists } from "./views/gists";
+import { renderRepositories } from "./views/repositories";
+import { renderDashboard } from "./views/dashboard";
+import { renderRebase } from "./views/rebase";
+import type { CommitDetails as CommitDetailsEl, RefMenuRequest } from "@gitstudio/webview-ui/commit-details";
+import type {
+  BranchInfo,
+  ChangedFile,
+  CommitDetailsPayload,
+  CompareMode,
+  CompareResult,
+  HeadCommit,
+  IssueInfo,
+  MergeMethod,
+  AppSettingsView,
+  HeadInfo,
+  LocalCopy,
+  PrDetail,
+  ProjectInfo,
+  PullRequest,
+  RefInfo,
+  GitHubStatus,
+  RepoInfo,
+  SshKey,
+  StashInfo,
+  WorktreeInfo,
+  WorktreeRemovalInfo,
+  SyncStatus,
+  ConflictModel,
+  FileDiff,
+  GitOpState,
+  CommitActionResult,
+  RepoTabsState,
+} from "../shared/ipc";
+
+
+/**
+ * Do two route targets ask for the same CONTENT?
+ *
+ * Identity fields only — `list` is deliberately ignored, because `undefined`
+ * and `{list: true}` are two spellings of "the list", and treating them as
+ * different would refuse a perfectly good parked list (losing its scroll and
+ * filters) whenever the two spellings met. Used by the keep-alive restore; the
+ * history's own push comparison keeps `list` because there it separates a
+ * detail entry from a list entry.
+ */
+function sameTargetContent(a: SectionTarget | undefined, b: SectionTarget | undefined): boolean {
+  return (
+    a?.number === b?.number &&
+    a?.jobId === b?.jobId &&
+    a?.id === b?.id &&
+    a?.sha === b?.sha &&
+    a?.path === b?.path &&
+    a?.file === b?.file &&
+    a?.ref === b?.ref &&
+    // The lens IS content for the keep-alive comparison: a parked full list
+    // restored over a door that promised "the merged ones" is a dead click.
+    a?.lens === b?.lens
+  );
+}
+
+/**
+ * One repository tab's whole app — its screen (top bar, rail, view host,
+ * terminal dock) and every piece of state behind it (issue #32).
+ *
+ * There is one of these PER TAB, not one whose fields are swapped on a switch:
+ * a late answer closes over `this`, and with an instance per tab it can only
+ * ever write into its own tab. The shell (TabShell, below) attaches the screen
+ * of the tab in front and detaches the rest — detached, so every "is my view
+ * still on screen" guard in the app (`isConnected`) stands a background tab's
+ * pollers down by the rules that already stand a parked view's down.
+ */
+class App {
+  constructor(
+    private readonly shell: TabShell,
+    /** This tab's lifetime; the bridge delivers its answers only while it is in front. */
+    readonly session: TabSession,
+    /** The repository, or undefined for the no-repository screen. */
+    private readonly info: RepoInfo | undefined,
+    /** A tab the last session had open, brought back at launch — it comes back
+     *  where it was left, Search included — rather than one opened since. */
+    private readonly restoredAtLaunch = false,
+  ) {}
+
+  /** This tab's whole screen — attached while it is in front, detached otherwise. */
+  screenEl?: HTMLElement;
+  /** Where the tab's view and rail were scrolled when it went to the back. */
+  private awayScroll: [HTMLElement, number, number, boolean][] = [];
+  private awayRailScroll = 0;
+
+  private graph?: GraphMount;
+  private diffPanel?: DiffPanel;
+  private contextMenu = new CommitContextMenu(
+    (req) => this.runAction(req),
+    (sha) => void this.dropCommit(sha),
+    (action, shas) => void this.runMany(action, shas),
+  );
+  /** The "N commits selected" summary asks only once the selection settles,
+   *  and only for the newest one — see showSelection. */
+  private readonly selectionSummary = new SettleLatest();
+  /** What waits for this tab to be in front again — see whenInFront. */
+  private frontWaiters: Array<() => void> = [];
+  /** Bumped per right-click; see openCommitMenu. */
+  private commitMenuSeq = 0;
+
+  private detailsEl?: HTMLElement;
+  /** The commit-details column beside the graph (commits view). */
+  private graphDetailsPane?: HTMLElement;
+  /** The kept-alive Commits view DOM — re-attached on return, never rebuilt. */
+  private graphViewWrap?: HTMLElement;
+  /** Re-clamps the graph/details split when the pane's box changes. */
+  private graphSplitRO?: ResizeObserver;
+  /** The top-bar account chip's re-reader, so signing in or out can refresh it. */
+  private syncAccountChip?: () => Promise<void>;
+  /** The live composer's label writer, so HEAD resolving can refresh it. */
+  private syncCommitLabel?: () => void;
+  /**
+   * What the Changes view had open and where it was scrolled.
+   *
+   * Every per-row Stage / Unstage / Discard, Stage all, Stash and Refresh ends
+   * in `showChangesView()`, which replaces the whole subtree — so the diff you
+   * were reading closed, the row you had selected deselected, and the list
+   * jumped back to the top. Staging one file in a list of forty meant finding
+   * your place again, every single time.
+   *
+   * Remembered as a row KEY (`kind:path`), never a bare path: a partially-staged
+   * file — git's `MM`, a staged edit plus a newer unstaged one — is deliberately
+   * TWO rows sharing one path, and only the kind says which half is open.
+   */
+  private changesOpenKey?: string;
+  private changesScroll = 0;
+  /**
+   * The conflicts dashboard's controller. App-lifetime, not view-lifetime: the
+   * Changes view is rebuilt on every repaint, and the outcome of a Continue,
+   * the busy lock and a verb still in flight have to survive that. Dropped on
+   * a repository switch.
+   */
+  private conflictsCtl?: DesktopConflicts;
+  /** Back to the dashboard from a file (set by the live Changes view). */
+  private changesShowConflicts?: () => void;
+  /** Open a conflicted file from the dashboard's Merge… (set by the live Changes view). */
+  private changesOpenMerge?: (path: string) => void;
+  /**
+   * The Changes view's diff surface, KEPT across its repaints. The view is
+   * rebuilt on every stage, every refresh and every repository-watcher tick,
+   * and rebuilding the surface threw away whatever was in it: the merge in
+   * progress, and every confirm on screen mid-operation — the dashboard's
+   * "Abort the rebase?", the merge editor's "drop the emptied commit?" — the
+   * moment anything on disk moved (memory: refresh-closing-dialogs). The
+   * surface element and its panel move into each rebuilt view instead; a
+   * route AWAY disposes them, and a repository switch drops them.
+   */
+  private changesPanel?: { root: string; surface: HTMLElement; panel: DiffPanel };
+  /** The conflicts dashboard in that surface, kept with it (its inline confirms are its state). */
+  private changesDash?: ConflictsDashboard;
+  /** The file whose row gets the keyboard when the dashboard comes back from the merge editor. */
+  private changesDashFocus?: { path: string; at: number };
+  /** The file the dashboard's Merge… just opened: the merge editor takes the keyboard when it is up. */
+  private changesShellFocus?: { path: string; at: number };
+  /** The top-bar chip naming a stopped operation. */
+  private opChipEl?: HTMLButtonElement;
+  /** The repo changed while the graph was parked — reload in place on return. */
+  private graphDirty = false;
+  private diffSurfaceEl?: HTMLElement;
+
+  private branchSwitchName?: HTMLElement;
+  private notifBellBadge?: HTMLElement;
+  /** The resolved HEAD from `head:get` — the authoritative answer to "which
+   *  branch am I on?", and the one the top bar already uses. */
+  private headInfo?: HeadInfo;
+  private selectedSha?: string;
+  private currentRepo?: RepoInfo;
+  private refs: RefInfo[] = [];
+  private viewHost!: HTMLElement;
+  private navButtons: HTMLElement[] = [];
+  /**
+   * The view the app opens on before any preference is restored.
+   *
+   * Not "code". A desktop Git client's first screen should answer a question
+   * you actually have when you open it — what have I changed, what is staged,
+   * what am I about to commit — and Changes is the surface that does. The file
+   * tree answered none of them, and the files are already open in the editor
+   * the user just came from.
+   *
+   * A returning user does not see this at all: `prefs.currentView` puts you
+   * back on the surface you were last working in.
+   */
+  /**
+   * Where the app opens with no memory of you.
+   *
+   * This is a literal rather than `TABS[0].id` only because a static field
+   * cannot be read before its own class finishes initialising — but it MEANS
+   * the first rail entry, and `landing-answers-what-you-arrive-with` fails if
+   * the two ever drift apart. They did: this said "changes" while the rail led
+   * with Home, so a first run and a returning run landed on different screens.
+   */
+  private currentView = "dashboard";
+  /** Guards re-entrant disk-triggered refreshes (see refreshFromDisk). */
+  private refreshingFromDisk = false;
+  /** "split" (staged/unstaged groups) or "checkboxes" (one ticked list) — issue #16. */
+  private stagingModelPref: "split" | "checkboxes" = "split";
+  /** Fetch with --prune so branches deleted on the remote drop out — issue #23. */
+  private pruneOnFetchPref = true;
+  /**
+   * Look commit authors' pictures up on Gravatar (Settings ▸ Appearance). One
+   * switch for every surface that draws an author — the flag itself lives in
+   * webview-ui's graph/avatar.ts, which decides every such URL; this is the
+   * persisted copy. On by default, as every release before it behaved.
+   */
+  private gravatarPref = true;
+  /** Paths whose individual changes are currently showing (#20). */
+  private expandedHunks = new Set<string>();
+  /**
+   * Multi-selected file rows, for stashing / staging several at once.
+   *
+   * Keyed "kind:path", not path. In the split model a partly staged file appears
+   * TWICE — once under Staged, once under Changes — and those rows mean different
+   * things; keying by path alone would select both from one click and act on the
+   * wrong half. Instance state rather than DOM state because showChangesView()
+   * rebuilds the whole subtree on every mutation, exactly like expandedHunks.
+   */
+  private selectedRows = new Set<string>();
+  /** The row a shift-range extends from. */
+  private selectionAnchor: string | undefined;
+  /** Visual order of selectable rows, rebuilt on each repaint. */
+  private rowOrder: string[] = [];
+  /** Paths being dragged right now; empty when no drag is in progress. */
+  private dragPaths: string[] = [];
+  /** Relabels the toolbar's stash button whenever the selection changes. */
+  private syncStashButton: (() => void) | undefined;
+  /**
+   * The Changes composer's in-progress state, held on the instance because
+   * every stage / unstage / discard rebuilds that whole subtree. Without it,
+   * typing a message and then staging one more file discarded the message —
+   * along with the amend / sign-off toggles and any co-authors.
+   */
+  /** The repo root `composerDraft` was typed in. See showRepoScreen. */
+  private composerDraftRoot?: string;
+  private composerDraft: {
+    message: string;
+    amend: boolean;
+    signoff: boolean;
+    coAuthors: string[];
+    /**
+     * The text Amend PUT in the box, so un-ticking can tell "the previous
+     * commit's message, untouched" from "something the user wrote".
+     *
+     * This lived as a render-local `let` while every sibling piece of composer
+     * state lived here — so the withdrawal only worked inside a single render.
+     * Every stage, unstage, discard, stash, Refresh, route change and
+     * filesystem-watcher tick rebuilds the composer, which means the guard was
+     * almost never in force: tick Amend to look at the last message, change your
+     * mind, untick, and the box kept the previous commit's message while the
+     * toggle, the button label and the branch line all returned to the
+     * new-commit shape. Committing then duplicated someone else's subject.
+     */
+    prefilled?: string;
+    /** Where the caret was, so a rebuild can put it back. */
+    caret?: { start: number; end: number };
+  } = { message: "", amend: false, signoff: false, coAuthors: [] };
+  /** A pending deep-link target for the next section mount (e.g. an issue number
+   *  to open from the project board). Consumed + cleared by mountSection. */
+  private sectionTarget?: SectionTarget;
+  /** In-app navigation history — every routed view (with its deep-link target)
+   *  lands here so ⌘[/⌘] and the top-bar chevrons walk back/forward like a real
+   *  app. Reset on repo switch (entries would point into the previous repo). */
+  private navHistory: Array<{ view: string; target?: SectionTarget; label?: string }> = [];
+  private navPos = -1;
+  /** True while back/forward drives routeView, so the travel isn't re-recorded. */
+  private navTravel = false;
+  private navBackBtn?: HTMLButtonElement;
+  private navFwdBtn?: HTMLButtonElement;
+  /** Current directory inside the Code (repo browser) view; "" = repo root. */
+  private codePath = "";
+  private compareBase?: string;
+  private compareHead?: string;
+  /** Compare sides that are COMMITS, not refs (Compare these two commits,
+   *  issue #32) — labelled by short sha, with the commit glyph. */
+  private compareCommits = new Set<string>();
+  private compareMode: CompareMode = "three-dot";
+  /** Compare sub-view: the commits list, or the files master/detail. */
+  private compareView: "commits" | "files" = "files";
+  /** Persisted width (px) of the compare file list when the diff is showing. */
+  private compareFileListW = 300;
+  private compareFilesCollapsed = false;
+  /**
+   * The file whose diff Compare has open — the same job `changesOpenKey` does
+   * for the Changes view.
+   *
+   * `renderCompareFiles` auto-opens the FIRST file, and every refreshAll
+   * rebuilt the view: a .git change (another tool's fetch, or git rewriting
+   * the index under a plain `git status`), ⌘R, a window focus after an edit in
+   * your editor — each one closed the file you were reading and opened the
+   * first one instead (issue #24, the desktop half). The rebuild reopens this
+   * one now, and only when it has genuinely left the comparison does the
+   * selection move.
+   */
+  private compareOpenPath?: string;
+  /** The Monaco-backed surface mounted in the current view, disposed on route
+   *  change so editors + models + their document.body theme observers don't leak. */
+  private activeMonacoView?: { dispose(): void };
+  private syncStatus?: SyncStatus;
+  private renderSyncWidget?: (s: SyncStatus | undefined) => void;
+  /** The top bar's two reads — the branch pill's and the sync state's — and
+   *  which of their answers may paint (see topbarRead.ts). */
+  private readonly refsRead = new TopbarRead();
+  private readonly syncRead = new TopbarRead();
+  private prSubTab = "conversation";
+  /** Bumped whenever the visible surface changes; async work captures it and
+   *  bails if superseded, so a slow IPC reply can't clobber a newer view. */
+  private routeGen = 0;
+  /**
+   * Bumped whenever a new file diff starts loading. Diffs are fetched over IPC,
+   * so clicking a second file (or a second commit) while the first is still in
+   * flight used to paint the SLOWER, older diff over the newer selection.
+   */
+  private diffGen = 0;
+  /** Keep-alive cache of rendered (non-Monaco) view containers, so navigating
+   *  back to a view restores it instantly instead of rebuilding from scratch.
+   *  Cleared on a repo switch; busted per-view on an explicit refresh. */
+  private viewCache = new Map<string, HTMLElement>();
+  /**
+   * What each parked DOM was SHOWING when it was parked — the route target it
+   * was rendered with. The cache is one slot per view id, and a sectioned view
+   * renders very different things under one id: the Issues route holds the
+   * issues LIST and every issue's detail page. Restoring by id alone handed a
+   * rail click asking for the list whatever happened to be parked — the last
+   * issue you read — while the history recorded the click as the list. Screen
+   * and history then disagreed, and the detail's back button (which pops the
+   * history) stepped somewhere its own label never named.
+   */
+  private viewCacheTarget = new Map<string, SectionTarget | undefined>();
+  /** The target the CURRENT view was routed with — recorded so the park below
+   *  can say what the DOM it is parking actually shows. */
+  private currentTarget?: SectionTarget;
+  /** Where each kept-alive view was scrolled when it was parked. Keyed by the
+   *  node itself, so a rebuilt view never inherits the old one's position. */
+  private viewScroll = new WeakMap<HTMLElement, [HTMLElement, number, number, boolean][]>();
+  /** What a kept-alive view does when the cache puts it back on screen — see
+   *  showBranchesView. Keyed by the node, like viewScroll. */
+  private viewRevive = new WeakMap<HTMLElement, () => void>();
+  /** Per view root, the elements inside it that have ever been scrolled. */
+  private scrolledIn = new WeakMap<HTMLElement, Set<HTMLElement>>();
+  /** Views safe to keep alive (no Monaco surface / dispose lifecycle of their own). */
+  /** A search that came back rate-limited is a REFUSAL, not an answer — caching
+   *  it makes every retry a cache hit for the whole TTL. See cache.gget. */
+  private static readonly SEARCH_KEEP = { cacheable: (r: { limited?: unknown }) => !r.limited };
+
+  /** Every scrolled element inside a view, with where it was.
+   *
+   *  Nested scrollers included, not just the outermost: these views nest them —
+   *  a list pane beside a detail pane, a rail beside a log — and restoring only
+   *  the outer one puts you back at the top of the part you were reading.
+   *
+   *  This used to find them by walking the whole view and reading `scrollTop`
+   *  on every node, which is a layout read per element: leaving the issues list
+   *  cost 10,666 of them, and a nine-view lap of the app cost 11,774. Nothing
+   *  in it was wrong — it was just asking five thousand elements a question
+   *  only three of them can answer yes to. The scroll handler on the view host
+   *  now records the answer as it happens, so this reads only the elements that
+   *  have actually been scrolled. Measured with
+   *  `node harness/perf.mjs changes --extra=many=1 --repeat=…`. */
+  private scrollSnapshot(root: HTMLElement): [HTMLElement, number, number, boolean][] {
+    const out: [HTMLElement, number, number, boolean][] = [];
+    const seen = this.scrolledIn.get(root);
+    if (!seen) return out;
+    for (const n of seen) {
+      // A node the view has since rebuilt away. Drop it rather than carry it.
+      if (!root.contains(n)) {
+        seen.delete(n);
+        continue;
+      }
+      // NOT MONACO. It manages its own viewport — partly by transform, partly
+      // by scrollTop on nodes it recreates — and restores its position from the
+      // model when it is re-attached. Snapshotting those nodes and writing them
+      // back afterwards can only fight it, and this harness cannot catch that:
+      // with the animation frame starved, Monaco never lays out, so its
+      // internal scrollers all read 0 here and it looks harmless.
+      if (n.closest(".monaco-editor")) continue;
+      if (n.scrollTop > 0 || n.scrollLeft > 0) {
+        // …and whether that offset WAS the bottom, which is a different
+        // intention from "this many pixels down" for anything still growing.
+        const atTail = n.scrollHeight - n.scrollTop - n.clientHeight <= 24;
+        out.push([n, n.scrollTop, n.scrollLeft, atTail]);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Views that mean nothing without a repository open.
+   *
+   * The rail shows them disabled rather than hiding them: a destination that
+   * vanishes and reappears is harder to learn than one that is visibly not
+   * available yet, and the first thing a new user should see is the shape of
+   * the whole app.
+   */
+  private static readonly NEEDS_REPO = new Set([
+    "changes",
+    "graph",
+    "branches",
+    "compare",
+    "rebase",
+    "code",
+    "notifications",
+    "mywork",
+    "prs",
+    "issues",
+    "actions",
+    "releases",
+    "projects",
+    "assistant",
+  ]);
+
+  private static readonly KEEPALIVE = new Set([
+    "branches",
+    "explore",
+    "settings",
+    "assistant",
+    "prs",
+    "issues",
+    "actions",
+    "releases",
+    "orgs",
+    "projects",
+    "gists",
+    "repositories",
+    "notifications",
+    "mywork",
+  ]);
+  /** Whether the working tree has anything to commit. Read by the composer's
+   *  enable rule, which used to gate on the message text alone and offered a
+   *  live Commit button over a clean tree. */
+  private changesHaveWork = false;
+  private syncCommitEnabled: (() => void) | undefined;
+  /** True while a fetch/pull/push is in flight — locks the sync trigger. */
+  private syncing = false;
+  /** Theme preference: follow the OS, or pin light/dark. */
+  private themeMode: ThemeMode = "system";
+  /** Dock icon preference: "auto" follows the resolved theme, or pin light/dark. */
+  private logoMode: LogoMode = "auto";
+  /** Settings ▸ Appearance ▸ Dark style: which dark look, in the window and
+   *  in the Dock (shared/darkStyle.ts). Graphite unless picked. */
+  private darkStyle: DarkStyle = DEFAULT_DARK_STYLE;
+  /** Sidebar rail: persisted width (px) + collapsed-to-icons state. */
+  private railWidth = 188;
+  private railCollapsed = false;
+  /** Changes view: persisted width (px) of the file list pane. */
+  private changesListW = 340;
+  private railEl?: HTMLElement;
+  private railToggleEl?: HTMLElement;
+  private mainStackEl?: HTMLElement;
+  /** The permanent bottom terminal dock (a footer bar that expands/collapses,
+   *  with the Output log + multiple terminal tabs). Lives for the repo session. */
+  private terminalDock?: TerminalDock;
+  /** Whether the dock is expanded vs collapsed to its footer bar. */
+  private terminalExpanded = false;
+  private terminalHeight = 280;
+
+  /**
+   * Power-user view switching: Cmd/Ctrl+1..8 jumps between sidebar views;
+   * Cmd/Ctrl+, opens Settings. The shell's ONE window listener hands the key
+   * to the tab in front — a background tab's App never hears a key.
+   */
+  handleAppKey(e: KeyboardEvent): void {
+    {
+      if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
+      // Per-branch repo guards, not one at the top. The single early return
+      // used to gate EVERY branch on an open repository — so ⌘K, ⌘, and even
+      // ⌘1 (Home) were dead on first launch, on the exact screen whose whole
+      // job is helping you get a repository open. Each branch now states what
+      // it actually needs: a digit needs a repo only when its VIEW does; the
+      // palette, Settings and history never did.
+      if (!this.navButtons.length) return;
+      if (/^[1-9]$/.test(e.key)) {
+        const idx = Number(e.key) - 1;
+        if (idx < App.TABS.length) {
+          const id = App.TABS[idx].id;
+          if (!this.currentRepo && App.NEEDS_REPO.has(id)) return;
+          e.preventDefault();
+          this.routeView(id);
+          this.navButtons[idx]?.focus();
+        }
+      } else if (e.key === ",") {
+        e.preventDefault();
+        this.routeView("settings");
+      } else if (e.key === "`") {
+        // The terminal opens a shell IN the repository — without one there is
+        // no working directory to give it.
+        if (!this.currentRepo) return;
+        e.preventDefault();
+        this.toggleTerminal();
+      } else if (e.key === "[") {
+        e.preventDefault();
+        this.navBack();
+      } else if (e.key === "]") {
+        e.preventDefault();
+        this.navForward();
+      } else if (e.key === "k" || e.key === "p") {
+        // The Linear move: everything — sections, branches, PRs, repos,
+        // actions — one keystroke away, from anywhere. One carve-out: on
+        // macOS, Ctrl+K/Ctrl+P are kill-line / previous-line inside text
+        // fields — leave those to the field (⌘K still opens the palette).
+        const t = e.target as HTMLElement | null;
+        const editable =
+          !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+        if (editable && e.ctrlKey && !e.metaKey && navigator.platform.toLowerCase().includes("mac")) {
+          return;
+        }
+        e.preventDefault();
+        if (!paletteIsOpen()) this.openPalette();
+      }
+    }
+  }
+
+  /** "?" opens the keyboard cheat sheet — the j/k/e/Esc layer is worthless
+   *  if nobody can discover it. */
+  handleHelpKey(e: KeyboardEvent): void {
+    if (e.key !== "?" || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (!this.currentRepo) return;
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    // A PAGE-LEVEL key, so any open layer outranks it — including the sheet
+    // itself. Skipping the text-field check alone let "?" open a second
+    // identical sheet over the first (its own first focusable is a button,
+    // not a field), and a third, and a fourth — each needing its own Escape.
+    // It also fired straight through an open dropdown or dialog.
+    if (!pageOwnsKeys()) return;
+    e.preventDefault();
+    openShortcutsHelp();
+  }
+
+  /** Mouse back/forward buttons (buttons 3/4) walk the same history — the
+   *  muscle memory every browser user brings to a mouse with side buttons. */
+  handleMouseUp(e: MouseEvent): void {
+    if (!this.currentRepo) return;
+    if (e.button === 3) {
+      e.preventDefault();
+      this.navBack();
+    } else if (e.button === 4) {
+      e.preventDefault();
+      this.navForward();
+    }
+  }
+
+  /**
+   * Build this tab's screen and land on its first view. Runs ONCE per tab, the
+   * first time the tab is shown — a tab restored at launch and never visited
+   * costs nothing until it is.
+   */
+  mount(): void {
+    // Restore persisted UI preferences so the app reopens where you left it.
+    const prefs = loadPrefs();
+    // Rail entries are not the only real places. Settings lives in the rail's
+    // footer and Search left the rail altogether — both are still surfaces a
+    // session can end on, and a restore that silently falls back to "changes"
+    // teaches people their place isn't kept.
+    const OFF_RAIL = new Set(["settings", "explore"]);
+    const known = (v: unknown): v is string =>
+      typeof v === "string" && (App.TABS.some((t) => t.id === v) || OFF_RAIL.has(v));
+    // A tab starts where THIS repository was last left (a tab restored at
+    // launch, or one reopened while its tab's view is still remembered), else
+    // on the view the window was last on — which is the view of the tab you
+    // opened it from, since the tab in front is the one that saves it.
+    const tabViews = (prefs.tabViews ?? {}) as Record<string, unknown>;
+    const remembered = this.info ? tabViews[this.info.root] : undefined;
+    if (known(remembered)) this.currentView = remembered;
+    else if (known(prefs.currentView)) this.currentView = prefs.currentView;
+    // Search is identified by its target, and that target belongs to the tab
+    // it was searched in: a NEW tab opened from Search lands in its code
+    // (showRepoScreen's staleBrowse rule, for a tab that never had a target).
+    // A tab brought back at launch is not new — it comes back to Search, the
+    // place it was left, as the single window always did.
+    if (this.currentView === "explore" && this.info && !this.restoredAtLaunch) this.currentView = "code";
+    // An unsent commit message this repository's tab was closed with.
+    if (this.info) {
+      const kept = takeDraftIn(this.info.root, "commit", "message");
+      if (kept) {
+        this.composerDraft = { message: kept, amend: false, signoff: false, coAuthors: [] };
+        this.composerDraftRoot = this.info.root;
+      }
+    }
+    this.readSharedPrefs(prefs, true);
+    this.showRepoScreen(this.info);
+  }
+
+  /**
+   * The saved preferences. Everything when a tab is built; afterwards — each
+   * time the tab comes to the front — only the ones every tab SHARES (the
+   * rail, the theme, the staging model), so collapsing the rail in one tab
+   * collapses it in all of them while each tab keeps its own Compare layout,
+   * Branches kind and dock.
+   */
+  private readSharedPrefs(prefs: Record<string, unknown> = loadPrefs(), initial = false): void {
+    if (initial) {
+      if (typeof prefs.compareFileListW === "number" && prefs.compareFileListW >= 180) {
+        this.compareFileListW = prefs.compareFileListW;
+      }
+      if (prefs.compareView === "commits" || prefs.compareView === "files") {
+        this.compareView = prefs.compareView;
+      }
+      // `branchCatsCollapsed` is gone with the four collapsible groups it
+      // remembered — the Branches view shows ONE kind at a time now. An old
+      // stored value is simply ignored rather than migrated; it described a
+      // shape that no longer exists.
+      if (
+        prefs.branchTab === "local" ||
+        prefs.branchTab === "remote" ||
+        prefs.branchTab === "tags" ||
+        prefs.branchTab === "stashes" ||
+        prefs.branchTab === "worktrees"
+      ) {
+        this.branchTab = prefs.branchTab;
+      }
+      if (typeof prefs.changesListW === "number" && prefs.changesListW >= 220) {
+        this.changesListW = prefs.changesListW;
+      }
+      if (typeof prefs.terminalOpen === "boolean") this.terminalExpanded = prefs.terminalOpen;
+      if (typeof prefs.terminalHeight === "number" && prefs.terminalHeight >= 120) {
+        this.terminalHeight = prefs.terminalHeight;
+      }
+    }
+    if (prefs.stagingModel === "checkboxes" || prefs.stagingModel === "split") {
+      this.stagingModelPref = prefs.stagingModel;
+    }
+    if (typeof prefs.pruneOnFetch === "boolean") {
+      this.pruneOnFetchPref = prefs.pruneOnFetch;
+    }
+    if (typeof prefs.gravatar === "boolean") {
+      this.gravatarPref = prefs.gravatar;
+    }
+    // Before this tab draws anything: the graph, the commit details and the
+    // branch lists all ask graph/avatar.ts, which is one switch for the window.
+    setGravatarEnabled(this.gravatarPref);
+    if (prefs.themeMode === "system" || prefs.themeMode === "light" || prefs.themeMode === "dark") {
+      this.themeMode = prefs.themeMode;
+    }
+    if (prefs.logoMode === "auto" || prefs.logoMode === "light" || prefs.logoMode === "dark") {
+      this.logoMode = prefs.logoMode;
+    }
+    // Shared like the theme: a style picked in one tab is every tab's.
+    this.darkStyle = parseDarkStyle(prefs.darkStyle);
+    if (typeof prefs.railWidth === "number" && prefs.railWidth >= 168 && prefs.railWidth <= 360) {
+      this.railWidth = prefs.railWidth;
+    }
+    if (typeof prefs.railCollapsed === "boolean") this.railCollapsed = prefs.railCollapsed;
+  }
+
+  /**
+   * The OS flipped light/dark. Every tab hears it — a background tab's
+   * terminal and Appearance card would otherwise come back in the old theme.
+   * The body class itself is the shell's to set, once.
+   */
+  onSystemThemeFlip(): void {
+    if (this.themeMode !== "system") return;
+    this.rerenderForTheme();
+    this.terminalDock?.applyTheme();
+    this.invalidateAppearanceCard();
+  }
+
+  /** The theme mode a tab was built with — the shell applies it at launch. */
+  get themeModePref(): ThemeMode {
+    return this.themeMode;
+  }
+
+  // ── The tab's life (issue #32) ──────────────────────────────────────────────
+
+  /**
+   * This tab's screen has just been attached and it is in front. Point every
+   * per-tab module at it, put the scroll back, and ask the disk whether
+   * anything moved while it was away.
+   */
+  activate(firstTime: boolean): void {
+    setCacheScope(this.info?.root);
+    setUndoScope(this.session.id);
+    setFocusTab(this.session.id);
+    // What waited for this tab to be in front again goes on now — as
+    // microtasks, after this switch has finished (the shell made this tab's
+    // session the active one before calling here).
+    for (const go of this.frontWaiters.splice(0)) go();
+    // A question held open through refreshes (repoEpoch) is about the tab it
+    // was asked in — and none can be open across a switch (the shell refuses
+    // to switch under a modal) — but the epoch is what `whileSameRepo` reads.
+    repoChanged();
+    // Module-level hooks point at the App in front.
+    this.installNav();
+    this.registerAssistantOpener();
+    setPeekNav((v, t) => this.routeView(v, false, t));
+    if (firstTime) return;
+    // Shared preferences may have moved while this tab was in the back.
+    const wasCollapsed = this.railCollapsed;
+    const wasWidth = this.railWidth;
+    this.readSharedPrefs();
+    if (this.railEl && (wasCollapsed !== this.railCollapsed || wasWidth !== this.railWidth)) {
+      this.railEl.classList.toggle("collapsed", this.railCollapsed);
+      this.railEl.style.width = this.railCollapsed ? "" : `${this.railWidth}px`;
+      this.syncRailToggle();
+    }
+    // Detaching zeroed every scrollTop in the screen; put them back — now, and
+    // on the frame after layout, as the keep-alive restore does.
+    const shot = this.awayScroll;
+    const rail = this.awayRailScroll;
+    const apply = (): void => {
+      for (const [node, top, left, atTail] of shot) {
+        if (!node.isConnected) continue;
+        node.scrollTop = atTail ? node.scrollHeight : top;
+        node.scrollLeft = left;
+      }
+      if (this.railEl) this.railEl.scrollTop = rail;
+    };
+    apply();
+    requestAnimationFrame(apply);
+    this.terminalDock?.layout();
+    this.fitTopbar?.();
+    void this.syncAccountChip?.();
+    void this.refreshNotifBadge();
+    // Anything done to this repository while it was in the back — a commit in
+    // a terminal, an edit in your editor — is found by the same cheap question
+    // a window focus asks. Nothing moved, nothing rebuilds.
+    void this.refreshIfDiskMoved();
+    if (this.tabsMoved) this.onTabsChanged(true);
+  }
+
+  /** This tab is going to the back: remember where its screen was scrolled
+   *  (detaching loses it) before the shell detaches it. */
+  deactivate(): void {
+    const view = this.viewHost?.firstElementChild as HTMLElement | null;
+    this.awayScroll = view ? this.scrollSnapshot(view) : [];
+    this.awayRailScroll = this.railEl?.scrollTop ?? 0;
+  }
+
+  /**
+   * Is anything running in this tab that closing it would stop watching?
+   * In words ("a push"), for the question the close asks.
+   */
+  runningOperation(): string | undefined {
+    return runningOperation(this.session.id);
+  }
+
+  /**
+   * The tab closed. Its unsent commit message is KEPT (it comes back when this
+   * repository is opened again); everything live is torn down — its shells,
+   * its Monaco surfaces, its graph.
+   */
+  dispose(): void {
+    const root = this.info?.root;
+    if (root) {
+      const draft = this.composerDraftRoot === root ? this.composerDraft.message : "";
+      // The prefilled amend message is the previous commit's, not the user's.
+      const own = draft && draft !== this.composerDraft.prefilled ? draft : "";
+      saveDraftIn(root, "commit", "message", own);
+    }
+    try {
+      this.activeMonacoView?.dispose();
+    } catch {
+      /* a dying surface's fault is its own */
+    }
+    this.activeMonacoView = undefined;
+    this.changesPanel?.panel.dispose();
+    this.changesPanel = undefined;
+    this.graph?.dispose();
+    this.graph = undefined;
+    this.terminalDock?.dispose();
+    this.terminalDock = undefined;
+    this.viewCache.clear();
+    this.screenEl?.remove();
+    // What its pages held until they were left — the PR diff, a commit's
+    // diff, a job log — goes with the tab, which is never coming back.
+    if (this.screenEl) releaseScreen(this.screenEl);
+  }
+
+  /** Every kept-alive view goes — the signed-in account changed under all of them. */
+  dropKeptViews(): void {
+    this.viewCache.clear();
+  }
+
+  /**
+   * Re-render after a live OS light↔dark flip. Only the welcome screen carries
+   * theme-keyed <img> sources (the hero mark + the wordmark); the repo screen is
+   * entirely CSS-var / inline-SVG driven and re-themes itself from the body class.
+   */
+  private rerenderForTheme(): void {
+    // The shell re-themes itself from the body class; there is no longer a
+    // separate hand-painted screen that needs rebuilding on a theme change.
+  }
+
+  // ── Welcome / repo-picker screen ────────────────────────────────────────────
+
+  // The welcome screen used to live here: a full-screen card with a logo, a
+  // tagline, Open/Clone buttons and its own list of recent repositories, shown
+  // whenever no repository was open.
+  //
+  // It is gone because it pre-empted everything. With no repo open there was no
+  // rail, so the first page could not be the dashboard however the dashboard
+  // was configured, and Repositories — the one destination that still means
+  // something with nothing open — was unreachable. Its recents list was also a
+  // third place repositories were listed, disagreeing with the other two.
+  //
+  // `showRepoScreen(undefined)` mounts the same shell with the repo-scoped
+  // views disabled, and Home's first card is the Open / Browse door.
+
+
+  // ── Repo screen (the full window is dedicated to the open repo) ──────────────
+
+  /**
+   * The application shell — rail, top bar, view host — with or without a
+   * repository open.
+   *
+   * `info` is optional because the alternative was a separate full-screen
+   * welcome card with no rail on it, which pre-empted every route: on a fresh
+   * install, after Close repository, or when the last repo was moved, the first
+   * page could not be the dashboard however the dashboard was configured. It
+   * also meant a THIRD list of repositories, and the one destination that still
+   * means something with nothing open — Repositories — was unreachable.
+   *
+   * With no repo the shell still mounts; the views that need one are disabled
+   * in the rail and the router refuses them.
+   */
+  private showRepoScreen(info?: RepoInfo): void {
+    this.currentRepo = info;
+    this.selectedSha = undefined;
+    this.codePath = "";
+    this.routeGen++; // a repo switch supersedes the previous repo's in-flight work
+    // A new repo invalidates every kept-alive view (they hold the old repo's DOM).
+    this.viewCache.clear();
+    // …and the navigation history: its entries (and deep-link targets) belong
+    // to the previous repo's sections.
+    this.navHistory = [];
+    this.navPos = -1;
+    // Namespace the SWR cache so another repo's branches/status/graph can never
+    // bleed into this one. (Each tab has its own namespace now, kept across
+    // switches — see cache.ts.)
+    setCacheScope(info?.root);
+    // Baseline the on-disk state for this repo, so the FIRST window focus can
+    // tell "nothing changed" from "no idea" and skip a full refresh it does not
+    // need. Fire-and-forget: it only has to land before the user alt-tabs.
+    void this.recordDiskFingerprint();
+    // A half-written commit message belongs to the repo it was typed in — and
+    // that is the rule this line USED to break. It reset unconditionally, so
+    // "Back to main menu" and straight back into the SAME repo (the recent-repo
+    // list is right there, one click away) destroyed the message, and so did
+    // every re-open of the repo you were already in. Ask which repo first.
+    if (info && this.composerDraftRoot !== info.root) {
+      this.composerDraft = { message: "", amend: false, signoff: false, coAuthors: [], prefilled: undefined, caret: undefined };
+      this.composerDraftRoot = undefined;
+    }
+    // Drop the previous repo's graph mount so a refresh from a non-graph view
+    // never reloads stale history.
+    this.graph?.dispose();
+    this.graph = undefined;
+    this.graphViewWrap = undefined;
+    // Tear down the previous repo's terminal sessions — a new repo means a new
+    // working directory, so its shells start fresh.
+    this.terminalDock?.dispose();
+    this.terminalDock = undefined;
+    // Each repo starts Compare from its own current/main defaults — don't carry
+    // the previous repo's (possibly non-existent) refs over. Nor the file that
+    // was open: another repository's comparison that happens to have a
+    // README.md would open it, third in its list, with nothing to say why.
+    this.compareBase = undefined;
+    this.compareHead = undefined;
+    this.compareCommits.clear();
+    this.compareOpenPath = undefined;
+    const screen = el("div", "screen repo");
+    screen.appendChild(this.topbar(info));
+    // A left sidebar rail routes the main area; a vertical stack holds the routed
+    // view above the permanent bottom terminal dock.
+    const main = el("div", "repo-main");
+    const stack = el("div", "main-stack");
+    this.mainStackEl = stack;
+    const viewHost = el("div", "view-host");
+    // Programmatically focusable, not tab-reachable. Closing the terminal dock
+    // has to put the keyboard back somewhere in the view, and "the first
+    // focusable thing in it" is a lottery — a toolbar button, whatever happens
+    // to be first in the DOM. The container itself is the honest answer: Tab
+    // then continues from the view rather than from the top of the window.
+    viewHost.tabIndex = -1;
+    this.viewHost = viewHost;
+    // Which elements in a view have been scrolled — recorded as it happens,
+    // rather than discovered by asking every node in the view afterwards. See
+    // `scrollSnapshot`, which used to be the app's single most expensive
+    // operation per route change.
+    //
+    // Capture, because `scroll` does not bubble; passive, because this never
+    // calls preventDefault and saying so keeps it off the scrolling path.
+    viewHost.addEventListener(
+      "scroll",
+      (e) => {
+        const node = e.target as HTMLElement | null;
+        if (!node || node.nodeType !== 1) return;
+        // Attribute it to the view it belongs to — the direct child of the
+        // host — so a parked view keeps its own set and drops it when the
+        // cached root is dropped.
+        let root: HTMLElement | null = node;
+        while (root && root.parentElement && root.parentElement !== viewHost) {
+          root = root.parentElement;
+        }
+        if (!root || root.parentElement !== viewHost) return;
+        let set = this.scrolledIn.get(root);
+        if (!set) {
+          set = new Set();
+          this.scrolledIn.set(root, set);
+        }
+        set.add(node);
+      },
+      { capture: true, passive: true },
+    );
+    stack.append(viewHost);
+    main.append(this.buildNav(), this.buildRailResizer(), stack);
+    screen.appendChild(main);
+
+    // Onto the tab stage — this tab's screen, beside (detached from) the
+    // others', never replacing them (issue #32).
+    this.screenEl = screen;
+    this.shell.present(this, screen);
+    // The terminal dock is a permanent footer bar — always mounted (after the
+    // screen is in the DOM so xterm measures cleanly), starting collapsed or
+    // expanded per the saved preference.
+    this.mountTerminalDock();
+    // A browse page is IDENTIFIED by its target — a repository, an account, a
+    // search. Re-routing to "explore" carries no target (they belong to the
+    // context that just went away, along with the history wiped above), so
+    // what rendered was the empty Search shell with its Back disabled: you
+    // opened a repository and landed nowhere near it. The repository you just
+    // opened is the answer.
+    const staleBrowse = this.currentView === "explore" && !!this.currentTarget;
+    this.routeView(staleBrowse ? "code" : this.currentView);
+    void this.refreshRefs();
+    void this.updateSync();
+  }
+
+  // ── Sidebar rail + view router ──────────────────────────────────────────────
+
+  private static readonly TABS: ReadonlyArray<{
+    id: string;
+    label: string;
+    icon: string;
+    /** A group divider is drawn before this item. */
+    divider?: boolean;
+    /** The label shown on the divider before this item (defaults to "GitHub"). */
+    dividerLabel?: string;
+  }> = [
+    // ORDER IS DAILY USE, and the first entry is the one the app opens on when
+    // it has no memory of where you were.
+    //
+    // Code — a read-only file tree of HEAD — held that slot, and it is the one
+    // view in this list nothing else in the app ever navigates to: the only two
+    // callers of routeView("code") are its own folder hop and the unknown-view
+    // fallback. It is also the view a user least needs from a Git client, since
+    // the files are already open in their editor. Landing there answered none
+    // of the questions you open this app with. It keeps its route and its seat;
+    // it just stops being the front door.
+    //
+    // Five rail entries — Changes, Branches, Rebase, Compare, Pull Requests —
+    // used to be five variations on the same fork-with-two-nodes motif, which
+    // at 16px in a single column is no icon at all. `git-branch`, `git-compare`
+    // and `git-pull-request` have the strongest claim on that shape and keep
+    // it (and are separated in the rail); the other two take glyphs that say
+    // what those screens actually are.
+    //
+    // HOME is the front door. Changes answers "what have I edited", which is
+    // the right question once you are working and a strange thing to be
+    // greeted by — most of the time it is an empty list, and it says nothing
+    // about the other repositories you have on the go or the review that has
+    // been waiting since yesterday. Changes keeps its seat, one below.
+    { id: "dashboard", label: l10n.t("Home"), icon: "home" },
+    // Repositories rides shotgun. It is the only destination that still means
+    // something with no repository open, and "which repo am I working in" is
+    // the decision that precedes every other entry on this rail — filing it
+    // under ACCOUNT, fifteen rows down, buried the front door's hallway.
+    { id: "repositories", label: l10n.t("Repositories"), icon: "repo" },
+    // Changes is a set of pending file diffs, not the SCM view's fork.
+    // It leads the group of views ABOUT the open repository, and the divider
+    // says so — the rail's principle is where the data lives: this machine,
+    // then this repository, then this repository on GitHub, then your account.
+    { id: "changes", label: l10n.t("Changes"), icon: "diff-multiple", divider: true, dividerLabel: "This repository" },
+    { id: "graph", label: l10n.t("Commits"), icon: "git-commit" },
+    { id: "branches", label: l10n.t("Branches"), icon: "git-branch" },
+    { id: "compare", label: l10n.t("Compare"), icon: "git-compare" },
+    // Rebase here IS an ordered list of commits you reorder and replay — a
+    // truer picture than `git-merge`, which is a different operation besides.
+    { id: "rebase", label: l10n.t("Rebase"), icon: "list-ordered" },
+    { id: "code", label: l10n.t("Code"), icon: "code" },
+    // Inbox first in the GitHub group — the "what needs me" surface (Linear's
+    // Inbox translated): review requests, mentions, assignments, CI failures.
+    // The top-bar bell stays for a quick glance; this is the full triage page.
+    { id: "notifications", label: l10n.t("Inbox"), icon: "inbox", divider: true },
+    // "What needs me?" answered in one page: review requests, assignments,
+    // your own PRs, mentions — each row one click from acting on it.
+    { id: "mywork", label: l10n.t("My Work"), icon: "person" },
+    { id: "prs", label: l10n.t("Pull Requests"), icon: "git-pull-request" },
+    // `issues` (the list glyph) rather than `issue-opened`, which reads as a
+    // single issue's OPEN state and clashed with per-issue status icons.
+    { id: "issues", label: l10n.t("Issues"), icon: "issues" },
+    // CI pipelines read as "runs" — a play badge, not the abstract Actions logo.
+    { id: "actions", label: l10n.t("Actions"), icon: "play-circle" },
+    { id: "releases", label: l10n.t("Releases"), icon: "tag" },
+    { id: "projects", label: l10n.t("Projects"), icon: "project" },
+    // Organizations and Gists are GitHub surfaces like everything above them —
+    // the old "Account" group was a distinction between kinds of GitHub data
+    // that nobody shopping the rail was making, and with Search gone and
+    // Repositories promoted it held two orphans under a heading.
+    { id: "orgs", label: l10n.t("Organizations"), icon: "organization" },
+    { id: "gists", label: l10n.t("Gists"), icon: "gist" },
+    // Search has NO rail entry — deliberately. It is a routed surface (the
+    // view keeps its `explore` id, deep links and entity pages), but the way
+    // IN is the search vocabulary the app already has everywhere: the topbar
+    // field, ⌘K, and Home's box. A search you navigate to from a sidebar is a
+    // filing cabinet; a search that is one keystroke from anywhere is a tool.
+  ];
+
+  /** TABS.label is compared against (dividerLabel) and kept as English keys;
+   *  this is the literal, statically-extractable translation of each. */
+  private static readonly NAV_LABELS: Record<string, string> = {
+    dashboard: l10n.t("Home"),
+    repositories: l10n.t("Repositories"),
+    changes: l10n.t("Changes"),
+    graph: l10n.t("Commits"),
+    branches: l10n.t("Branches"),
+    compare: l10n.t("Compare"),
+    rebase: l10n.t("Rebase"),
+    code: l10n.t("Code"),
+    notifications: l10n.t("Inbox"),
+    mywork: l10n.t("My Work"),
+    prs: l10n.t("Pull Requests"),
+    issues: l10n.t("Issues"),
+    actions: l10n.t("Actions"),
+    releases: l10n.t("Releases"),
+    projects: l10n.t("Projects"),
+    orgs: l10n.t("Organizations"),
+    gists: l10n.t("Gists"),
+    settings: l10n.t("Settings"),
+  };
+
+  private buildNav(): HTMLElement {
+    const nav = el("nav", "nav-rail" + (this.railCollapsed ? " collapsed" : ""));
+    nav.setAttribute("role", "tablist");
+    nav.setAttribute("aria-orientation", "vertical");
+    nav.setAttribute("aria-label", l10n.t("Repository views"));
+    nav.style.width = this.railCollapsed ? "" : `${this.railWidth}px`;
+    this.railEl = nav;
+    this.navButtons = [];
+    const mod = navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl+";
+
+    const mkItem = (id: string, label: string, icon: string, shortcut?: string): HTMLElement => {
+      const btn = el("button", "nav-item");
+      btn.dataset.view = id;
+      btn.title = shortcut ? `${label}  (${shortcut})` : label;
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("aria-label", label);
+      btn.append(glyph(icon), span(label, "nav-label"));
+      // Visibly not available yet, rather than absent: with no repository open
+      // these lead nowhere, and a destination that vanishes and reappears is
+      // harder to learn than one you can see is waiting on something.
+      if (!this.currentRepo && App.NEEDS_REPO.has(id)) {
+        (btn as HTMLButtonElement).disabled = true;
+        btn.classList.add("is-unavailable");
+        btn.title = l10n.t("{0} — open a repository first", label);
+        btn.setAttribute("aria-label", btn.title);
+      }
+      btn.addEventListener("click", () => this.routeView(id));
+      btn.addEventListener("keydown", (e) => {
+        const i = this.navButtons.indexOf(btn);
+        if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+          e.preventDefault();
+          this.navButtons[(i + 1) % this.navButtons.length].focus();
+        } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+          e.preventDefault();
+          this.navButtons[(i - 1 + this.navButtons.length) % this.navButtons.length].focus();
+        } else if (e.key === "Home") {
+          e.preventDefault();
+          this.navButtons[0].focus();
+        } else if (e.key === "End") {
+          e.preventDefault();
+          this.navButtons[this.navButtons.length - 1].focus();
+        }
+      });
+      this.navButtons.push(btn);
+      return btn;
+    };
+
+    App.TABS.forEach((it, i) => {
+      if (it.divider) {
+        const sep = el("div", "nav-divider");
+        // The group is "this repository, ON THIS MACHINE" — so name it. While
+        // you read someone else's repository on a browse page, "This
+        // repository" pointed at the one NOT on screen, over six items that
+        // stay live. They are not disabled, because reading libgit2 is no
+        // reason to take away your own Changes tab; the label tells the truth
+        // instead. TABS is static, so this resolves here, not in the literal.
+        const isRepoGroup = it.dividerLabel === "This repository";
+        const label = isRepoGroup
+          ? (this.currentRepo?.name ?? l10n.t("This repository"))
+          : l10n.t("GitHub");
+        // Collapsed to icons the label is hidden, so the group's name lives on
+        // the rule itself.
+        sep.title =
+          isRepoGroup && this.currentRepo
+            ? l10n.t("{0} — the repository open on this machine", this.currentRepo.name)
+            : label;
+        sep.setAttribute("role", "separator");
+        sep.setAttribute("aria-label", sep.title);
+        sep.setAttribute("aria-hidden", "true");
+        sep.append(span(label, "nav-divider-label"));
+        nav.appendChild(sep);
+      }
+      nav.appendChild(mkItem(it.id, App.NAV_LABELS[it.id] ?? it.label, it.icon, i < 9 ? `${mod}${i + 1}` : undefined));
+    });
+    // Footer: just Settings, pinned to the bottom of the rail. The terminal lives
+    // permanently in the bottom footer dock; the sidebar toggle lives in the top
+    // bar — neither clutters the rail. A dedicated class makes it a quiet, compact
+    // affordance hugging the rail's bottom edge, roughly at the footer dock's level.
+    nav.appendChild(el("div", "nav-spacer"));
+    const settingsItem = mkItem("settings", l10n.t("Settings"), "gear", `${mod},`);
+    settingsItem.classList.add("nav-foot-item");
+    nav.appendChild(settingsItem);
+    return nav;
+  }
+
+  /** The rail's right-edge divider: a pure drag-to-resize handle (the collapse
+   *  toggle lives in the top bar). Dragging the rail narrow enough collapses it
+   *  by hand — the "collapse by hand" the user asked for. */
+  private buildRailResizer(): HTMLElement {
+    /** Below this drag width the rail snaps shut. */
+    const SNAP = 150;
+    const grip = el("div", "rail-resizer");
+    grip.append(el("div", "rail-resizer-grip"));
+    wireResizerKeys(grip, {
+      orientation: "vertical",
+      label: l10n.t("Resize sidebar"),
+      min: 168,
+      max: () => 360,
+      get: () => this.railWidth,
+      set: (w) => {
+        this.railWidth = w;
+        if (this.railEl) this.railEl.style.width = `${w}px`;
+      },
+      onCommit: () => this.persist(),
+      disabled: () => this.railCollapsed,
+    });
+
+    const onDown = (e: PointerEvent): void => {
+      if (this.railCollapsed) return;
+      e.preventDefault();
+      document.body.classList.add("resizing-h");
+      const startX = e.clientX;
+      const startW = this.railWidth;
+      let collapsedDuringDrag = false;
+      const move = (ev: PointerEvent): void => {
+        const raw = startW + (ev.clientX - startX);
+        // Drag narrow enough → collapse by hand, and end the drag.
+        if (raw < SNAP) {
+          collapsedDuringDrag = true;
+          up();
+          this.toggleRail();
+          return;
+        }
+        const w = Math.max(168, Math.min(360, raw));
+        this.railWidth = w;
+        if (this.railEl) this.railEl.style.width = `${w}px`;
+      };
+      const up = (): void => {
+        document.body.classList.remove("resizing-h");
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        if (!collapsedDuringDrag) this.persist();
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    };
+    grip.addEventListener("pointerdown", onDown);
+    grip.addEventListener("dblclick", () => {
+      if (this.railCollapsed) return;
+      this.railWidth = 188;
+      if (this.railEl) this.railEl.style.width = "188px";
+      this.persist();
+    });
+    return grip;
+  }
+
+  /** Update the top-bar sidebar toggle's icon + tooltip (VS Code's layout icon). */
+  private syncRailToggle(): void {
+    const t = this.railToggleEl;
+    if (!t) return;
+    t.title = this.railCollapsed ? l10n.t("Show sidebar") : l10n.t("Hide sidebar");
+    t.setAttribute("aria-label", t.title);
+    t.classList.toggle("is-collapsed", this.railCollapsed);
+    t.replaceChildren(glyph(this.railCollapsed ? "layout-sidebar-left-off" : "layout-sidebar-left"));
+  }
+
+  /** Collapse the rail to an icon-only strip (or expand it back). */
+  private toggleRail(): void {
+    this.railCollapsed = !this.railCollapsed;
+    this.persist();
+    if (this.railEl) {
+      this.railEl.classList.toggle("collapsed", this.railCollapsed);
+      this.railEl.style.width = this.railCollapsed ? "" : `${this.railWidth}px`;
+    }
+    this.syncRailToggle();
+    // The graph/diff Monaco + terminal surfaces need a relayout after the width change.
+    this.terminalDock?.layout();
+  }
+
+  // ── Integrated terminal (permanent bottom dock) ─────────────────────────────
+
+  /** Expand/collapse the terminal dock (Terminal nav button + Cmd/Ctrl+`). */
+  private toggleTerminal(): void {
+    if (this.terminalDock) {
+      this.terminalDock.toggle();
+      return;
+    }
+    // Safety net: the dock is normally mounted with the repo screen.
+    this.mountTerminalDock()?.expand();
+  }
+
+  /** Mount the permanent terminal dock (footer bar) into the main stack. */
+  private mountTerminalDock(): TerminalDock | undefined {
+    if (!this.mainStackEl || this.terminalDock) return this.terminalDock;
+    this.terminalDock = new TerminalDock(this.mainStackEl, {
+      expanded: this.terminalExpanded,
+      // Never let a restored dock eat the window — the screenshot that
+      // triggered this fix had it at ~60% height, drowning the actual app.
+      height: Math.min(this.terminalHeight, Math.round(window.innerHeight * 0.4)),
+      onStateChange: ({ expanded, height }) => {
+        this.terminalExpanded = expanded;
+        this.terminalHeight = height;
+        this.persist();
+      },
+      onCloseDetails: () => this.closeGraphDiff(),
+      // One dock per tab: its Output log is this repository's commands.
+      root: this.info?.root,
+    });
+    // Shrinking the window must not leave the dock covering the whole view.
+    window.addEventListener("resize", () => this.terminalDock?.handleWindowResize());
+    this.registerAssistantOpener();
+    return this.terminalDock;
+  }
+
+  /**
+   * The ✨ inline AI actions land in the ASSISTANT SECTION — one AI surface,
+   * full height, instead of a chat tab splitting the window in half from the
+   * bottom dock. Registered by the tab in FRONT (again on every switch), so an
+   * action lands in the tab it was taken in.
+   */
+  private registerAssistantOpener(): void {
+    registerAssistantTab((req) => {
+      // The TITLE is what the user bubble says — "Analyze #42", not the whole
+      // prompt the action builds around the issue body and its comments.
+      // Only route if the goal was not taken by an Assistant already on screen.
+      // `force: true` drops the view from the cache and rebuilds it, so firing
+      // a second ✨ action while the agent was answering the first destroyed
+      // the transcript and the Stop button and orphaned the run.
+      // NEVER with force when the goal was taken. `force` is what drops the
+      // kept-alive mount and rebuilds it — the unforced route re-attaches the
+      // same node, with its transcript and its live Stop button intact.
+      if (seedAssistantGoal(req.goal, req.title)) this.routeView("assistant", true);
+      else this.routeView("assistant");
+    });
+  }
+
+  /** Persist the UI preferences worth restoring on next launch. */
+  private persist(): void {
+    // A background tab has nothing to say about the window's preferences —
+    // the tab in front owns them.
+    if (!this.shell.isActive(this)) return;
+    // Each repository's own last view, for the tab's next launch (#32). Only
+    // the tabs that are open are kept, so the map cannot grow without end.
+    const prev = loadPrefs().tabViews;
+    const tabViews: Record<string, string> = {};
+    const open = new Set(this.shell.openRoots());
+    if (prev && typeof prev === "object") {
+      for (const [root, v] of Object.entries(prev as Record<string, unknown>)) {
+        if (open.has(root) && typeof v === "string") tabViews[root] = v;
+      }
+    }
+    if (this.info) tabViews[this.info.root] = this.currentView;
+    savePrefs({
+      tabViews,
+      currentView: this.currentView,
+      stagingModel: this.stagingModelPref,
+      pruneOnFetch: this.pruneOnFetchPref,
+      gravatar: this.gravatarPref,
+      compareFileListW: this.compareFileListW,
+      compareView: this.compareView,
+      branchTab: this.branchTab,
+      themeMode: this.themeMode,
+      logoMode: this.logoMode,
+      darkStyle: this.darkStyle,
+      railWidth: this.railWidth,
+      railCollapsed: this.railCollapsed,
+      changesListW: this.changesListW,
+      terminalOpen: this.terminalExpanded,
+      terminalHeight: this.terminalHeight,
+    });
+  }
+
+  /** Change the theme mode: apply live + persist. */
+  private setThemeMode(mode: ThemeMode): void {
+    this.themeMode = mode;
+    applyTheme(resolveTheme(mode));
+    this.rerenderForTheme();
+    // Recolor every highlighted code block for the new palette.
+    refreshHighlightTheme();
+    this.terminalDock?.applyTheme();
+    // An "auto" dock icon follows the new theme.
+    this.syncDockIcon();
+    this.invalidateAppearanceCard();
+    this.persist();
+  }
+
+  /**
+   * Change the dark style: re-point the tokens, repaint what reads them once
+   * (Monaco's theme, the terminals), move the Dock to the style's tile, and
+   * persist — theme-boot.js reads it back to paint the next launch's first
+   * frame in it.
+   */
+  private setDarkStyle(style: DarkStyle): void {
+    this.darkStyle = style;
+    applyDarkStyle(style);
+    refreshHighlightTheme();
+    this.terminalDock?.applyTheme();
+    this.syncDockIcon();
+    this.invalidateAppearanceCard();
+    this.persist();
+  }
+
+  /** The dark style a tab was built with — the shell applies it at launch. */
+  get darkStylePref(): DarkStyle {
+    return this.darkStyle;
+  }
+
+  /** Change the dock icon mode: push to the dock + persist. */
+  private setLogoMode(mode: LogoMode): void {
+    this.logoMode = mode;
+    this.syncDockIcon();
+    this.invalidateAppearanceCard();
+    this.persist();
+  }
+
+  /**
+   * Settings holds a kept-alive DOM built when it was last rendered, so its
+   * Appearance card kept showing whichever theme was selected THEN. Changing
+   * the theme from anywhere else — ⌘K, the menu, an OS light/dark flip — left
+   * the segment highlighting the old mode and the App-icon preview painting
+   * the old variant, both stating as fact something that had already changed.
+   */
+  private invalidateAppearanceCard(): void {
+    // Update the card IN PLACE. It used to rebuild the whole Settings view —
+    // which throws away every other card's in-progress state, so changing the
+    // theme with ⌘K while half-way through typing a Git identity, an SSH
+    // passphrase or a clone folder destroyed what was typed. That is the same
+    // rule this codebase already enforces everywhere else ("a form is not the
+    // app's to throw away"), broken by the fix for the card NEXT to it.
+    this.syncAppearanceCard?.();
+    // The cached DOM is still correct, because the card just updated itself —
+    // but a card built LATER must start from the current values, and that is
+    // what showSettingsView does on a fresh build.
+  }
+
+  /** Re-sync the Appearance card's own controls, set when that card is built. */
+  private syncAppearanceCard?: () => void;
+
+  /** The dock icon variant to show: pinned light/dark, or (auto) the resolved theme. */
+  private dockVariant(): AppTheme {
+    return this.logoMode === "auto" ? resolveTheme(this.themeMode) : this.logoMode;
+  }
+
+  /**
+   * The top bar drops things in a STATED order when it runs out of room.
+   *
+   * Everything on the left is about the repository and the row is not always
+   * wide enough for all of it. Left to flexbox, whatever happens to be last
+   * gets squeezed — which is how the branch ended up unreadable so that an
+   * editor's full name could fit. The order is: the editor's NAME first (its
+   * icon still says which editor it is), then the search box's label. The
+   * branch and the sync state never yield; they are what this bar is for.
+   *
+   * Measured, not a media query: `redesign/wave-2` and `fix/a` need different
+   * amounts of room at the very same window size.
+   *
+   * The collapsed labels keep `max-width: 0` rather than `display: none`, so
+   * this can still ask what putting them back would COST. That is what makes
+   * the decision stable — computing the need from the current, already-shrunk
+   * layout is how a fit pass ends up flip-flopping between two states.
+   */
+  private wireTopbarFit(bar: HTMLElement): void {
+    /** What a cluster WANTS, not what flex has already squeezed it to.
+     *  `offsetWidth` on a shrunken flex item reports the squeeze, not the need,
+     *  so the row could never tell "it fits" from "it has already given up". */
+    const naturalWidth = (elx: HTMLElement): number => {
+      const flex = elx.style.flex;
+      const width = elx.style.width;
+      elx.style.flex = "0 0 auto";
+      elx.style.width = "max-content";
+      const w = elx.offsetWidth;
+      elx.style.flex = flex;
+      elx.style.width = width;
+      return w;
+    };
+    const fit = (): void => {
+      const left = bar.querySelector<HTMLElement>(".topbar-left");
+      const right = bar.querySelector<HTMLElement>(".topbar-right");
+      if (!left || !right || !bar.clientWidth) return;
+      // The room between the bar's OWN padding, less the gap between the two
+      // clusters, and a little slack.
+      const cs = getComputedStyle(bar);
+      const have =
+        bar.clientWidth -
+        (parseFloat(cs.paddingLeft) || 0) -
+        (parseFloat(cs.paddingRight) || 0) -
+        (parseFloat(cs.columnGap) || 0) -
+        4;
+      // What the row NEEDS in each state, measured IN that state — not the
+      // current state plus whatever its collapsed labels report. A collapse
+      // takes more than the words: the tight rules also drop the gaps and
+      // padding around them (the editor button's, the operation chip's, the
+      // search box's), and adding back only the words' scrollWidth left the
+      // need ~25px short. The bar then read as fitting from its collapsed
+      // state, let everything back, and the open-in button overlapped the
+      // search box — at exactly the widths where the row is on the edge.
+      // (Also why a stopped operation's words count: "Rebasing · 30
+      // conflicts" collapses with the editor's name.) Classes are toggled and
+      // measured within one task, so nothing paints in between, and the
+      // MutationObserver below ignores attributes, so this cannot loop.
+      const needIn = (tight: boolean, tighter: boolean): number => {
+        bar.classList.toggle("is-tight", tight);
+        bar.classList.toggle("is-tighter", tighter);
+        return naturalWidth(left) + naturalWidth(right);
+      };
+      const open = needIn(false, false);
+      const tightNeed = open > have ? needIn(true, false) : open;
+      const tight = open > have;
+      const tighter = tight && tightNeed > have;
+      bar.classList.toggle("is-tight", tight);
+      bar.classList.toggle("is-tighter", tighter);
+    };
+    this.fitTopbar = fit;
+    const ro = new ResizeObserver(fit);
+    ro.observe(bar);
+    // Both clusters: the right one changes width too (the account chip, the
+    // bell's badge, the Assistant launcher), and was never watched.
+    for (const cluster of [bar.querySelector(".topbar-left"), bar.querySelector(".topbar-right")]) {
+      if (!cluster) continue;
+      ro.observe(cluster);
+      // A branch name changing does not change any BOX — the switch is capped —
+      // so a ResizeObserver alone never hears about the one event that most
+      // changes how much room this row wants. Attributes are deliberately not
+      // watched: `fit` toggles classes, and watching those would loop.
+      new MutationObserver(fit).observe(cluster, { subtree: true, childList: true, characterData: true });
+    }
+    fit();
+  }
+
+  /** Re-run the top bar's fit after something on it changes length (a branch
+   *  name, a push count) rather than only when the window resizes. */
+  private fitTopbar?: () => void;
+
+  /** Push the resolved dock icon variant to the main process (best-effort). */
+  private syncDockIcon(): void {
+    void host.invoke("appearance:dockIcon", { variant: this.dockVariant(), style: this.darkStyle }).catch(() => {});
+  }
+
+  /** Step back in the in-app navigation history (⌘[ / topbar chevron). */
+  private navBack(): boolean {
+    if (this.navPos <= 0) return false;
+    this.navPos--;
+    this.navTravelTo(this.navHistory[this.navPos]);
+    return true;
+  }
+
+  /**
+   * Hand the history to the views, so a detail page's own Back can POP.
+   *
+   * It used to PUSH — every `.det-back` called `nav(view, {list:true})`, which
+   * appends. Measured: pressing back left FORWARD disabled, which only happens
+   * if nothing was stepped over. The one control that should restore your place
+   * was the one destroying it.
+   */
+  private installNav(): void {
+    installNavStack({
+      back: () => this.navBack(),
+      prev: () => (this.navPos > 0 ? this.navHistory[this.navPos - 1] : undefined),
+      label: (label: string) => {
+        const cur = this.navHistory[this.navPos];
+        if (cur) cur.label = label;
+      },
+      retarget: (patch) => {
+        const cur = this.navHistory[this.navPos];
+        if (cur) cur.target = { ...(cur.target ?? {}), ...patch } as SectionTarget;
+      },
+    });
+  }
+
+  /** Step forward in the in-app navigation history (⌘] / topbar chevron). */
+  private navForward(): void {
+    if (this.navPos >= this.navHistory.length - 1) return;
+    this.navPos++;
+    this.navTravelTo(this.navHistory[this.navPos]);
+  }
+
+  private navTravelTo(entry: { view: string; target?: SectionTarget }): void {
+    this.navTravel = true;
+    try {
+      // Same-view travel must FORCE: without it routeView's "already showing"
+      // early-return swallowed the hop (navPos moved, nothing on screen
+      // changed — Back looked dead). Cross-view travel stays unforced so
+      // kept-alive views restore from cache.
+      this.routeView(entry.view, entry.view === this.currentView, entry.target);
+    } finally {
+      this.navTravel = false;
+    }
+    this.updateNavButtons();
+  }
+
+  /** Enable/disable the top-bar back/forward chevrons to match the stack. */
+  private updateNavButtons(): void {
+    if (this.navBackBtn) this.navBackBtn.disabled = this.navPos <= 0;
+    if (this.navFwdBtn) this.navFwdBtn.disabled = this.navPos >= this.navHistory.length - 1;
+  }
+
+  /** Swap the main area to the chosen view's surface. `target` deep-links a
+   *  specific item in a section view (e.g. opening an issue from the project
+   *  board) — keeping navigation inside the app instead of bouncing to GitHub. */
+  private routeView(id: string, force = false, target?: SectionTarget): void {
+    // A tab in the BACK never navigates (issue #32). Its screen is detached,
+    // and a route would build a view whose reads are stamped with the tab in
+    // front. The one route that reaches a background tab on purpose is the
+    // landing after an open — `await openPath(); nav("code")` — whose answer
+    // arrives with the opened repository already in front: that means "land
+    // THERE", so it goes to the tab in front. Anything else is dropped.
+    if (!this.shell.isActive(this)) {
+      if (inOpenLanding()) this.shell.routeActive(id, force, target);
+      return;
+    }
+    // Where the app actually navigated, for the harness to assert against.
+    // Several defects are "it went somewhere else" — a commit reference
+    // ejecting you into the graph, a back button landing on a list — and none
+    // of them were checkable, because a check can see the DOM that resulted
+    // but not the route that produced it. Costs one array push in a build the
+    // harness page is the only consumer of; `__GS_ROUTES` is absent in
+    // production because nothing ever creates it.
+    const spy = (window as unknown as { __GS_ROUTES?: Array<{ view: string; target?: SectionTarget }> })
+      .__GS_ROUTES;
+    if (spy) spy.push({ view: id, target });
+    // Any route change dismisses every floating layer — a peek, a menu, a
+    // modal, the palette, the notifications popover. They all mount on
+    // document.body, so a view swap cannot take them with it: an Inbox facet
+    // menu used to survive navigation and hover over the next view, filtering
+    // a list that was no longer on screen.
+    dismissLayers();
+    // A deep-link landing mark belongs to the screen it landed on. Leaving is
+    // an action, so it counts as the dismissal — and it stops the two document
+    // listeners outliving the row they point at.
+    this.clearLanded?.();
+    // Which list a row belongs to, so Escaping out of a detail can put the
+    // keyboard back on the row you opened instead of on <body>.
+    setFocusScope(id);
+    // The Assistant has no rail item to light up; its launcher is its tab.
+    queueMicrotask(() => {
+      this.syncAssistantChip?.();
+      this.syncWhereChip?.();
+    });
+    // Deep-linking an item must rebuild the section so it can select that item —
+    // never restore a stale cached view (which wouldn't have it open). The ONE
+    // exception: a sha-only graph reveal, which works against the live
+    // kept-alive mount — forcing would tear it down and refetch history for a
+    // scroll that needs nothing rebuilt.
+    // A view that needs a repository, with none open, is not a destination.
+    // Reached by a deep link, a restored preference or a keyboard shortcut, it
+    // would render a screen with nothing to render.
+    if (!this.currentRepo && App.NEEDS_REPO.has(id)) {
+      id = "dashboard";
+      target = undefined;
+    }
+    const shaOnlyGraphReveal =
+      id === "graph" &&
+      !!target?.sha &&
+      target.number === undefined &&
+      target.ref === undefined &&
+      target.path === undefined;
+    if (target && !shaOnlyGraphReveal) force = true;
+    // The Code browser's identity includes its folder: a plain "code" route is
+    // normalized to carry the CURRENT folder, so its history entry restores the
+    // exact place on back/forward instead of whatever codePath happens to be.
+    // Normalized BEFORE the no-op guard below, so re-clicking Code in the rail
+    // compares folder-to-folder and stays a no-op, rather than comparing
+    // undefined-to-folder and pointlessly rebuilding the listing.
+    if (id === "code" && !target) target = { path: this.codePath };
+    this.sectionTarget = target;
+    // Re-clicking the section you're already on should do nothing — WHEN the
+    // screen already shows what the click asks for. The guard used to compare
+    // only the view id, and a section's id covers both its list and every one
+    // of its detail pages: with issue #31 open, clicking "Issues" in the rail
+    // asked for the list and was swallowed as "already there". A primary nav
+    // control that silently does nothing is the deadest kind of click — the
+    // request's own words were "clicking … should return me to the issues
+    // page". Same id + same CONTENT is a no-op; same id + different content
+    // falls through and rebuilds, which renders the list.
+    if (
+      !force &&
+      id === this.currentView &&
+      this.viewHost.firstChild &&
+      sameTargetContent(this.currentTarget, target)
+    ) {
+      if (shaOnlyGraphReveal && target?.sha) this.revealWhenReady(target.sha);
+      return;
+    }
+    // Record real navigation (not back/forward travel) in the history stack.
+    // A forward-truncate on push gives browser semantics: navigating after
+    // going back discards the abandoned forward entries.
+    if (!this.navTravel) {
+      const last = this.navHistory[this.navPos];
+      const same = (a?: SectionTarget, b?: SectionTarget): boolean =>
+        a?.number === b?.number &&
+        a?.jobId === b?.jobId &&
+        a?.id === b?.id &&
+        a?.sha === b?.sha &&
+        a?.path === b?.path &&
+        // The FILE too. Without it, opening a file from the listing it lives in
+        // compares equal to the listing (same `path`), so no history entry was
+        // pushed: Back skipped past the folder entirely and Forward could never
+        // return to the file. That is half of what SectionTarget.file was added
+        // for, and it was silently doing nothing.
+        a?.file === b?.file &&
+        a?.ref === b?.ref &&
+        (a?.list ?? false) === (b?.list ?? false);
+      if (!last || last.view !== id || (target && !same(last.target, target))) {
+        // The forward-truncate belongs HERE, with the push it accompanies —
+        // browser semantics are "navigating after going back discards the
+        // abandoned forward entries", and a re-route to the place you are
+        // already standing is not navigating.
+        //
+        // Above the check, it ran on every route that reached this point,
+        // including the one `refreshAll` performs — which is fired by the file
+        // watcher on every save, by a window focus whose fingerprint moved, and
+        // by every git action the app runs. So Forward died constantly, seconds
+        // after going Back, for reasons the reader could not see.
+        // The forward-truncate belongs HERE, with the push it accompanies —
+        // browser semantics are "navigating after going back discards the
+        // abandoned forward entries", and a re-route to the place you are
+        // already standing is not navigating.
+        //
+        // Above the check, it ran on every route that reached this point,
+        // including the one `refreshAll` performs — which the file watcher
+        // fires on every save, a window focus fires whenever the fingerprint
+        // moved, and every git action the app runs fires too. So Forward died
+        // constantly, seconds after going Back, for reasons nobody could see.
+        this.navHistory.splice(this.navPos + 1);
+        this.navHistory.push({ view: id, target });
+        this.navPos = this.navHistory.length - 1;
+      }
+      this.updateNavButtons();
+    }
+    // Stash the OUTGOING view if it's keep-alive-able, so returning to it later
+    // restores the rendered DOM (scroll, expanded state) instead of refetching.
+    //
+    // But only if it actually FINISHED. A section you clicked into and left
+    // before its data arrived was cached mid-load — skeleton and all — and
+    // restored from that cache on every later visit, so Issues came back
+    // permanently empty for the rest of the session and nothing but the header
+    // refresh button could recover it. The trigger is ordinary: click a section,
+    // get impatient, click something else. A view that never painted is not a
+    // view worth keeping.
+    const prev = this.currentView;
+    const outgoing = this.viewHost.firstElementChild as HTMLElement | null;
+    const stillLoading =
+      !!outgoing?.querySelector(".skeleton, .sk-row, .list-loading, .loading-state, .spinner");
+    // An EMPTY or ERROR state is not worth keeping either. A list that painted
+    // "No issues" because its first fetch raced repo start-up was parked as a
+    // finished view and restored — empty, forever, while the data sat one
+    // fetch away. Rebuilding a view that shows nothing costs one cheap read;
+    // restoring a stale nothing costs the user their trust in the screen.
+    const showsNothing = !!outgoing?.querySelector(".list-empty, .error-state");
+    // NOT gated on `force`. `force` means "rebuild the view I am going TO with
+    // fresh data" — and it is set by every navigation that carries a target,
+    // which is every navigation INTO a detail page. Letting it also throw away
+    // the view being left meant opening a branch's page discarded the Branches
+    // list, so Back rebuilt it from scratch: the filter you had typed to find
+    // that branch was gone and you were back at the top of ninety rows. The
+    // incoming view's own cache is still dropped below, which is what force is
+    // actually for.
+    if (App.KEEPALIVE.has(prev) && outgoing && !stillLoading && !showsNothing) {
+      // Take the scroll positions BEFORE the node is detached. Detaching zeroes
+      // every `scrollTop` inside it, so by the time it is re-attached there is
+      // nothing left to restore — which is why keeping the DOM alive returned
+      // you to a 90-row branch list, or a long settings page, at the top of it
+      // every time. The comment above has promised otherwise since it was
+      // written.
+      this.viewScroll.set(outgoing, this.scrollSnapshot(outgoing));
+      this.viewCache.set(prev, outgoing);
+      // `currentTarget` still belongs to the OUTGOING route here — it is
+      // reassigned a few lines down, when the incoming view takes over.
+      this.viewCacheTarget.set(prev, this.currentTarget);
+    } else if (stillLoading || showsNothing) {
+      // …and drop any older good copy, so the next visit rebuilds rather than
+      // restoring something staler than what we just abandoned.
+      this.viewCache.delete(prev);
+    }
+    if (force) {
+      this.viewCache.delete(id); // a refresh must rebuild with fresh data
+    }
+    this.currentView = id;
+    this.currentTarget = target;
+    this.persist();
+    this.routeGen++; // supersede any in-flight async work from the prior view
+    // Free the previous view's Monaco surface before swapping the DOM under it —
+    // except the Changes view's kept surface on a re-route to Changes itself
+    // (a refresh): it moves into the rebuilt view, merge and confirms intact.
+    const keepChanges =
+      id === "changes" && prev === "changes" && !!this.changesPanel && this.activeMonacoView === this.changesPanel.panel;
+    if (!keepChanges) {
+      this.activeMonacoView?.dispose();
+      this.activeMonacoView = undefined;
+    }
+    // The "Diff" dock tab exists ONLY while a file diff is actually open — it
+    // used to appear the moment you entered the commits view and sit there
+    // empty. openFile() creates it on demand; leaving the view removes it.
+    // Done AFTER disposing the Monaco diff (which lives in its surface) so we
+    // never remove a surface with a live editor in it.
+    if (id !== "graph") {
+      this.closeGraphDiff();
+      this.detailsEl = undefined;
+    }
+    // Roving tabindex: exactly ONE rail item is in the Tab order.
+    //
+    // "The active one" is not enough, because some routes are not rail items at
+    // all — the Assistant is reached from the top bar, and a detail page is a
+    // route with no rail entry. On those, nothing matched, every one of the 17
+    // destinations got tabIndex -1, and the entire navigation rail dropped out
+    // of the keyboard's reach until you happened to press ⌘1-8. A roving tab
+    // stop needs a fallback, or it is not a tab stop.
+    let anyActive = false;
+    for (const btn of this.navButtons) {
+      const active = btn.dataset.view === id;
+      if (active) anyActive = true;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+      btn.tabIndex = active ? 0 : -1;
+    }
+    if (!anyActive && this.navButtons.length) this.navButtons[0].tabIndex = 0;
+    // Restore a kept-alive view instantly, skipping the rebuild + refetch.
+    // Any soft-reload hook belongs to the view being replaced, and its captured
+    // routeGen can never match again (routeGen bumps on every route). Left in
+    // place it made refreshBranchesSoft await a function that returns
+    // immediately — so a fetch or pull silently refreshed nothing.
+    //
+    // This has to run BEFORE the keep-alive restore below, which returns early.
+    // It did not, so a route change into a CACHED view skipped it and left the
+    // dead hook armed: Branches then stopped refreshing for the rest of the
+    // session. A dropped stash stayed on the list, and dropping it a second
+    // time ran `stash drop` against an index that now names a DIFFERENT stash —
+    // destroying work the user never chose.
+    this.reloadBranchRows = null;
+    this.reloadCompare = null;
+    // …and only when the parked DOM shows what THIS route asks for. The slot
+    // is content-checked, not just id-checked: a stashed detail must never
+    // answer a request for the list, or the screen contradicts the history the
+    // back button walks. A mismatch simply falls through to a rebuild — the
+    // slot is overwritten at the next park, so nothing needs deleting.
+    const cached =
+      App.KEEPALIVE.has(id) && sameTargetContent(this.viewCacheTarget.get(id), target)
+        ? this.viewCache.get(id)
+        : undefined;
+    if (cached) {
+      this.viewHost.replaceChildren(cached);
+      // Live again: its soft-reload hook, dropped above with every route, is
+      // re-armed for THIS route — or a restored Branches view went deaf to
+      // every tab that opened or closed for the rest of the session (#32).
+      this.viewRevive.get(cached)?.();
+      // …and put them back, on the frame after the attach so layout has run.
+      const shot = this.viewScroll.get(cached);
+      if (shot) {
+        const apply = (): void => {
+          for (const [node, top, left, atTail] of shot) {
+            if (!node.isConnected) continue;
+            // A node that GREW while parked is a different problem from one
+            // that did not. The Assistant's transcript keeps taking a live
+            // turn's output behind your back, so restoring the pixel offset put
+            // you permanently behind the answer — pinned to a fixed point while
+            // it wrote past you. If the reader was at the TAIL when they left,
+            // the tail is where they meant to be, wherever that now is.
+            node.scrollTop = atTail ? node.scrollHeight : top;
+            node.scrollLeft = left;
+          }
+        };
+        apply();
+        requestAnimationFrame(apply);
+      }
+      return;
+    }
+    if (id === "refdetail") {
+      // A ref is a PLACE. A branch's history used to be a modal peek: no route,
+      // no back-stack entry, no ⌘[/⌘], gone on Escape — and for a remote
+      // branch, a tag or a stash that modal was the ONLY door to every action
+      // they had.
+      void renderRefDetail(this.viewHost, (v, t) => this.routeView(v, false, t), target);
+    } else if (id === "predit") {
+      // A pull request's title and body are the same two fields, and editing
+      // one was the last surface still doing it in a modal — one with no draft
+      // at all, so Escape took everything you had written.
+      void renderIssueCompose(this.viewHost, (v, t) => this.routeView(v, false, t), target, "pr");
+    } else if (id === "issuenew") {
+      // Writing an issue is a PAGE. As a modal it had a title box, a body box
+      // and nowhere to say who it is for — so labels, assignees and milestone
+      // were a second trip through the issue's own page, after GitHub had
+      // already announced it.
+      void renderIssueCompose(this.viewHost, (v, t) => this.routeView(v, false, t), target);
+    } else if (id === "releasenew") {
+      // Writing a release is a PAGE. As a modal it gave the notes — the only
+      // part anyone spends time on — about 180px of a 560px card.
+      void renderReleaseCompose(this.viewHost, (v, t) => this.routeView(v, false, t), target);
+    } else if (id === "joblog") {
+      // The log is a PAGE, not a pane inside one. It used to get 523px of a
+      // 913px window, on a run page that itself scrolled — two nested scroll
+      // contexts and whatever height was left over.
+      void renderJobLog(this.viewHost, (v, t) => this.routeView(v, false, t), target);
+    } else if (id === "commit") {
+      // A commit is a PLACE, not a row to reveal in the graph. Everything that
+      // referenced one used to route to "graph" and call reveal(sha), which
+      // shows no files, returns silently when the sha is off the loaded page,
+      // and abandons wherever you were.
+      void renderCommit(this.viewHost, (v, t) => this.routeView(v, false, t), target, (req) =>
+        this.runAction(req),
+      );
+    } else if (id === "code") {
+      // A path target deep-links a folder — that's how the Code browser's own
+      // folder hops travel, so ⌘[/⌘] walk the folder trail like a browser.
+      if (target?.path !== undefined) this.codePath = target.path;
+      // …and a `file` target is the open FILE, which is a place in the app just
+      // as much as a folder is. See SectionTarget.file.
+      if (target?.file) void this.openCodeFile(target.file);
+      else void this.showCodeView();
+    } else if (id === "graph") {
+      this.showGraphView(force);
+      // A sha target deep-links a commit: scroll to + select it once the rows
+      // stream in (e.g. "View in Commits" from a peek, or a tag detail).
+      if (target?.sha) this.revealWhenReady(target.sha);
+    } else if (id === "branches") {
+      void this.showBranchesView(target?.ref, target?.lens, target?.refKind);
+    } else if (id === "changes") {
+      void this.showChangesView();
+    } else if (id === "compare") {
+      void this.showCompareView();
+    } else if (id === "rebase") {
+      this.mountSection(renderRebase);
+    } else if (id === "assistant") {
+      this.mountSection(renderAssistant);
+    } else if (id === "prs") {
+      this.mountSection(renderPrs);
+    } else if (id === "issues") {
+      this.mountSection(renderIssues);
+    } else if (id === "notifications") {
+      this.mountSection(renderNotifications);
+    } else if (id === "mywork") {
+      this.mountSection(renderMyWork);
+    } else if (id === "actions") {
+      this.mountSection(renderActions);
+    } else if (id === "releases") {
+      this.mountSection(renderReleases);
+    } else if (id === "explore") {
+      this.mountSection(renderExplore);
+    } else if (id === "orgs") {
+      this.mountSection(renderOrgs);
+    } else if (id === "projects") {
+      this.mountSection(renderProjects);
+    } else if (id === "gists") {
+      this.mountSection(renderGists);
+    } else if (id === "repositories") {
+      this.mountSection(renderRepositories);
+    } else if (id === "dashboard") {
+      this.mountSection(renderDashboard);
+    } else if (id === "settings") {
+      void this.showSettingsView();
+    } else {
+      this.showPlaceholderView(id);
+    }
+  }
+
+  /** Mount a per-section view module into a fresh container inside the view host.
+   *  The module owns its container, so a stale async render writes into detached
+   *  DOM (harmless) once the user navigates on. */
+  private mountSection(render: SectionRender): void {
+    const wrap = el("div", "view-host-inner");
+    // Paint a content-shaped skeleton NOW — sections gate on github:status
+    // before their first render, and that await used to leave a blank pane
+    // (blank → skeleton → content, three stages on every visit).
+    wrap.appendChild(skeletonList(6));
+    this.viewHost.replaceChildren(wrap);
+    const target = this.sectionTarget;
+    this.sectionTarget = undefined;
+    const nav = (v: string, t?: SectionTarget): void => this.routeView(v, false, t);
+    // The person peek's router, set from the one place every section mounts —
+    // it is opened by chips on views that have nothing to do with orgs, and
+    // used to be wired only by the Organizations view itself.
+    setPeekNav(nav);
+    render(wrap, nav, target);
+  }
+
+  /** A real branch manager: local branches with upstream + ahead/behind + last
+   *  commit, plus remotes, tags and stashes. `highlightRef` deep-links one row:
+   *  its group builds expanded and the row scrolls into view with a flash. */
+  /**
+   * The ref manager: local branches, remote branches, tags and stashes.
+   *
+   * It was the last view in the app still hand-rolling its own chrome — a bare
+   * filter input, a "New branch" button, and four collapsible groups of four
+   * incompatible row shapes. No title, no count, no Refresh, no facets, no
+   * routed detail; the most-used repo-wide verb on the screen (Fetch) was a
+   * menu item inside ONE local branch's hover-revealed kebab, and remote
+   * branches, tags and stashes had no row actions at all — their entire action
+   * set required opening a modal first.
+   *
+   * Now: one KIND per screen behind a segmented switch, one row anatomy, and
+   * every verb visible at rest.
+   */
+  private async showBranchesView(
+    highlightRef?: string,
+    lens?: string,
+    highlightKind?: string,
+  ): Promise<void> {
+    // A deep link must SHOW the ref it names (a graph ref chip lands here), so
+    // it drops the sticky filter below — otherwise the row it asks to scroll to
+    // and flash is filtered out and the arrival looks like an empty list.
+    if (highlightRef) this.branchQuery = "";
+    // A door that COUNTED something lands on the list it counted: Home's
+    // "2 branches merged — clean up?" preselects the standing facet rather
+    // than dropping you at the top of ninety branches with the answer buried.
+    // A lens is a VISIT preset, not a choice made in the view: it arrives
+    // with the door click and leaves with the next ordinary entrance. Facet
+    // stickiness is for filters people set on the bar themselves — a door's
+    // filter surviving onto a plain rail click reads as "why is my branch
+    // list mysteriously short?".
+    if (lens) {
+      this.branchTab = "local";
+      this.branchFacets.local = { standing: lens };
+      // And the age cut opens on All: a merged branch is usually a stale one,
+      // and landing the lens inside "Active" would empty the very list the
+      // door just counted (the sweep button documents the same trap).
+      this.branchAge = "all";
+      this.branchLensApplied = true;
+    } else if (this.branchLensApplied) {
+      this.branchFacets.local = {};
+      this.branchLensApplied = false;
+    }
+    const wrap = el("div", "list-view branches-view");
+    const body = el("div", "list-body");
+    body.appendChild(skeletonList(8));
+
+    const header = ghHeader(l10n.t("Branches"), undefined, () => this.refreshBranchesSoft());
+    // The search field the rest of the app uses: 110ms debounce, a clear ✕, and
+    // Escape to empty it — none of which a raw `input.list-filter` had. It also
+    // searches more than the name now (upstream, tip subject, short sha, a
+    // stash's message), because a name-only filter cannot find "the branch with
+    // the log-stream fix in it".
+    // Seeded from instance state, like branchTab/branchFacets beside it. Opening
+    // a ref carries a target, which forces a rebuild AND skips caching the
+    // outgoing list — so this view is reconstructed on the way back, and a
+    // closure-local query meant the filter you typed to find the branch was
+    // gone the moment you looked at it. Every other section keeps its query
+    // outside the build for exactly this reason (views/issues.ts).
+    let query = this.branchQuery;
+    const search = searchField({
+      placeholder: l10n.t("Search refs…"),
+      initial: query,
+      onInput: (q) => {
+        query = q;
+        this.branchQuery = q;
+        render();
+      },
+    });
+    header.querySelector(".gh-head-titlewrap")?.appendChild(search);
+
+    const tools = el("div", "gh-head-tools");
+    // FETCH, at the surface. It was reachable only from inside one local
+    // branch's ⋯ menu — the action that makes every ahead/behind number on this
+    // screen true, two hover levels deep. Refresh (in .gh-acct) re-reads what
+    // git already has; Fetch goes to the network. Different promises, so
+    // different buttons, and the titles say which is which.
+    const fetchBtn = el("button", "mini-btn") as HTMLButtonElement;
+    fetchBtn.append(glyph("sync"), span(l10n.t("Fetch")));
+    fetchBtn.title = l10n.t("Fetch from every remote — updates what ahead and behind mean here");
+    fetchBtn.addEventListener("click", () => void this.fetchAllLive(fetchBtn));
+    const ctaSlot = el("div", "gh-head-cta");
+    const verbs = el("div", "gh-head-verbs");
+    verbs.append(fetchBtn, ctaSlot);
+    tools.append(verbs);
+    header.querySelector(".gh-acct")?.before(tools);
+
+    const segSlot = el("div", "branches-segbar");
+    const facetSlot = el("div", "branches-facets");
+    wrap.append(header, segSlot, facetSlot, body);
+    wireListNav(body, ".sec-row");
+    this.viewHost.replaceChildren(wrap);
+
+    const gen = this.routeGen;
+    await this.refreshRefs();
+    let locals: BranchInfo[];
+    try {
+      locals = await gget("branches:list", undefined);
+    } catch (e) {
+      // A failed read is not an empty repository. This used to be impossible to
+      // reach — the bridge turned every git failure into `[]` — so a repo with a
+      // corrupt packed-refs or a held index.lock rendered as "No branches yet",
+      // which is a confident lie about a repo full of them.
+      if (gen !== this.routeGen) return;
+      body.replaceChildren(
+        errorState(l10n.t("Couldn't list branches"), cleanErr(e) || l10n.t("Git could not read this repository's refs."), () =>
+          void this.showBranchesView(highlightRef, undefined, highlightKind),
+        ),
+      );
+      return;
+    }
+    if (gen !== this.routeGen) return;
+    // Stashes join the ref manager: they're refs too, and this is the only
+    // browsable surface they have.
+    let stashes: StashInfo[] = [];
+    let stashFailed = false;
+    try {
+      stashes = await host.invoke("stash:list", undefined);
+    } catch {
+      // Swallowing this used to render "no stashes" over a repo that has some.
+      stashFailed = true;
+    }
+    if (gen !== this.routeGen) return;
+    // Recomputed on every render so a live reload (fetch from the branch menu)
+    // picks up new remote branches/tags without rebuilding the whole view.
+    //
+    // `refs/remotes/origin/HEAD` shortens to the bare remote NAME ("origin"),
+    // not "origin/HEAD" — so the old `endsWith("/HEAD")` guard never fired and
+    // the list carried a phantom row called "origin" offering to check out a
+    // branch that does not exist. Its symref names the DEFAULT branch, which is
+    // worth keeping; the row is not (isRemoteHead, shared with the switcher and
+    // the graph's ref menu).
+    let remotes = this.refs.filter((r) => r.type === "remote" && !isRemoteHead(r));
+    let tags = this.refs.filter((r) => r.type === "tag");
+    let defaultBranch = this.defaultBranchName(locals);
+    // Worktrees: four channels that have existed since the IPC contract was
+    // written with NO caller in any view. The segment appears only when there
+    // is more than one — a single worktree is just "the repository".
+    let worktrees: WorktreeInfo[] = [];
+    // A failed read is not an empty list — the same rule the stash list already
+    // follows. Swallowing it let the view assert "No other worktrees" from a
+    // git call that never answered.
+    let worktreeFailed = false;
+    // Which tabs were open when the list was read: each row's "open in a tab"
+    // is main's answer for THOSE (#32). See tabsEpoch.
+    let tabsRead = this.tabsEpoch;
+    try {
+      worktrees = await host.invoke("worktree:list", undefined);
+    } catch {
+      worktrees = [];
+      worktreeFailed = true;
+    }
+    if (gen !== this.routeGen) return;
+
+    // Which KIND is on screen. One homogeneous kind per screen is what makes a
+    // shared row and a facet bar possible at all — and it stops 300 tags
+    // burying six branches, which is what the four-groups-in-one-scroller shape
+    // did every time a repo had any history.
+    type Kind = "local" | "remote" | "tags" | "stashes" | "worktrees";
+    if (highlightRef) {
+      // The kind the caller KNEW, when it knew one, beats the name search —
+      // which is ordered locals-first and so always picks a branch over a tag
+      // of the same name.
+      const byKind: Record<string, Kind | undefined> = {
+        head: "local",
+        currentHead: "local",
+        remoteHead: "remote",
+        remote: "remote",
+        tag: "tags",
+      };
+      const asked = highlightKind ? byKind[highlightKind] : undefined;
+      const found = locals.some((b) => b.name === highlightRef)
+        ? "local"
+        : remotes.some((r) => r.name === highlightRef)
+          ? "remote"
+          : tags.some((r) => r.name === highlightRef)
+            ? "tags"
+            : stashes.some((st) => st.ref === highlightRef)
+              ? "stashes"
+              : undefined;
+      // A kind that names a segment the ref is not actually in is worse than
+      // no kind, so it only wins when that segment really holds the ref.
+      const inAsked =
+        asked === "local"
+          ? locals.some((b) => b.name === highlightRef)
+          : asked === "remote"
+            ? remotes.some((r) => r.name === highlightRef)
+            : asked === "tags"
+              ? tags.some((r) => r.name === highlightRef)
+              : false;
+      this.branchTab = (inAsked ? asked : found) ?? this.branchTab;
+      // Nothing matched anywhere. The filters have already been cleared by the
+      // time we get here, so failing silently leaves the user staring at a
+      // list they did not ask for with no idea why.
+      if (!found && !inAsked) {
+        toast(l10n.t("{0} is not in this repository's refs any more.", highlightRef), "info");
+      }
+      // A deep link must SHOW the row it names, so it clears EVERY narrowing
+      // that could hide it — not just the search box. The age cut alone was
+      // enough to swallow the arrival silently: `branchAge` defaults to
+      // "active", so a link to any branch untouched for three months landed on
+      // a list that did not contain it, with nothing saying why. The facets can
+      // do the same, and they persist per segment across launches.
+      this.branchFacets[this.branchTab] = Object.create(null) as FacetState;
+      this.branchAge = "all";
+    }
+
+    const counts = (): Record<Kind, number> => ({
+      local: locals.length,
+      remote: remotes.length,
+      tags: tags.length,
+      stashes: stashes.length,
+      worktrees: worktrees.length,
+    });
+
+    /**
+     * How recently a branch moved, as GitHub cuts it: Active / Stale / All.
+     *
+     * Three months is github.com's own line, and it is the difference between
+     * "the branches I am working on" and "everything this clone has ever
+     * touched" — the distinction that makes a list of ninety branches usable.
+     */
+    const STALE_AFTER = 90 * 24 * 3600;
+    const isStale = (date?: number): boolean =>
+      !!date && Date.now() / 1000 - date > STALE_AFTER;
+
+    /** The one word that describes where a branch stands. First match wins, and
+     *  the order is the order a person cares about them in. */
+    const standing = (b: BranchInfo): string => {
+      if (b.current) return "current";
+      if (b.gone) return "gone";
+      // `merged` means "ahead === 0 against the default branch", so the default
+      // branch satisfies it trivially — and reading "Merged" beside main, in a
+      // facet grouping it with the branches whose work is done, says something
+      // false about the branch everything else is measured from. It is judged
+      // on its own upstream instead, like any other branch with one.
+      if (b.merged && branchName(b) !== defaultBranch) return "merged";
+      if (!b.upstream) return "unpublished";
+      if (b.ahead && b.behind) return "diverged";
+      if (b.ahead) return "ahead";
+      if (b.behind) return "behind";
+      return "insync";
+    };
+    const STANDING_LABELS: Record<string, string> = {
+      current: l10n.t("Current"),
+      gone: l10n.t("Upstream gone"),
+      merged: l10n.t("Merged"),
+      unpublished: l10n.t("Unpublished"),
+      diverged: l10n.t("Diverged"),
+      ahead: l10n.t("Ahead"),
+      behind: l10n.t("Behind"),
+      insync: l10n.t("In sync"),
+    };
+
+    const render = (): void => {
+      const n = counts();
+      segSlot.replaceChildren(
+        segmented<Kind>({
+          ariaLabel: l10n.t("Which refs to show"),
+          value: this.branchTab,
+          options: [
+            { value: "local", label: l10n.t("Local ({0})", n.local), icon: "git-branch" },
+            { value: "remote", label: l10n.t("Remotes ({0})", n.remote), icon: "cloud" },
+            { value: "tags", label: l10n.t("Tags ({0})", n.tags), icon: "tag" },
+            { value: "stashes", label: l10n.t("Stashes ({0})", n.stashes), icon: "git-stash" },
+            // Only when there is more than one: a single worktree is just "the
+            // repository", and a segment reading "Worktrees (1)" is a tab that
+            // tells you nothing.
+            //
+            // …unless you are STANDING on it. Removing the second-to-last
+            // worktree dropped the option out from under the reader, leaving
+            // them on a segment with no button — the bar showed four, none
+            // active, while the body still rendered worktrees. A tab may not
+            // disappear while it is the one you are looking at.
+            ...(n.worktrees > 1 || this.branchTab === "worktrees"
+              ? [{ value: "worktrees" as Kind, label: l10n.t("Worktrees ({0})", n.worktrees), icon: "window" }]
+              : []),
+          ],
+          onChange: (v) => {
+            this.branchTab = v;
+            this.persist();
+            render();
+          },
+        }),
+      );
+
+      // "What is safe to delete" — the question a branch list is opened to
+      // answer at least as often as "what do I switch to", and one this view
+      // could never answer at all. A branch is finished when every commit on it
+      // is already in the default branch (merged), or when the upstream it
+      // tracked has been deleted (gone) — which is what a merged pull request
+      // leaves behind.
+      //
+      // The default branch is NEVER finished, and excluding it is not a nicety:
+      // `merged` is `ahead === 0` measured against the default branch, and the
+      // default branch is zero commits ahead of itself. So `main` qualified,
+      // and any moment you were standing on a feature branch the sweep offered
+      // — in a confirm listing it by name, among five others — to delete the
+      // one branch the repository is organised around.
+      const sweep = el("button", "mini-btn branches-sweep") as HTMLButtonElement;
+      segSlot.appendChild(sweep);
+
+      // ── the filter bar ────────────────────────────────────────────────
+      //
+      // All client-side: `branches:list` and `refs:list` are whole-set reads,
+      // so every spec carries a predicate and changing one is a re-render, not
+      // a refetch. State is per KIND — a Standing filter means nothing on the
+      // tags screen.
+      const specs: FacetSpec<unknown>[] =
+        this.branchTab === "local"
+          ? [
+              {
+                key: "standing",
+                label: l10n.t("Standing"),
+                icon: "git-branch",
+                options: [...new Set(locals.map(standing))].map((v) => ({
+                  value: v,
+                  label: STANDING_LABELS[v] ?? v,
+                })),
+                predicate: (item: unknown, v: string) => standing(item as BranchInfo) === v,
+              },
+              {
+                key: "remote",
+                label: l10n.t("Remote"),
+                icon: "cloud",
+                options: [...new Set(locals.map((b) => b.upstream?.split("/")[0]).filter(Boolean))].map(
+                  (v) => ({ value: v as string, label: v as string }),
+                ),
+                predicate: (item: unknown, v: string) => (item as BranchInfo).upstream?.split("/")[0] === v,
+              },
+            ]
+          : this.branchTab === "remote"
+            ? [
+                {
+                  key: "remote",
+                  label: l10n.t("Remote"),
+                  icon: "cloud",
+                  // By the full name (remoteRefParts): the short one is
+                  // "remotes/origin/x" beside a local "origin/x" — a remote
+                  // called "remotes" in this facet.
+                  options: [...new Set(remotes.map((r) => remoteRefParts(r).remote))].map((v) => ({
+                    value: v,
+                    label: v,
+                  })),
+                  predicate: (item: unknown, v: string) => remoteRefParts(item as RefInfo).remote === v,
+                },
+                {
+                  key: "local",
+                  label: l10n.t("Local copy"),
+                  icon: "git-branch",
+                  options: [
+                    { value: "yes", label: l10n.t("Have one") },
+                    { value: "no", label: l10n.t("None") },
+                  ],
+                  predicate: (item: unknown, v: string) => {
+                    // Both sides by name under the namespace — a local
+                    // "release" beside a tag lists as "heads/release".
+                    const short = remoteRefParts(item as RefInfo).branch;
+                    const have = locals.some((b) => branchName(b) === short);
+                    return v === "yes" ? have : !have;
+                  },
+                },
+              ]
+            : this.branchTab === "tags"
+              ? [
+                  {
+                    key: "kind",
+                    label: l10n.t("Kind"),
+                    icon: "tag",
+                    // Human words. "Annotated"/"Lightweight" is git's own
+                    // jargon and it read as noise on the very row it labeled.
+                    options: [
+                      { value: "annotated", label: l10n.t("With message") },
+                      { value: "lightweight", label: l10n.t("Bare pointer") },
+                    ],
+                    predicate: (item: unknown, v: string) =>
+                      ((item as RefInfo).objectType === "tag" ? "annotated" : "lightweight") === v,
+                  },
+                ]
+              : [];
+
+      // A menu that offers one value is not a filter, it is furniture.
+      //
+      // Most repositories have exactly one remote, so "Remote" offered
+      // "origin" and nothing else — a dropdown whose only choice was the state
+      // the list is already in. Same for any other facet the current set
+      // happens to agree on. They cost a control each in a toolbar the owner
+      // called complicated, and they can only ever narrow to what is already
+      // shown.
+      // Only when the options are STATED. A facet that harvests or loads its
+      // options has none yet at this point, and dropping those would remove
+      // working filters rather than empty ones.
+      const usableSpecs = specs.filter((sp) => !sp.options || sp.options.length > 1);
+      const state = (this.branchFacets[this.branchTab] ??= {});
+      const bar = facetBar<unknown>({
+        specs: usableSpecs,
+        state,
+        items: [],
+        onChange: () => render(),
+      });
+      facetSlot.replaceChildren();
+      if (usableSpecs.length) facetSlot.appendChild(bar.el);
+
+      const q = query.trim().toLowerCase();
+      // Beyond the name: the upstream, the tip subject and the short sha, so
+      // "the branch with the log-stream fix" is findable by what it did.
+      const hit = (...parts: Array<string | undefined>): boolean =>
+        !q || parts.some((x) => (x ?? "").toLowerCase().includes(q));
+
+      // "What is safe to delete" — the question a branch list is opened to
+      // answer at least as often as "what do I switch to", and one this view
+      // could never answer at all. A branch is finished when every commit on it
+      // is already in the default branch (merged), or when the upstream it
+      // tracked has been deleted (gone) — which is what a merged pull request
+      // leaves behind.
+      //
+      // The default branch is NEVER finished, and excluding it is not a nicety:
+      // `merged` is `ahead === 0` measured against the default branch, and the
+      // default branch is zero commits ahead of itself. So `main` qualified,
+      // and any moment you were standing on a feature branch the sweep offered
+      // — in a confirm listing it by name, among five others — to delete the
+      // one branch the repository is organised around.
+      //
+      // Downstream of the SEARCH and the FACETS, like the age counts beside it:
+      // computed above them, the button read "Delete 6 finished…" beside a list
+      // you had narrowed to one, offering to delete five branches that were not
+      // on screen. Not downstream of the age cut, which is a browsing lens
+      // rather than a narrowing — a finished branch is usually a stale one, and
+      // filtering by it would empty the sweep from the segment it opens on.
+      const finished = locals
+        .filter((b) => hit(b.name, b.upstream, b.subject))
+        .filter((b) => bar.passes(b))
+        .filter((b) => !b.current && branchName(b) !== defaultBranch && (b.merged || b.gone));
+      sweep.replaceChildren(glyph("trash"), span(l10n.t("Delete {0} finished…", finished.length)));
+      sweep.title = q
+        ? l10n.t(
+            "Of the branches matching “{0}”: those already in {1}, or whose upstream is gone",
+            q,
+            defaultBranch ?? l10n.t("the default branch"),
+          )
+        : l10n.t("Branches whose work is already in {0}, or whose upstream is gone", defaultBranch ?? l10n.t("the default branch"));
+      sweep.hidden = this.branchTab !== "local" || finished.length === 0;
+      sweep.onclick = () => void this.sweepFinishedBranches(finished, defaultBranch);
+
+      // Active / Stale / All — github.com's own cut, and the difference between
+      // "what I am working on" and "everything this clone has touched".
+      if (this.branchTab === "local") {
+        // The counts answer "how many if I press this", so they sit downstream
+        // of the search and the facets: a segment reading (12) while the list
+        // it would produce holds three is worse than no count at all.
+        const inScope = locals.filter((b) => hit(b.name, b.upstream, b.subject)).filter((b) => bar.passes(b));
+        const stale = inScope.filter((b) => !b.current && isStale(b.date)).length;
+        facetSlot.appendChild(
+          segmented<"active" | "stale" | "all">({
+            ariaLabel: l10n.t("How recently these branches moved"),
+            value: this.branchAge,
+            options: [
+              { value: "active", label: l10n.t("Active ({0})", inScope.length - stale) },
+              { value: "stale", label: l10n.t("Stale ({0})", stale) },
+              { value: "all", label: l10n.t("All ({0})", inScope.length) },
+            ],
+            onChange: (v) => {
+              this.branchAge = v;
+              render();
+            },
+          }),
+        );
+      }
+      const sortBtn = this.branchSortBtn(() => render());
+      if (sortBtn) facetSlot.appendChild(sortBtn);
+
+      body.replaceChildren();
+      ctaSlot.replaceChildren(this.branchesCta(this.branchTab));
+
+      // The order the segment on screen can actually carry out — not whatever
+      // was last picked on a segment that had more choices.
+      const order = this.effectiveSort();
+      const byName = (a: string, b: string): number => a.localeCompare(b, undefined, { numeric: true });
+      const byDate = (a?: number, b?: number): number => (b ?? 0) - (a ?? 0);
+
+      let shown = 0;
+      let total = 0;
+      // Did the Active/Stale lens actually remove anything? It defaults to
+      // Active, so "is a lens set" is true before the reader has touched a
+      // control — and the empty state used that to blame "the filters you have
+      // set" for every search that matched nothing, in a repo where the lens
+      // may well be hiding nothing at all. Only a cut that HID something is a
+      // reason the list is empty.
+      let ageHid = 0;
+      // WHO, part two: one log walk per branch is too slow to hold the list
+      // for, so rows paint with tip authors and this upgrades the slots in
+      // place — creator + contributor stack — when the read lands. Local AND
+      // remote tabs: the walk covers refs/remotes too, and both rows carry
+      // data-branch. The slot is fixed-width, so nothing shifts when it fills.
+      const fillPeople = (): void => {
+        void gget("branches:people", undefined, 60_000)
+          .then((people) => {
+            if (!body.isConnected) return;
+            for (const slot of body.querySelectorAll<HTMLElement>(".br-people[data-branch]")) {
+              const p = people[slot.dataset.branch ?? ""];
+              if (!p) continue;
+              const stack = el("span", "br-people-stack");
+              const faces = [...p.contributors];
+              const ci = faces.findIndex((f) => f.email.toLowerCase() === p.creator.email.toLowerCase());
+              if (ci > 0) faces.unshift(...faces.splice(ci, 1));
+              for (const f of faces.slice(0, 3)) {
+                stack.appendChild(avatar(f.name, gravatarUrl(f.email, 36), 18));
+              }
+              const names = p.contributors.map((f) => `${f.name} (${f.count})`).join(", ");
+              stack.title =
+                `Created by ${p.creator.name}` +
+                (p.contributors.length > 1 ? `\nContributors: ${names}` : "");
+              if (p.contributors.length > 3) {
+                stack.appendChild(span(`+${p.contributors.length - 3}`, "br-people-more"));
+              }
+              slot.replaceChildren(stack);
+            }
+          })
+          .catch(() => {
+            /* the tip author already on the row is the honest fallback */
+          });
+      };
+      if (this.branchTab === "local") {
+        total = locals.length;
+        const searched = locals
+          .filter((b) => hit(b.name, b.upstream, b.subject))
+          .filter((b) => bar.passes(b));
+        const rows = searched
+          // The current branch is never "stale" — it is where you are standing.
+          // Which means it belongs in Active whatever its date says, and NOT in
+          // Stale: a bare `|| b.current` put it in both, so a repo left alone
+          // for a year showed its own checked-out branch under Stale while the
+          // segment's count, which excludes it, said one fewer.
+          .filter((b) =>
+            this.branchAge === "all"
+              ? true
+              : this.branchAge === "stale"
+                ? !b.current && isStale(b.date)
+                : b.current || !isStale(b.date),
+          )
+          .sort((a, b) =>
+            order === "name"
+              ? byName(branchName(a), branchName(b))
+              : order === "ahead"
+                ? (b.ahead ?? 0) - (a.ahead ?? 0) || byDate(a.date, b.date)
+                : order === "stale"
+                  ? (a.date ?? 0) - (b.date ?? 0)
+                  : byDate(a.date, b.date),
+          );
+        shown = rows.length;
+        ageHid = searched.length - rows.length;
+        // The sweep is a repo-level cleanup and is deliberately NOT cut by the
+        // age lens — a finished branch is usually a stale one, so binding it
+        // would empty the button from the segment it opens on. But then its
+        // number can exceed the rows beneath it, and a destructive control
+        // whose count contradicts the list is one nobody should press. Say so.
+        const visible = new Set(rows.map((b) => b.name));
+        const unseen = finished.filter((b) => !visible.has(b.name)).length;
+        if (unseen) {
+          sweep.title +=
+            `\n${unseen} of them ${unseen === 1 ? "is" : "are"} not shown by the current view — ` +
+            "the confirm lists every one by name.";
+        }
+        // Scaled to what is ON SCREEN, so the bars stay comparable down the
+        // list rather than against a branch the filter has removed.
+        for (const b of rows) body.appendChild(this.localBranchRow(b, defaultBranch));
+        fillPeople();
+      } else if (this.branchTab === "remote") {
+        total = remotes.length;
+        const rows = remotes
+          .filter((r) => hit(r.name, r.subject, r.sha.slice(0, 7)))
+          .filter((r) => bar.passes(r))
+          .sort((a, b) =>
+            order === "name"
+              ? byName(remoteRefParts(a).remote + "/" + remoteRefParts(a).branch, remoteRefParts(b).remote + "/" + remoteRefParts(b).branch)
+              : order === "stale"
+                ? (a.date ?? 0) - (b.date ?? 0)
+                : byDate(a.date, b.date),
+          );
+        shown = rows.length;
+        // By the name under refs/heads/: a local "release" beside a tag lists
+        // as "heads/release", and origin/release read "no local copy".
+        const haveLocal = new Set(locals.map((b) => branchName(b)));
+        for (const r of rows) body.appendChild(this.remoteRefRow(r, haveLocal));
+        fillPeople();
+      } else if (this.branchTab === "tags") {
+        total = tags.length;
+        const rows = tags
+          .filter((r) => hit(r.name, r.subject, r.sha.slice(0, 7)))
+          .filter((r) => bar.passes(r))
+          // By DATE by default, not by name: alphabetical puts v1.10.0 before
+          // v1.9.0, which is wrong about every version scheme anyone uses.
+          .sort((a, b) =>
+            order === "name"
+              ? byName(tagName(a), tagName(b))
+              : order === "stale"
+                ? (a.date ?? 0) - (b.date ?? 0)
+                : byDate(a.date, b.date),
+          );
+        shown = rows.length;
+        for (const r of rows) body.appendChild(this.tagRefRow(r));
+      } else if (this.branchTab === "stashes") {
+        total = stashes.length;
+        const rows = stashes.filter((st) => hit(st.message, st.ref));
+        shown = rows.length;
+        for (const st of rows) body.appendChild(this.stashRow(st));
+      } else {
+        total = worktrees.length;
+        // By the path as it reads (C:\Users\… on Windows) as well as git's.
+        const rows = worktrees.filter((w) => hit(w.branch, w.path, w.shownPath, w.head.slice(0, 7)));
+        shown = rows.length;
+        for (const w of rows) body.appendChild(this.worktreeRow(w));
+      }
+
+      header.setCount?.(shown, total);
+      if (!shown) {
+        // Which control emptied it. The search box speaks for itself; a facet
+        // or the age cut does not, and without this the view announced that the
+        // REPOSITORY had no branches over a repo with ninety.
+        const narrowed = bar.activeCount() > 0 || ageHid > 0;
+        body.appendChild(
+          this.branchesEmpty(this.branchTab, q, stashFailed, narrowed, worktreeFailed, () => {
+            bar.clear();
+            this.branchAge = "all";
+            render();
+          }),
+        );
+      }
+    };
+
+    // The route this view answers for: the one that built it, and then each
+    // one that restores it from the keep-alive cache (revive, below).
+    let live = gen;
+    const reload = async (): Promise<void> => {
+      if (live !== this.routeGen) return;
+      await this.refreshRefs();
+      locals = await gget("branches:list", undefined);
+      try {
+        stashes = await host.invoke("stash:list", undefined);
+        stashFailed = false;
+      } catch {
+        // The rows already on screen are kept — they are the last thing git
+        // actually said — but the failure has to REACH the reader, or a stash
+        // list that stopped updating looks like one that stopped changing.
+        // `branchesEmpty` can only speak when the list is EMPTY, so with stale
+        // rows showing this was the one path with no way to say anything.
+        stashFailed = true;
+        if (stashes.length) toast(l10n.t("Couldn't re-read the stashes — showing the last list git gave."), "info");
+      }
+      // Worktrees too. This re-read everything EXCEPT them, so the list was
+      // fetched exactly once when the view was first built — and every soft
+      // refresh in the view goes through here, including `removeWorktreeLive`.
+      // "Worktree removed." left the row and its count on screen, and pressing
+      // Remove again ran git against a path that no longer existed.
+      //
+      // The tabs open as main is asked: its answer is about THOSE. A tab that
+      // opens or closes while it answers bumps the epoch past this, and the
+      // next restore reads again.
+      const asked = this.tabsEpoch;
+      let read = false;
+      try {
+        worktrees = await host.invoke("worktree:list", undefined);
+        worktreeFailed = false;
+        read = true;
+      } catch {
+        // KEEP the rows we have. Replacing them with [] on a failed refresh
+        // deleted a list git never said was gone.
+        worktreeFailed = true;
+        if (worktrees.length) toast(l10n.t("Couldn't re-read the worktrees — showing the last list git gave."), "info");
+      }
+      if (live !== this.routeGen) return;
+      remotes = this.refs.filter((r) => r.type === "remote" && !isRemoteHead(r));
+      tags = this.refs.filter((r) => r.type === "tag");
+      defaultBranch = this.defaultBranchName(locals);
+      render();
+      // Only now are the rows on screen main's answer for those tabs. Noted
+      // before the read and the route check, a re-read dropped because the
+      // view was left while main answered marked the tabs as seen — and the
+      // restore that should have read them again did not. A failed read
+      // leaves the old rows, and the old note with them.
+      if (read) tabsRead = asked;
+    };
+    this.reloadBranchRows = reload;
+    // Restored from the keep-alive cache, the view is on screen again but its
+    // hook was dropped with the route that parked it, and nothing re-armed it:
+    // a tab closing in front of it left its worktree's "open in a tab" mark
+    // behind, and a tab opening never added one. Re-armed for the route that
+    // restored it — and a tab that opened or closed while it was parked is
+    // read now, since the list on screen was main's answer for the tabs then.
+    this.viewRevive.set(wrap, () => {
+      live = this.routeGen;
+      this.reloadBranchRows = reload;
+      if (tabsRead !== this.tabsEpoch) void reload();
+    });
+    // ── the keyboard ──────────────────────────────────────────────────────
+    //
+    // Nothing in this view had a shortcut: not the filter, not Fetch, not New
+    // branch, not a row's own verb. `sectionList`'s ↑↓/j/k/Home/End already
+    // move between rows; these are the two that make it operable without a
+    // mouse at all.
+    wrap.addEventListener("keydown", (e) => {
+      const t = e.target as HTMLElement | null;
+      const typing = !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+
+      // "/" focuses the search, the way it does in every list people already
+      // know. Not while typing — a slash is a character in a branch name.
+      if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        search.querySelector("input")?.focus();
+        return;
+      }
+      // ⌘Enter runs the focused row's PRIMARY verb — Checkout, Pull, Publish,
+      // Push, Apply — without reaching for the pointer. Plain Enter still opens
+      // the row, which is what every other list in the app does.
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        const row = t?.closest?.(".sec-row") as HTMLElement | null;
+        const verb = row?.querySelector<HTMLButtonElement>(".sec-row-actions .row-btn:not(.lv-menu-btn)");
+        if (verb) {
+          e.preventDefault();
+          verb.click();
+        }
+        return;
+      }
+      // Shift+F fetches. The action the whole screen depends on deserves one.
+      if ((e.key === "f" || e.key === "F") && e.shiftKey && !typing && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        fetchBtn.click();
+      }
+    });
+
+    render();
+    if (highlightRef) {
+      const row = body.querySelector<HTMLElement>(`[data-ref="${CSS.escape(highlightRef)}"]`);
+      // `block: "center"`, not "nearest": a row already just inside the
+      // viewport edge was never scrolled at all, so the only evidence you had
+      // arrived was a mark you might not be looking at. Put it where the eye is.
+      row?.scrollIntoView({ block: "center" });
+      if (row) this.markLanded(row);
+    }
+  }
+
+  /** Which KIND of ref the Branches view is showing. Survives re-renders and
+   *  is persisted, the way every other section remembers its sub-tab. */
+  private branchTab: "local" | "remote" | "tags" | "stashes" | "worktrees" = "local";
+  /** Facet state per KIND — a Standing filter means nothing on the tags screen,
+   *  so each segment keeps its own and switching back finds it as you left it. */
+  private branchFacets: Record<string, FacetState> = Object.create(null) as Record<string, FacetState>;
+  /** True while the current Branches facet state came from a door's lens
+   *  rather than the facet bar — the next lens-less entrance clears it. */
+  private branchLensApplied = false;
+  /** The live text filter. Outside the build like the facets, so opening a ref
+   *  and pressing Back doesn't throw away the search that found it. */
+  private branchQuery = "";
+  /** Active / Stale / All — github.com's own cut at three months. */
+  private branchAge: "active" | "stale" | "all" = "active";
+  /** How the list is ordered. Recency is the default because it answers "what
+   *  was I just doing", which is why this view is opened most often. */
+  private branchSort: "recent" | "name" | "ahead" | "stale" = "recent";
+
+  /** Dismisses the current deep-link landing mark, if one is showing. */
+  private clearLanded?: () => void;
+
+  /**
+   * Mark the row a navigation pointed at, and KEEP it marked.
+   *
+   * It used to be a 1.6s fade, which is the wrong instrument: the animation
+   * was over before the eye finished crossing a long list, so arriving looked
+   * exactly like nothing having happened. The mark is a state now, and the
+   * next thing you do clears it — a pointerdown or a key press anywhere.
+   *
+   * The listeners go on in a later task deliberately. The click that CAUSED
+   * the navigation is still being dispatched while this runs, and binding
+   * synchronously would let that very click dismiss the mark it just created.
+   */
+  private markLanded(row: HTMLElement): void {
+    this.clearLanded?.();
+    row.classList.add("row-landed");
+    const clear = (): void => {
+      row.classList.remove("row-landed");
+      document.removeEventListener("pointerdown", clear, true);
+      document.removeEventListener("keydown", clear, true);
+      if (this.clearLanded === clear) this.clearLanded = undefined;
+    };
+    this.clearLanded = clear;
+    setTimeout(() => {
+      // Nothing to arm if the mark was already cleared or replaced.
+      if (this.clearLanded !== clear) return;
+      document.addEventListener("pointerdown", clear, true);
+      document.addEventListener("keydown", clear, true);
+    }, 0);
+  }
+
+  /** Set while the Branches view is live — see showBranchesView. */
+  private reloadBranchRows: (() => Promise<void>) | null = null;
+  /** Set while Compare is live — see showCompareView. Re-runs the comparison
+   *  IN PLACE for refreshAll, so a refresh that changes nothing touches
+   *  nothing on screen. */
+  private reloadCompare: (() => Promise<void>) | null = null;
+
+  /** The App-side operations handed to peek cards (peeks.ts). Every mutation a
+   *  peek can trigger routes through the same helpers the views use, so toasts,
+   *  cache busting, and refreshes behave identically everywhere. */
+  private peekHost(): GitPeekHost {
+    return {
+      checkout: (fullName) => void this.checkoutRef(fullName),
+      branchMenu: (b, anchor) => this.openBranchActions(b, anchor),
+      compareWith: (head) => {
+        const current = this.refs.find((r) => r.type === "head" && r.isCurrent)?.name;
+        this.compareBase = current ?? "HEAD";
+        this.compareHead = head;
+        this.routeView("compare", true);
+      },
+      revealInGraph: (sha) => this.revealInGraph(sha),
+      openBranch: (ref) => this.routeView("branches", false, { ref }),
+      openCommitFile: (file, sha) =>
+        void this.openFile({ path: file.path, status: file.status, oldPath: file.oldPath }, sha),
+      stashesChanged: () => {
+        // Applying/popping a stash changes the working tree; dropping changes
+        // the list. Bust the SWR cache and refresh whatever's showing.
+        bust();
+        void this.refreshBranchesSoft();
+        void this.updateSync();
+      },
+    };
+  }
+
+  /**
+   * Run a refresh with a visible busy state, and put the keyboard back on the
+   * Refresh button afterwards.
+   *
+   * These buttons rebuild their whole view, so the button you pressed is
+   * destroyed and replaced mid-click: nothing spun, nothing said "working", and
+   * the focus you had went to <body>. The replacement occupies the same seat, so
+   * it is found by class and re-focused only if the keyboard was here to start.
+   */
+  private async refreshInPlace(btn: HTMLElement, run: () => void | Promise<void>): Promise<void> {
+    if ((btn as HTMLButtonElement).disabled) return;
+    const hadFocus = document.activeElement === btn;
+    const host_ = btn.parentElement;
+    const nth = host_ ? [...host_.children].indexOf(btn) : -1;
+    (btn as HTMLButtonElement).disabled = true;
+    btn.classList.add("is-busy");
+    btn.querySelector(".codicon")?.classList.add("spin");
+    try {
+      await run();
+    } finally {
+      // The button's own state goes back whether or not it is on screen: one
+      // rebuilt away takes it with it, but one kept in a tab that went to the
+      // back meanwhile (an open lands in its new tab — #32) comes back with it,
+      // and it must not come back still busy.
+      (btn as HTMLButtonElement).disabled = false;
+      btn.classList.remove("is-busy");
+      btn.querySelector(".codicon")?.classList.remove("spin");
+      if (!btn.isConnected && hadFocus && host_?.isConnected && nth >= 0) {
+        (host_.children[nth] as HTMLElement | undefined)?.focus?.();
+      }
+    }
+  }
+
+  /** A remote branch's ⋯ menu — in the Branches list, and (after its
+   *  checkout) the branch switcher's submenu for it (#32). */
+  private remoteActionItems(r: RefInfo): MenuItem[] {
+    const { branch: short } = remoteRefParts(r);
+    return [
+      { label: l10n.t("Compare with {0}", short), icon: "git-compare", onClick: () => this.compareWithRef(r.name) },
+      { label: l10n.t("View in Commits"), icon: "git-commit", onClick: () => this.routeView("graph", false, { sha: r.sha }) },
+      { separator: true },
+      { label: l10n.t("Copy name"), icon: "copy", onClick: () => void copyText(r.name, l10n.t("Copied “{0}”.", r.name)) },
+    ];
+  }
+
+  /** A tag's ⋯ menu — in the Branches list, and the branch switcher's
+   *  submenu for it (#32). */
+  private tagActionItems(r: RefInfo): MenuItem[] {
+    return [
+      { label: l10n.t("View in Commits"), icon: "git-commit", onClick: () => this.routeView("graph", false, { sha: r.sha }) },
+      { label: l10n.t("Compare with {0}", r.name), icon: "git-compare", onClick: () => this.compareWithRef(r.name) },
+      { separator: true },
+      { label: l10n.t("Copy name"), icon: "copy", onClick: () => void copyText(r.name, l10n.t("Copied “{0}”.", r.name)) },
+      { separator: true },
+      {
+        label: l10n.t("Delete tag…"),
+        icon: "trash",
+        danger: true,
+        onClick: () => void this.deleteTagLive(tagName(r)),
+      },
+    ];
+  }
+
+  /**
+   * A remote branch.
+   *
+   * It used to be a single-line button showing a name and a short sha, with NO
+   * actions whatsoever — its entire verb set required opening a modal first.
+   * It now carries what it points at, when, whether you already have it
+   * locally, and the two things you actually do with one.
+   */
+  private remoteRefRow(r: RefInfo, haveLocal: Set<string>): HTMLElement {
+    // "origin/feat/x" reads as "feat/x on origin" — the remote is a column, not
+    // a prefix repeated down every title. Split from the FULL name: the short
+    // one is "remotes/origin/x" beside a local branch "origin/x".
+    const { remote, branch: short } = remoteRefParts(r);
+    const mine = haveLocal.has(short);
+    const said = `${remote}/${short}`;
+
+    const actions: HTMLElement[] = [];
+    const primary = el("button", "row-btn") as HTMLButtonElement;
+    primary.textContent = mine ? l10n.t("Checkout") : l10n.t("Check out here");
+    primary.title = mine
+      ? l10n.t("Check out your local {0}", short)
+      : l10n.t("Create {0} from {1} and check it out", short, said);
+    primary.setAttribute("aria-label", primary.title);
+    // By the REMOTE's full name either way: the planner switches to a local
+    // branch of that name when one exists (planRemoteCheckout) and creates it
+    // tracking the remote when not — which is what `mine` only labels. The
+    // local's short name here was the bug: beside a tag it names a revision.
+    primary.addEventListener("click", () => void this.checkoutRef(r.fullName, primary));
+    actions.push(primary);
+    const more = el("button", "row-btn lv-menu-btn") as HTMLButtonElement;
+    more.setAttribute("aria-label", l10n.t("More actions for {0}", said));
+    more.setAttribute("aria-haspopup", "menu");
+    more.appendChild(glyph("ellipsis"));
+    const menu = (): void => openMenu(more, this.remoteActionItems(r));
+    more.addEventListener("click", menu);
+    actions.push(more);
+
+    const row = secRow({
+      lead: glyph("cloud"),
+      title: short,
+      meta: [
+        (() => {
+          const c = el("span", "br-state-col");
+          if (!mine) c.appendChild(span(l10n.t("no local copy"), "ab-pill unpublished"));
+          return c;
+        })(),
+        span(r.subject ?? "", "br-subject br-subject-col"),
+        // WHO — the tip author now, the creator + contributor stack when the
+        // per-branch walk lands (the fill matches on data-branch, and remote
+        // branches are walked too).
+        (() => {
+          const p = el("span", "br-people");
+          p.dataset.branch = r.name;
+          if (r.who) {
+            const a = avatar(r.who.name, gravatarUrl(r.who.email, 36), 18);
+            a.title = l10n.t("Last commit by {0}", r.who.name);
+            p.appendChild(a);
+          }
+          return p;
+        })(),
+        span(remote, "br-remote"),
+        span(r.sha.slice(0, 7), "br-sha sec-mono"),
+      ],
+      time: r.date ? relTime(r.date) : "",
+      timeTitle: r.date ? absTime(r.date) : undefined,
+      actions,
+      onOpen: () => this.routeView("refdetail", false, { ref: r.name, id: "remote" }),
+      ariaLabel: l10n.t("{0} on {1}{2}{3}", short, remote, mine ? "" : l10n.t(", no local copy"), r.date ? l10n.t(", updated {0}", relTime(r.date)) : ""),
+    });
+    row.classList.add("ref-row");
+    row.dataset.ref = r.name;
+    row.title = [said, r.subject].filter(Boolean).join("\n");
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      menu();
+    });
+    return row;
+  }
+
+  /**
+   * A tag.
+   *
+   * Annotated vs lightweight is the one fact that distinguishes the two kinds
+   * and NOTHING has ever carried it — `%(objecttype)` was there all along.
+   * Delete and Push are new: `tag:create` existed and the app could not remove
+   * or publish what it made.
+   */
+  private tagRefRow(r: RefInfo): HTMLElement {
+    const annotated = r.objectType === "tag";
+    // Named by the part under refs/tags/ (tagName): beside a branch of the
+    // same name the short form is "tags/v1".
+    const said = tagName(r);
+    const actions: HTMLElement[] = [];
+    const push = el("button", "row-btn") as HTMLButtonElement;
+    push.textContent = l10n.t("Push");
+    push.setAttribute("aria-label", l10n.t("Push tag {0} to the remote", said));
+    push.title = l10n.t("Publish {0} to the remote", said);
+    // The name under refs/tags/: beside a branch of the same name the short
+    // name is "tags/v1", and refs/tags/tags/v1 is no tag at all.
+    push.addEventListener("click", () => void this.pushTagLive(tagName(r), push));
+    actions.push(push);
+    const more = el("button", "row-btn lv-menu-btn") as HTMLButtonElement;
+    more.setAttribute("aria-label", l10n.t("More actions for {0}", said));
+    more.setAttribute("aria-haspopup", "menu");
+    more.appendChild(glyph("ellipsis"));
+    const menu = (): void => openMenu(more, this.tagActionItems(r));
+    more.addEventListener("click", menu);
+    actions.push(more);
+
+    const row = secRow({
+      lead: glyph("tag"),
+      title: said,
+      meta: [
+        // No "annotated"/"lightweight" pill: git's own jargon for "carries a
+        // message and a tagger" vs "bare pointer" explained nothing on a row
+        // ("wtf is lightweight/annotated tag?"). The state slot stays for the
+        // column rhythm; the DISTINCTION now lives where it means something —
+        // who is shown, and what their tooltip says.
+        el("span", "br-state-col"),
+        span(r.subject ?? "", "br-subject br-subject-col"),
+        (() => {
+          const p = el("span", "br-people");
+          if (r.who) {
+            const a = avatar(r.who.name, gravatarUrl(r.who.email, 36), 18);
+            a.title = r.who.tagger
+              ? l10n.t("Tagged by {0} — this tag carries its own message and date", r.who.name)
+              : l10n.t("Points at {0}'s commit — the tag itself records nothing", r.who.name);
+            p.appendChild(a);
+          }
+          return p;
+        })(),
+        span(r.sha.slice(0, 7), "br-sha sec-mono"),
+      ],
+      time: r.date ? relTime(r.date) : "",
+      timeTitle: r.date ? absTime(r.date) : undefined,
+      actions,
+      onOpen: () => this.routeView("refdetail", false, { ref: r.name, id: "tag" }),
+      ariaLabel: l10n.t(
+        "{0}, {1}{2}{3}",
+        said,
+        annotated ? l10n.t("tag with its own message") : l10n.t("tag"),
+        r.who ? l10n.t(", by {0}", r.who.name) : "",
+        r.date ? l10n.t(", {0}", relTime(r.date)) : "",
+      ),
+    });
+    row.classList.add("ref-row");
+    row.dataset.ref = r.name;
+    row.title = [said, r.subject].filter(Boolean).join("\n");
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      menu();
+    });
+    return row;
+  }
+
+  /**
+   * A stash.
+   *
+   * `stash@{n}` is POSITIONAL: dropping one renumbers every stash below it, so
+   * a row built from a stale list can act on a DIFFERENT stash than the one it
+   * names. Every mutation here re-reads the list first and refuses if the
+   * selector no longer points at the same commit.
+   */
+  private stashRow(st: StashInfo): HTMLElement {
+    const actions: HTMLElement[] = [];
+    const apply = el("button", "row-btn") as HTMLButtonElement;
+    apply.textContent = l10n.t("Apply");
+    apply.setAttribute("aria-label", l10n.t("Apply {0}", st.ref));
+    apply.title = l10n.t("Apply {0} and keep it in the stash list", st.ref);
+    apply.addEventListener("click", () => void this.stashActLive("apply", st, apply));
+    actions.push(apply);
+    const more = el("button", "row-btn lv-menu-btn") as HTMLButtonElement;
+    more.setAttribute("aria-label", l10n.t("More actions for {0}", st.ref));
+    more.setAttribute("aria-haspopup", "menu");
+    more.appendChild(glyph("ellipsis"));
+    const menu = (): void =>
+      openMenu(more, [
+        { label: l10n.t("Pop — apply and remove"), icon: "git-stash-pop", onClick: () => void this.stashActLive("pop", st, more) },
+        { separator: true },
+        {
+          label: l10n.t("Drop this stash…"),
+          icon: "trash",
+          danger: true,
+          onClick: () => void this.stashActLive("drop", st, more),
+        },
+      ]);
+    more.addEventListener("click", menu);
+    actions.push(more);
+
+    const row = secRow({
+      lead: glyph("git-stash"),
+      title: st.message || st.ref,
+      meta: [span(st.ref, "stash-sel sec-mono")],
+      time: st.time ? relTime(st.time) : "",
+      timeTitle: st.time ? absTime(st.time) : undefined,
+      actions,
+      onOpen: () => this.routeView("refdetail", false, { ref: st.ref, id: "stash" }),
+      ariaLabel: l10n.t("{0}, {1}{2}", st.message || st.ref, st.ref, st.time ? l10n.t(", {0}", relTime(st.time)) : ""),
+    });
+    row.classList.add("ref-row", "stash-row");
+    row.dataset.ref = st.ref;
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      menu();
+    });
+    return row;
+  }
+
+  /** Compare the current branch against a ref, in the Compare view. */
+  private compareWithRef(head: string): void {
+    const current = this.refs.find((r) => r.type === "head" && r.isCurrent)?.name;
+    this.compareBase = current ?? "HEAD";
+    this.compareHead = head;
+    this.routeView("compare", true);
+  }
+
+  /** Publish one tag. */
+  private async pushTagLive(name: string, btn: HTMLButtonElement): Promise<void> {
+    await this.refreshInPlace(btn, async () => {
+      const r = await host.invoke("tag:push", { name });
+      if (!r.ok) {
+        toast(r.message ?? l10n.t("Couldn't push {0}.", name), r.expected ? "info" : "error");
+        return;
+      }
+      toast(l10n.t("Pushed {0}.", name), "success");
+    });
+  }
+
+  /** Delete a tag LOCALLY — and say that the pushed copy outlives it, because
+   *  "delete" on a tag that has been published is only half true. */
+  private async deleteTagLive(name: string): Promise<void> {
+    const ok = await confirmDialog({
+      title: l10n.t("Delete tag {0}?", name),
+      message: l10n.t(
+        "This removes the tag from this clone only. If it has already been pushed, the copy on the remote is untouched and a fetch brings it straight back.",
+      ),
+      confirmLabel: l10n.t("Delete locally"),
+      danger: true,
+    });
+    if (!ok) return;
+    const r = await host.invoke("tag:delete", name);
+    if (!r.ok) {
+      toast(r.message ?? l10n.t("Couldn't delete {0}.", name), r.expected ? "info" : "error");
+      return;
+    }
+    if (r.was) {
+      const sha = r.was;
+      didUndoable(l10n.t("Deleted tag {0} locally.", name), {
+        label: l10n.t("Put {0} back", name),
+        undo: async () => {
+          const back = await host.invoke("tag:restore", { name, sha });
+          if (!back.ok) return back.message ?? l10n.t("Couldn't put {0} back.", name);
+          bust("branches");
+          return undefined;
+        },
+        after: () => this.refreshBranchesSoft(),
+      });
+    } else {
+      toast(l10n.t("Deleted tag {0} locally.", name), "success");
+    }
+    await this.refreshBranchesSoft();
+  }
+
+  /**
+   * Apply / pop / drop a stash, safely.
+   *
+   * `stash@{n}` is a POSITION, not an identity: dropping one renumbers every
+   * stash below it. A row built from a list that has since changed therefore
+   * names one stash and acts on another — and for `drop` that is unrecoverable.
+   * So: re-read the list first and refuse unless the selector still points at
+   * the same commit.
+   */
+  private async stashActLive(
+    action: "apply" | "pop" | "drop",
+    st: StashInfo,
+    btn: HTMLElement,
+  ): Promise<void> {
+    if (action === "drop") {
+      const ok = await confirmDialog({
+        title: l10n.t("Drop {0}?", st.ref),
+        // Not "permanently": the commit behind a stash outlives the ref, and
+        // the app can put it back. The dialog stays — this removes something
+        // you meant to keep — but it must not describe a loss that is not one.
+        message: l10n.t("“{0}” is removed from the stash list. You can undo this straight afterwards.", st.message || st.ref),
+        confirmLabel: l10n.t("Drop"),
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await this.refreshInPlace(btn, async () => {
+      let fresh: StashInfo[];
+      try {
+        fresh = await host.invoke("stash:list", undefined);
+      } catch {
+        toast(l10n.t("Couldn't re-read the stash list — nothing was changed."), "error");
+        return;
+      }
+      const still = fresh.find((x) => x.ref === st.ref);
+      if (!still || (st.sha && still.sha && still.sha !== st.sha)) {
+        toast(
+          l10n.t("{0} is not the stash it was — the list changed underneath. Refreshed instead.", st.ref),
+          "info",
+        );
+        await this.refreshBranchesSoft();
+        return;
+      }
+      // By SHA, not st.ref: the check above holds only until the request
+      // leaves. A Stash & Retry sends it again after its question, and a stash
+      // pushed while the question was up renumbered the list — the old
+      // stash@{n} then popped, and dropped, the newcomer. Main finds the sha
+      // in the list just before git runs.
+      const r = await host.invoke(
+        action === "apply" ? "stash:apply" : action === "pop" ? "stash:pop" : "stash:drop",
+        st.sha || st.ref,
+      );
+      // Uncommitted changes in the stash's way were asked about (Stash &
+      // Retry or Cancel — bridge.ts), and the user cancelled: nothing ran.
+      if (r.cancelled) return;
+      if (!r.ok) {
+        toast(
+          r.message ??
+            (action === "apply"
+              ? l10n.t("Couldn't apply {0}.", st.ref)
+              : action === "pop"
+                ? l10n.t("Couldn't pop {0}.", st.ref)
+                : l10n.t("Couldn't drop {0}.", st.ref)),
+          r.expected ? "info" : "error",
+        );
+        return;
+      }
+      // A drop removes a ref; the commit behind it is untouched, so this is
+      // one of the few destructive-looking actions that is genuinely free to
+      // reverse. Pop and apply are not offered an undo: they have already put
+      // the changes into the working tree, and taking them back out is a
+      // different and much less safe operation than it looks.
+      if (action === "drop" && st.sha) {
+        const sha = st.sha;
+        didUndoable(l10n.t("Dropped {0}.", st.ref), {
+          label: l10n.t("Put the stash back"),
+          undo: async () => {
+            const back = await host.invoke("stash:restore", { sha, message: st.message });
+            if (!back.ok) return back.message ?? l10n.t("Couldn't put the stash back.");
+            bust("branches");
+            return undefined;
+          },
+          after: () => this.refreshBranchesSoft(),
+        });
+      } else {
+        // A Pop whose staging git could not restore was applied and KEPT
+        // (main's stashNote, said by bridge.ts, says why) — not "Popped".
+        toast(
+          action === "apply"
+            ? l10n.t("Applied {0}.", st.ref)
+            : action === "pop"
+              ? r.stashKept
+                ? l10n.t("Applied {0} — it stays in the list.", st.ref)
+                : l10n.t("Popped {0}.", st.ref)
+              : l10n.t("Dropped {0}.", st.ref),
+          "success",
+        );
+      }
+      await this.refreshBranchesSoft();
+    });
+  }
+
+  /**
+   * Delete the branches whose work is done.
+   *
+   * The confirm NAMES every one of them, and says which ref merged-ness was
+   * measured against — because "merged" is a claim about a specific branch, a
+   * squash-merged branch reads as unmerged, and a branch merged into a release
+   * line but not into the default reads as unmerged too. A bulk delete that
+   * does not show its list is a bulk delete nobody should press.
+   *
+   * Sequential, stopping at the first failure, and it reports what actually
+   * happened rather than assuming: there is no transaction here, and claiming
+   * six deletions when the third one failed would be a lie about the repo.
+   */
+  private async sweepFinishedBranches(finished: BranchInfo[], defaultBranch?: string): Promise<void> {
+    // Belt and braces on the one destructive action here that takes a LIST: the
+    // caller already excludes the default branch and the current one, and this
+    // refuses to delete them anyway. A bulk delete is the wrong place to trust
+    // that a filter upstream still says what it said when it was written.
+    //
+    // By branchName, never b.name: beside a tag "main" git lists the default
+    // branch as "heads/main", which is not "main", and the sweep offered it.
+    // Each is then deleted by its FULL name and restored under branchName —
+    // the short "heads/x" came back as a branch literally called that.
+    finished = finished.filter((b) => !b.current && branchName(b) !== defaultBranch);
+    if (!finished.length) return;
+    const names = finished.map((b) => branchName(b));
+    const dbName = defaultBranch ?? l10n.t("the default branch");
+    const title = finished.length === 1 ? l10n.t("Delete 1 finished branch?") : l10n.t("Delete {0} finished branches?", finished.length);
+    const message = l10n.t(
+      "{0}\n\n“Finished” means every commit is already in {1}, or the upstream it tracked no longer exists. A squash-merged branch does NOT look merged to git, and a branch merged somewhere other than {1} will not be listed here. Only the local copies are deleted.",
+      names.join("\n"),
+      dbName,
+    );
+    const confirmLabel = finished.length === 1 ? l10n.t("Delete 1") : l10n.t("Delete {0}", finished.length);
+    const ok = await confirmDialog({ title, message, confirmLabel, danger: true });
+    if (!ok) return;
+
+    const done: string[] = [];
+    const restorable: Array<{ name: string; was: string; upstream?: string }> = [];
+    for (const b of finished) {
+      let r;
+      try {
+        r = await host.invoke("branch:delete", { fullName: b.fullName, force: false });
+      } catch (e) {
+        toast(
+          l10n.t(
+            "Deleted {0} of {1}, then {2} failed: {3}.",
+            done.length,
+            finished.length,
+            branchName(b),
+            cleanErr(e) || l10n.t("git error"),
+          ),
+          "error",
+        );
+        break;
+      }
+      if (!r?.ok) {
+        toast(
+          done.length
+            ? l10n.t("Deleted {0}. Stopped at {1}: {2}", done.join(", "), branchName(b), r?.message ?? l10n.t("git refused."))
+            : l10n.t("{0} was not deleted: {1}", branchName(b), r?.message ?? l10n.t("git refused.")),
+          r?.expected ? "info" : "error",
+        );
+        break;
+      }
+      done.push(branchName(b));
+      if (r.was) restorable.push({ name: branchName(b), was: r.was, upstream: r.upstream });
+    }
+    if (done.length === finished.length) {
+      const msg =
+        done.length === 1 ? l10n.t("Deleted 1 finished branch.") : l10n.t("Deleted {0} finished branches.", done.length);
+      // All of them, in one go — a sweep is the action most likely to take
+      // something you wanted, and undoing it one branch at a time would be a
+      // worse offer than the sweep was.
+      if (restorable.length === done.length) {
+        didUndoable(msg, {
+          label: done.length === 1 ? l10n.t("Restore {0}", done[0]) : l10n.t("Restore {0} branches", done.length),
+          undo: async () => {
+            const failed: string[] = [];
+            for (const b of restorable) {
+              // in-the-way-reviewed: a restore never switches, so it changes no
+              // file and is never refused over uncommitted work.
+              const back = await host.invoke("branch:create", {
+                name: b.name,
+                startPoint: b.was,
+                upstream: b.upstream,
+              });
+              if (!back.ok) failed.push(b.name);
+            }
+            bust("branches");
+            return failed.length ? l10n.t("Couldn't restore {0}.", failed.join(", ")) : undefined;
+          },
+          after: () => this.refreshBranchesSoft(),
+        });
+      } else {
+        toast(msg, "success");
+      }
+    }
+    bust("branches");
+    await this.refreshBranchesSoft();
+  }
+
+  /**
+   * The sort control. Recency is the default because "what was I just doing"
+   * is the question this view is opened for most often.
+   *
+   * It offers only the orders the CURRENT segment can actually carry out. It
+   * used to offer all four everywhere and render on every segment, so:
+   * "Most ahead" and "Stalest first" reordered nothing on Remotes and Tags
+   * (a RefInfo has no divergence from the default branch) yet the button
+   * relabelled itself, standing there naming an order the list was not in; and
+   * on Stashes and Worktrees, which apply no sort at all, every one of the four
+   * was inert. A control that states a false fact about the list beneath it is
+   * worse than no control.
+   */
+  private branchSortBtn(rerender: () => void): HTMLElement | undefined {
+    const LABELS: Record<string, string> = {
+      recent: l10n.t("Recently committed"),
+      name: l10n.t("Name"),
+      ahead: l10n.t("Most ahead"),
+      stale: l10n.t("Stalest first"),
+    };
+    // Stashes are a STACK — stash@{0} is the newest and the numbering is the
+    // order — and worktrees are a handful of paths. Neither has an order to
+    // choose, so neither gets a control.
+    const keys = this.branchSortKeys();
+    if (!keys.length) return undefined;
+    // A segment can drop the order that is currently selected (switching from
+    // Local to Tags with "Most ahead" active). Show the one it will really use.
+    const shown = keys.includes(this.branchSort) ? this.branchSort : "recent";
+    const b = el("button", "mini-btn branches-sort") as HTMLButtonElement;
+    b.append(glyph("list-ordered"), span(LABELS[shown]));
+    b.title = l10n.t("How this list is ordered");
+    b.setAttribute("aria-haspopup", "menu");
+    b.addEventListener("click", () =>
+      openMenu(
+        b,
+        keys.map((k) => ({
+          label: LABELS[k],
+          current: shown === k,
+          onClick: () => {
+            this.branchSort = k;
+            rerender();
+          },
+        })),
+      ),
+    );
+    return b;
+  }
+
+  /**
+   * The repository's default branch, as a LOCAL branch name.
+   *
+   * `refs/remotes/<remote>/HEAD` has a symref of "<remote>/<branch>", and the
+   * remote is not always called origin: `git clone -o upstream`, a
+   * `git remote rename`, or simply a second remote whose name sorts first —
+   * `refs:list` is refname-ordered, so the first symref found may be anyone's.
+   * Stripping the literal "origin/" left "upstream/main", which no local branch
+   * is ever named, and every check written against this value silently stopped
+   * firing: no row got the "default" pill, the divergence bar rendered for the
+   * default branch against itself, and the sweep's guard let `main` through
+   * into a bulk delete.
+   *
+   * Strip the remote the ref actually names — on a remote HEAD `name` IS the
+   * bare remote — which also keeps `origin/release/2.x` → `release/2.x` right.
+   */
+  private defaultBranchName(locals: BranchInfo[]): string | undefined {
+    const head = this.refs.find((r) => r.type === "remote" && r.symref);
+    const symref = head?.symref;
+    if (symref) {
+      const prefix = `${head!.name}/`;
+      return symref.startsWith(prefix) ? symref.slice(prefix.length) : symref;
+    }
+    const cur = locals.find((b) => b.current);
+    return cur ? branchName(cur) : undefined;
+  }
+
+  /** Which orders the segment on screen can honour. */
+  private branchSortKeys(): Array<"recent" | "name" | "ahead" | "stale"> {
+    if (this.branchTab === "local") return ["recent", "name", "ahead", "stale"];
+    // A remote branch or a tag carries a date and a name, and nothing that
+    // could answer "most ahead".
+    if (this.branchTab === "remote" || this.branchTab === "tags") return ["recent", "name", "stale"];
+    return [];
+  }
+
+  /** The order actually applied, once the segment has had its say. */
+  private effectiveSort(): "recent" | "name" | "ahead" | "stale" {
+    const keys = this.branchSortKeys();
+    return keys.includes(this.branchSort) ? this.branchSort : "recent";
+  }
+
+  /** A worktree row. `worktree:list/add/remove/open` have existed in the IPC
+   *  contract with no caller in any view — the cheapest capability in the app. */
+  private worktreeRow(w: WorktreeInfo): HTMLElement {
+    const actions: HTMLElement[] = [];
+    // Said and copied in the system's spelling; `w.path` (git's) is what is sent.
+    const shown = w.shownPath ?? w.path;
+    // Nothing to open when its folder is gone or is not a worktree any more
+    // (a tab there would be the repository around it), or for a bare
+    // repository's entry.
+    if (!w.current && !w.missing && !w.unlinked && !w.bare) {
+      const open = el("button", "row-btn") as HTMLButtonElement;
+      open.textContent = l10n.t("Open");
+      open.setAttribute("aria-label", l10n.t("Open the worktree at {0}", shown));
+      // An open, like any other (issue #32): the worktree gets a tab of its
+      // own, or the one it already has is brought to the front.
+      open.title = l10n.t("Open the worktree at {0} in its own tab", shown);
+      open.addEventListener("click", () => void this.openWorktreeLive(w, open));
+      actions.push(open);
+    }
+    const more = el("button", "row-btn lv-menu-btn") as HTMLButtonElement;
+    more.setAttribute("aria-label", l10n.t("More actions for {0}", shown));
+    more.setAttribute("aria-haspopup", "menu");
+    more.appendChild(glyph("ellipsis"));
+    const menu = (): void =>
+      openMenu(more, [
+        { label: l10n.t("Copy path"), icon: "copy", onClick: () => void copyText(shown, l10n.t("Copied the path.")) },
+        { separator: true },
+        {
+          // Its folder gone, or not a worktree any more, removing it only
+          // forgets git's record of it.
+          label: w.missing || w.unlinked ? l10n.t("Forget this worktree…") : l10n.t("Remove this worktree…"),
+          icon: "trash",
+          danger: true,
+          disabled: w.current || w.main,
+          title: w.current
+            ? l10n.t("This is the worktree you are in")
+            : w.main
+              ? l10n.t("The main worktree holds the repository itself — git never removes it")
+              : undefined,
+          onClick: () => void this.removeWorktreeLive(w),
+        },
+      ]);
+    more.addEventListener("click", menu);
+    actions.push(more);
+
+    const pills: HTMLElement[] = [];
+    // A window holds a repository per TAB (#32): the mark is this tab's, and a
+    // worktree another tab has open says so — its Remove is refused for it.
+    // Main says which, by the comparison that refusal makes: a tab's root and
+    // git's path are two spellings of a folder (a symlink, case, C:\ against
+    // C:/), and only main can ask the disk. Compared here as text, the row lost
+    // its mark where main still refused the remove.
+    const inTab = !!w.openInTab;
+    if (w.current) {
+      const p = span(l10n.t("this tab"), "ab-pill current");
+      p.title = l10n.t("The worktree this tab has open");
+      pills.push(p);
+    } else if (inTab) {
+      const p = span(l10n.t("open in a tab"), "ab-pill default");
+      p.title = l10n.t("Another tab of this window has it open — close that tab to remove it");
+      pills.push(p);
+    }
+    // Named, as the extension names it: it holds the repository itself, and
+    // was told apart only by "this tab" — when this tab had it open.
+    if (w.main && !w.bare) {
+      const p = span(l10n.t("main worktree"), "ab-pill default");
+      p.title = l10n.t("The main worktree holds the repository itself — git never removes it");
+      pills.push(p);
+    }
+    if (w.locked) {
+      const p = span(l10n.t("locked"), "ab-pill unpublished");
+      p.title = w.lockReason ? l10n.t("Locked: {0}", w.lockReason) : l10n.t("Locked, with no reason given");
+      pills.push(p);
+    }
+    // Not only `prunable`: git never calls a LOCKED worktree prunable, even
+    // with its folder gone.
+    if (w.missing || (w.prunable && !w.unlinked)) {
+      const p = span(l10n.t("folder missing"), "ab-pill gone");
+      p.title = l10n.t("Its folder is gone — Forget it from the ⋯ menu");
+      pills.push(p);
+    } else if (w.unlinked) {
+      const p = span(l10n.t("not a worktree"), "ab-pill gone");
+      p.title = l10n.t("Its folder is there, but it isn't a worktree any more (its .git is gone) — Forget it from the ⋯ menu; the folder stays");
+      pills.push(p);
+    }
+
+    const row = secRow({
+      lead: glyph("window"),
+      title: w.branch ?? (w.bare ? l10n.t("(bare)") : w.head.slice(0, 7)),
+      meta: [
+        // Same table the other four tabs keep: state pills in their own
+        // column, the path where the subject column lives, the sha aligned.
+        (() => {
+          const c = el("span", "br-state-col");
+          for (const p of pills) c.appendChild(p);
+          return c;
+        })(),
+        span(shown, "br-subject br-subject-col"),
+        span(w.head.slice(0, 7), "br-sha sec-mono"),
+      ],
+      time: "",
+      actions,
+      // A detached or bare worktree went to `copyText` here — so activating the
+      // row performed a side effect on data the user owns (whatever was on
+      // their clipboard), navigated nowhere, and disagreed with the row's own
+      // "Open" button, while every other row in this view routes somewhere. It
+      // has a HEAD, and a commit is a page.
+      onOpen: () =>
+        w.branch
+          ? this.routeView("refdetail", false, { ref: w.branch, id: "head" })
+          : this.routeView("commit", false, { sha: w.head }),
+      ariaLabel: l10n.t(
+        "{0} at {1}{2}{3}",
+        w.branch ?? w.head.slice(0, 7),
+        shown,
+        w.current ? l10n.t(", this tab") : inTab ? l10n.t(", open in another tab") : "",
+        w.main && !w.bare ? l10n.t(", main worktree") : "",
+      ),
+    });
+    row.classList.add("ref-row", "worktree-row");
+    row.dataset.ref = w.path;
+    row.title = shown;
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      menu();
+    });
+    return row;
+  }
+
+  /** Open another worktree of this repository in a tab of its own (or switch
+   *  to the tab it has). Its answer lands with that tab in front, so the toast
+   *  is said there. */
+  private async openWorktreeLive(w: WorktreeInfo, btn: HTMLButtonElement): Promise<void> {
+    await this.refreshInPlace(btn, async () => {
+      const repo = await host.invoke("worktree:open", w.path);
+      // Main has said why nothing opened (every tab is taken): once is enough.
+      if (repo && "said" in repo) return;
+      if (!repo) {
+        toast(l10n.t("Couldn't open {0}.", w.shownPath ?? w.path), "error");
+        return;
+      }
+      toast(l10n.t("Opened {0}.", w.branch ?? w.shownPath ?? w.path), "success");
+    });
+  }
+
+  /**
+   * Remove (or, its folder gone, forget) a worktree. What that takes is read
+   * FIRST (`worktree:removal`), so the one question names it — a lock's
+   * reason, the uncommitted files that go — and the answer runs exactly that.
+   * It used to promise "any uncommitted work goes with it", run a plain
+   * remove, and show git's refusal: a dirty worktree was never removed, a
+   * locked one could not be, and the main one was offered at all. The words
+   * are the extension's (host-bridge/worktreeRemoval).
+   *
+   * A change made while the question is open (an agent still at work in it)
+   * is never deleted unasked: the remove runs nothing and answers
+   * `changedSince` with what the worktree holds now, and the question is asked
+   * again from that — once, as the extension's is. It used to show git's
+   * refusal ("use --force to delete it") in a red toast, filed as a crash.
+   */
+  private async removeWorktreeLive(w: WorktreeInfo, again?: WorktreeRemovalInfo): Promise<void> {
+    const label = w.branch ?? (w.bare ? l10n.t("(bare)") : l10n.t("{0} (detached)", w.head.slice(0, 7)));
+    const plan = again ?? (await host.invoke("worktree:removal", { path: w.path }));
+    if (plan.kind === "notListed" || plan.kind === "main" || plan.kind === "current" || plan.kind === "openInTab") {
+      toast(worktreeRemovalRefusal(plan.kind, label, "tab"), "info");
+      if (plan.kind === "notListed") await this.refreshBranchesSoft();
+      return;
+    }
+    const q = worktreeRemovalQuestion({
+      kind: plan.kind,
+      ...(plan.staleWhy ? { staleWhy: plan.staleWhy } : {}),
+      label,
+      shownPath: w.shownPath ?? w.path,
+      branch: plan.branch,
+      head: plan.head,
+      locked: plan.locked,
+      lockReason: plan.lockReason,
+      changes: plan.changes,
+      operation: plan.operation,
+    });
+    const ok = await confirmDialog({
+      title: q.title,
+      message: q.message,
+      confirmLabel: q.confirmLabel,
+      danger: q.danger,
+      holdWhile: this.whileThisRepo(),
+    });
+    if (!ok) return;
+    const r = await host.invoke("worktree:remove", {
+      path: w.path,
+      discardChanges: q.discardChanges,
+      // Exactly what the question named: a path it did not stops the discard.
+      ...(q.discardChanges && plan.kind === "present" && plan.changes ? { listed: plan.changes } : {}),
+      pastLock: plan.locked,
+    });
+    if (!r.ok) {
+      if (r.changedSince && !again) {
+        await this.removeWorktreeLive(w, r.changedSince);
+        return;
+      }
+      toast(r.message ?? l10n.t("Couldn't remove the worktree."), r.expected ? "info" : "error");
+      await this.refreshBranchesSoft();
+      return;
+    }
+    toast(plan.kind === "present" ? l10n.t("Removed worktree {0}.", label) : l10n.t("Forgot worktree {0}.", label), "success");
+    await this.refreshBranchesSoft();
+  }
+
+  private async refreshBranchesSoft(): Promise<void> {
+    if (this.currentView === "branches" && this.reloadBranchRows) {
+      await this.reloadBranchRows();
+    } else if (this.currentView === "branches") {
+      void this.showBranchesView();
+    }
+  }
+
+  /**
+   * Fetch every remote, from the header.
+   *
+   * This existed only as a menu item inside ONE local branch's hover-revealed
+   * ⋯ — the action that makes every ahead/behind number on the screen true,
+   * two hover levels deep and attached to a row it has nothing to do with.
+   */
+  private async fetchAllLive(btn: HTMLButtonElement): Promise<void> {
+    await this.refreshInPlace(btn, async () => {
+      // Honour the preference, as the other two fetch call sites do. Passing
+      // `undefined` here meant Settings → "Prune on fetch" was silently ignored
+      // by the Fetch button on the view whose whole job is showing which
+      // branches still exist — so a branch deleted on the remote stayed in the
+      // list after exactly the action that should have removed it.
+      const r = await host.invoke("sync:fetch", { prune: this.pruneOnFetchPref });
+      if (!r.ok) {
+        toast(r.message ?? l10n.t("Fetch failed."), r.expected ? "info" : "error");
+        return;
+      }
+      bust("branches");
+      await this.refreshBranchesSoft();
+      toast(l10n.t("Fetched from every remote."), "success");
+    });
+  }
+
+  /** Push a branch that has never been pushed, and set its upstream. */
+  private async publishBranchLive(b: BranchInfo, btn: HTMLButtonElement): Promise<void> {
+    await this.refreshInPlace(btn, async () => {
+      const r = await host.invoke("branch:push", { fullName: b.fullName });
+      if (!r.ok) {
+        toast(r.message ?? l10n.t("Couldn't publish {0}.", branchName(b)), r.expected ? "info" : "error");
+        return;
+      }
+      bust("branches");
+      await this.refreshBranchesSoft();
+      toast(l10n.t("Published {0}.", branchName(b)), "success");
+    });
+  }
+
+  /** The per-kind primary action in the header. Each segment has exactly one
+   *  thing you come here to MAKE; Remotes has none, because Fetch is it. */
+  private branchesCta(tab: "local" | "remote" | "tags" | "stashes" | "worktrees"): HTMLElement {
+    const mk = (label: string, icon: string, title: string, run: () => void): HTMLElement => {
+      const b = el("button", "mini-btn") as HTMLButtonElement;
+      b.append(glyph(icon), span(label));
+      b.title = title;
+      b.addEventListener("click", run);
+      return b;
+    };
+    if (tab === "local") {
+      return mk(l10n.t("New branch"), "add", l10n.t("Create a branch from the current HEAD"), () => void this.newBranch());
+    }
+    if (tab === "tags") {
+      return mk(l10n.t("New tag"), "tag", l10n.t("Tag the current HEAD"), () => void this.newTagHere());
+    }
+    if (tab === "stashes") {
+      // The one screen that LISTS stashes could not make one.
+      return mk(l10n.t("Stash changes"), "git-stash", l10n.t("Stash the working tree"), () => void this.stashHere());
+    }
+    return el("span", "gh-head-cta-blank");
+  }
+
+  /** Tag the current HEAD, from the Tags segment's own CTA. */
+  private async newTagHere(): Promise<void> {
+    const name = await promptInline(l10n.t("Tag name"), "v1.0.0");
+    if (!name?.trim()) return;
+    const msg = await promptInline(
+      l10n.t("Message for {0}", name.trim()),
+      l10n.t("Optional — a message makes the tag carry its own note"),
+      "",
+      l10n.t("Create tag"),
+      true,
+    );
+    if (msg === null) return;
+    const r = await host.invoke("tag:create", {
+      name: name.trim(),
+      message: msg.trim() || undefined,
+    });
+    if (!r.ok) {
+      toast(r.message ?? l10n.t("Couldn't create the tag."), r.expected ? "info" : "error");
+      return;
+    }
+    toast(l10n.t("Created tag {0}.", name.trim()), "success");
+    await this.refreshBranchesSoft();
+  }
+
+  /** Stash the working tree. The one screen that LISTS stashes could not make
+   *  one — the verb lived only in the Changes view. */
+  private async stashHere(): Promise<void> {
+    const msg = await promptInline(l10n.t("Stash message"), l10n.t("What is this work?"), "", l10n.t("Stash"), true);
+    if (msg === null) return;
+    const r = await host.invoke("stash:save", { message: msg.trim() || undefined });
+    if (!r.ok) {
+      toast(r.message ?? l10n.t("Couldn't stash."), r.expected ? "info" : "error");
+      return;
+    }
+    toast(l10n.t("Stashed your working changes."), "success");
+    await this.refreshBranchesSoft();
+  }
+
+  /** Empty and error states per kind, each with the verb that fills it. */
+  private branchesEmpty(
+    tab: "local" | "remote" | "tags" | "stashes" | "worktrees",
+    query: string,
+    stashFailed: boolean,
+    /** A facet or the Active/Stale cut is narrowing the list, and it is not the
+     *  search box. Without this the view claimed the REPOSITORY was empty. */
+    filtered = false,
+    /** `worktree:list` threw. A failed read is not an empty list. */
+    worktreeFailed = false,
+    onClear?: () => void,
+  ): HTMLElement {
+    // What the reader calls this list, not the internal key. `tab` is
+    // "local" / "remote" / "tags", and printing it produced "Nothing in local
+    // matches …" and "No tag here matches …".
+    const NOUN: Record<string, { one: string; many: string }> = {
+      local: { one: l10n.t("branch"), many: l10n.t("branches") },
+      remote: { one: l10n.t("remote branch"), many: l10n.t("remote branches") },
+      tags: { one: l10n.t("tag"), many: l10n.t("tags") },
+      stashes: { one: l10n.t("stash"), many: l10n.t("stashes") },
+      worktrees: { one: l10n.t("worktree"), many: l10n.t("worktrees") },
+    };
+    const noun = NOUN[tab] ?? { one: l10n.t("ref"), many: l10n.t("refs") };
+
+    // A NARROWING emptied it, not the repository. Both narrowings are named
+    // when both are active: the search branch used to return first, so a search
+    // that matched something and a facet that matched nothing blamed the search
+    // box alone — and offered no way to clear the filter actually responsible.
+    if (query || filtered) {
+      const why =
+        query && filtered
+          ? l10n.t("No {0} match “{1}” and the filters in effect.", noun.many, query)
+          : query
+            ? l10n.t("No {0} match “{1}”.", noun.many, query)
+            : l10n.t("No {0} match the filters in effect.", noun.many);
+      return emptyState(l10n.t("No matches"), why, {
+        icon: filtered ? "filter" : "search",
+        anchor: "inline",
+        // Offered whenever there is a filter to clear — a search you can see in
+        // the box you typed it into needs no button, but a facet or an age cut
+        // three controls away does.
+        ...(filtered && onClear ? { action: { label: l10n.t("Clear filters"), onClick: onClear } } : {}),
+      });
+    }
+    if (tab === "worktrees" && worktreeFailed) {
+      return errorState(l10n.t("Couldn't read the worktrees"), l10n.t("Git did not answer. Whether this repository has others is unknown, not settled."),
+        () => void this.refreshBranchesSoft(),
+      );
+    }
+    if (tab === "stashes" && stashFailed) {
+      // A failed read is not an empty list — the old view swallowed the error
+      // and rendered "no stashes" over a repo that has some.
+      return errorState(l10n.t("Couldn't read the stashes"), l10n.t("Git did not answer. The stash list is unknown, not empty."),
+        () => void this.refreshBranchesSoft(),
+      );
+    }
+    // Every segment, INCLUDING worktrees. `branchTab` is persisted across
+    // launches, and the Worktrees segment only renders when there is more than
+    // one — so a repo that loses its extra worktree, or whose `worktree:list`
+    // fails (the catch turns that into `[]`), reopens on a segment with no
+    // entry here. Destructuring undefined threw, and the whole Branches view
+    // rendered blank with a console error nobody sees.
+    const copy: Record<string, [string, string]> = {
+      local: [l10n.t("No branches yet"), l10n.t("Every repository has at least one — this read found none.")],
+      remote: [l10n.t("No remote branches"), l10n.t("Nothing has been fetched yet. Fetch brings them in.")],
+      tags: [l10n.t("No tags"), l10n.t("Tag a commit to mark a release or a milestone.")],
+      stashes: [l10n.t("No stashes"), l10n.t("Stashing puts your working changes aside without committing them.")],
+      worktrees: [
+        l10n.t("No other worktrees"),
+        l10n.t("A worktree checks out a second branch into its own directory, so you can work on two at once."),
+      ],
+    };
+    const [title, desc] = copy[tab] ?? [l10n.t("Nothing here"), l10n.t("This list is empty.")];
+    return emptyState(title, desc, { icon: tab === "stashes" ? "git-stash" : "git-branch" });
+  }
+
+  /**
+   * One local branch, on the shared `secRow` anatomy.
+   *
+   * The old row was a bespoke two-line `div[role=button]` whose entire action
+   * cluster was `opacity: 0` until hover — which is why every deeper verb had
+   * to be exiled into a ⋯ menu, and why none of them could be reached by
+   * keyboard or touch at all. One primary verb and the menu render at rest.
+   */
+  private localBranchRow(b: BranchInfo, defaultBranch?: string): HTMLElement {
+    // Named — on the row, in its labels, and against the default branch — by
+    // the part under refs/heads/ (branchName), never b.name: git's short form
+    // is "heads/release" beside a tag "release", which the row printed, and
+    // "heads/main" beside a tag "main", which lost the default pill. Its
+    // upstream the same way: "origin/x", never "remotes/origin/x".
+    const bn = branchName(b);
+    const up = upstreamLabel(b);
+    const pills: HTMLElement[] = [];
+    const pill = (text: string, cls: string, title: string): HTMLElement => {
+      const p = span(text, `ab-pill ${cls}`);
+      p.title = title;
+      return p;
+    };
+    if (b.current) pills.push(pill(l10n.t("current"), "current", l10n.t("This is the checked-out branch")));
+    else if (bn === defaultBranch) pills.push(pill(l10n.t("default"), "default", l10n.t("The repository's default branch")));
+    if (b.gone) {
+      // Without this the row reads "0 ahead, 0 behind" — the same shape as
+      // perfectly in sync — about a remote that no longer exists, which is what
+      // every merged pull request leaves behind.
+      pills.push(
+        pill(l10n.t("upstream gone"),
+          "gone",
+          l10n.t("{0} no longer exists — this branch is probably finished with.", up ?? l10n.t("Its upstream")),
+        ),
+      );
+    } else if (b.merged && !b.current && bn !== defaultBranch) {
+      pills.push(
+        pill(l10n.t("merged"),
+          "merged",
+          l10n.t("Every commit here is already in {0} — safe to delete.", defaultBranch ?? l10n.t("the default branch")),
+        ),
+      );
+    } else if (!b.upstream) {
+      pills.push(pill(l10n.t("unpublished"), "unpublished", l10n.t("This branch has never been pushed")));
+    }
+
+    const chips: HTMLElement[] = [];
+    // NO divergence bar.
+    //
+    // There used to be one here: two numbers either side of a 64px sparkline
+    // showing distance from the default branch, scaled to the widest divergence
+    // on screen. It cost about a hundred pixels on every row, it was the second
+    // thing your eye hit after the name, and nobody could read a quantity off
+    // it — the scale changed with whatever else happened to be listed. Those
+    // hundred pixels came out of the branch NAME, which is the only thing
+    // anyone scans this list for.
+    //
+    // The number is still available where it can be stated plainly: the
+    // branch's own page, and the row tooltip. What stays on the row is the
+    // ahead/behind pair, which is not decoration — it says what Push and Pull
+    // will do, and the row has buttons for both.
+    const meta: HTMLElement[] = [];
+    // The STATE is a column too. As a title-suffix every pill landed wherever
+    // its branch's name happened to end — eleven rows put eleven pills at
+    // eleven x-positions, which is the picture that came back captioned
+    // "retarded". One fixed slot, every pill on one line down the page.
+    const stateCol = el("span", "br-state-col");
+    for (const p of pills) stateCol.appendChild(p);
+    meta.push(stateCol);
+    // The subject is a COLUMN now, not a tail pinned to the name. As a chip it
+    // started wherever the name (and its pills) happened to end, so five rows
+    // put five different x-positions under one heading — the "mess" was mostly
+    // this. A fixed-basis column reads down the page like a table.
+    const subjectCol = span(b.subject ?? "", "br-subject br-subject-col");
+    if (b.subject) subjectCol.title = b.subject;
+    meta.push(subjectCol);
+
+    // WHO — the tip author immediately (free, from for-each-ref), upgraded in
+    // place to creator + contributors when branches:people lands. The slot is
+    // reserved either way, so late data never shifts the columns.
+    const people = el("span", "br-people");
+    people.dataset.branch = b.name;
+    if (b.tipAuthor) {
+      const a = avatar(b.tipAuthor.name, gravatarUrl(b.tipAuthor.email, 36), 18);
+      a.title = `Last commit by ${b.tipAuthor.name}`;
+      people.appendChild(a);
+    }
+    meta.push(people);
+
+    const track = el("span", "br-track");
+    // The upstream pair answers a DIFFERENT question from the bar: not "how far
+    // from main" but "what will Push and Pull do".
+    if (b.ahead) {
+      const p = span(`↑ ${b.ahead}`, "ab-pill ahead");
+      p.title = l10n.t("{0} to push to {1}", plural(b.ahead, "commit"), up ?? l10n.t("upstream"));
+      track.appendChild(p);
+    }
+    if (b.behind) {
+      const p = span(`↓ ${b.behind}`, "ab-pill behind");
+      p.title = l10n.t("{0} to pull from {1}", plural(b.behind, "commit"), up ?? l10n.t("upstream"));
+      track.appendChild(p);
+    }
+    // Only when it HAS a count. The slot is a fixed 78px so the pairs line up
+    // down the list, and it was pushed onto every row — including the many with
+    // nothing to push or pull, where it reserved 78px to align nothing at all
+    // against a branch name that was being cut off four pixels short.
+    // Always reserved: with the subject in its own column the 78px no longer
+    // comes out of the name, and an empty slot is what keeps the time column
+    // straight on rows with nothing to push or pull.
+    meta.push(track);
+    // The upstream, ONLY when it is not the obvious one.
+    //
+    // A 160px right-aligned column held `origin/<this branch's name>` on nearly
+    // every row — the same string as the name three columns to its left, and
+    // truncated from the LEFT, so a list of long branches read
+    // "…ly-long-descriptive-name" over and over, identical on every line. It
+    // told you nothing and it took its width from the name.
+    //
+    // A branch tracking a DIFFERENTLY named upstream is a real and surprising
+    // fact, so that still shows.
+    const conventionalUpstream = !!b.upstream && upstreamParts(b)?.branch === bn;
+    if (b.upstream && !conventionalUpstream) {
+      // INSIDE the subject column, not a slot of its own. A fixed 160px column
+      // that only SOME rows carry pushed that one row's faces, counts and time
+      // 172px left of every neighbour's — one surprising branch broke the
+      // table for the whole list. The surprising fact rides where the context
+      // lives; the subject makes room.
+      const upEl = span(`↪ ${up}`, "br-upstream sec-mono");
+      upEl.title = `Tracks ${up} — a differently named upstream`;
+      subjectCol.append(upEl);
+    }
+
+    // ONE contextual primary verb, plus the menu. Delete deliberately does NOT
+    // live on the row: it is one stray click away from a name you are scanning.
+    const actions: HTMLElement[] = [];
+    if (b.behind) {
+      const pull = el("button", "row-btn") as HTMLButtonElement;
+      pull.textContent = l10n.t("Pull");
+      pull.setAttribute("aria-label", l10n.t("Pull {0}", bn));
+      pull.title = b.current
+        ? l10n.t("Pull {0} from {1}", plural(b.behind, "commit"), up ?? l10n.t("upstream"))
+        : l10n.t("Pull {0} into {1} — fast-forward, no checkout", plural(b.behind, "commit"), bn);
+      pull.addEventListener("click", () => void this.pullBranchLive(b, pull));
+      actions.push(pull);
+    } else if (!b.upstream) {
+      const pub = el("button", "row-btn") as HTMLButtonElement;
+      pub.textContent = l10n.t("Publish");
+      pub.setAttribute("aria-label", `Publish ${bn}`);
+      pub.title = `Push ${bn} and set its upstream`;
+      pub.addEventListener("click", () => void this.publishBranchLive(b, pub));
+      actions.push(pub);
+    } else if (!b.current) {
+      const co = el("button", "row-btn") as HTMLButtonElement;
+      co.textContent = l10n.t("Checkout");
+      co.setAttribute("aria-label", l10n.t("Check out {0}", bn));
+      co.title = l10n.t("Check out {0}", bn);
+      co.addEventListener("click", () => void this.checkoutRef(b.fullName, co));
+      actions.push(co);
+    }
+    const moreBtn = el("button", "row-btn lv-menu-btn") as HTMLButtonElement;
+    moreBtn.setAttribute("aria-label", l10n.t("More actions for {0}", bn));
+    moreBtn.setAttribute("aria-haspopup", "menu");
+    moreBtn.appendChild(glyph("ellipsis"));
+    moreBtn.addEventListener("click", () => this.openBranchActions(b, moreBtn));
+    actions.push(moreBtn);
+
+    const row = secRow({
+      lead: glyph(b.current ? "check" : bn === defaultBranch ? "home" : "git-branch"),
+      title: bn,
+      meta,
+      time: b.date ? relTime(b.date) : "",
+      timeTitle: b.date ? absTime(b.date) : undefined,
+      actions,
+      // The row is a PLACE now, not a modal: it routes to the branch's own page.
+      onOpen: () => this.routeView("refdetail", false, { ref: b.name, id: "head" }),
+      // What the row says out loud, rather than "Inspect branch main".
+      ariaLabel: [
+        bn,
+        b.current ? l10n.t("current branch") : "",
+        b.gone ? l10n.t("upstream gone") : b.merged ? l10n.t("merged") : "",
+        // The divergence as a FACT, not as the verbs the row's own buttons
+        // carry — "3 to push, 5 to pull" beside a Pull button makes a screen
+        // reader recite the actions back before it reaches them.
+        b.ahead ? l10n.t("{0} ahead", b.ahead) : "",
+        b.behind ? l10n.t("{0} behind", b.behind) : "",
+        b.date ? l10n.t("updated {0}", relTime(b.date)) : "",
+      ]
+        .filter(Boolean)
+        .join(", "),
+    });
+    row.classList.add("branch-row");
+    row.dataset.ref = b.name;
+    row.title = [
+      bn,
+      b.subject,
+      // The divergence the bar used to draw, said in words.
+      b.aheadDefault !== undefined && b.behindDefault !== undefined && bn !== defaultBranch
+        ? l10n.t("{0} ahead of and {1} behind {2}", b.aheadDefault, b.behindDefault, defaultBranch ?? l10n.t("the default branch"))
+        : "",
+      b.upstream && conventionalUpstream ? l10n.t("tracking {0}", String(up)) : "",
+      b.date ? absTime(b.date) : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    // Right-click MIRRORS the menu — a shortcut, never a verb's only door.
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      this.openBranchActions(b, moreBtn);
+    });
+    return row;
+  }
+
+  /** The per-branch action menu: merge / rebase / rename / set-upstream / tag /
+   *  delete-remote — the depth that makes Branches a real manager, not a list. */
+  private openBranchActions(b: BranchInfo, anchor: HTMLElement): void {
+    openMenu(anchor, this.branchActionItems(b, anchor));
+  }
+
+  /**
+   * A local branch's actions — the Branches list's ⋯ menu, and the branch
+   * switcher's submenu for that branch (#32), which is the same list with
+   * Checkout moved to the top: the switcher is where you go to SWITCH, and
+   * Enter, Enter there is a checkout, as in IntelliJ's popup.
+   */
+  private branchActionItems(
+    b: BranchInfo,
+    anchor: HTMLElement,
+    opts: { checkoutFirst?: boolean } = {},
+  ): MenuItem[] {
+    // Every op below reaches git by b.fullName (the main process refuses one
+    // without it); every label names the branch by the part under refs/heads/
+    // — git's short "heads/x" beside a tag "x" is neither (branchRequests.ts).
+    const bn = branchName(b);
+    const refresh = async (): Promise<void> => {
+      bust();
+      await this.refreshRefs();
+      await this.updateSync();
+      if (this.currentView === "branches") void this.showBranchesView();
+    };
+    const run = async (
+      label: string,
+      p: Promise<{ ok: boolean; message?: string; expected?: boolean; cancelled?: true }>,
+    ): Promise<void> => {
+      try {
+        const r = await p;
+        // A merge or rebase over uncommitted changes in its way asks Stash &
+        // Retry or Cancel (bridge.ts); cancelled, nothing ran and nothing is
+        // said. A refusal that is the user's state — the changes still in the
+        // way, a merge that stopped on conflicts — is said in the neutral
+        // tone, not as a failure.
+        if (r.cancelled) {
+          // nothing to say
+        } else if (!r.ok) toast(cleanErr(r.message) || l10n.t("Couldn't {0}.", label), r.expected ? "info" : "error");
+        else toast(l10n.t("{0} ✓", label), "success");
+      } catch (e) {
+        toast(cleanErr(e) || l10n.t("Couldn't {0}.", label), "error");
+      }
+      await refresh();
+    };
+    const items: MenuItem[] = [];
+    const checkout: MenuItem = {
+      label: l10n.t("Checkout {0}", bn),
+      icon: "check",
+      onClick: () => void this.checkoutRef(b.fullName),
+    };
+    if (opts.checkoutFirst && !b.current) items.push(checkout, { separator: true });
+    // Fetch is pinned on top and runs IN PLACE: the menu stays open, the item
+    // spins while the remotes refresh, and every row's ↓/↑ counts update live
+    // behind it — so "what's unpulled where?" is one click, not a round trip.
+    items.push({
+      label: l10n.t("Fetch"),
+      sub: l10n.t("update remote tracking"),
+      icon: "sync",
+      keepOpen: true,
+      onClick: (itemEl) => void this.fetchLiveInMenu(itemEl, b),
+    });
+    // Push / Publish for THIS branch. The menu offered no way to push at all —
+    // only the top-bar widget could, and only for the checked-out branch, so an
+    // ahead or unpublished branch was unpushable from the list showing it.
+    items.push({
+      label: b.upstream ? l10n.t("Push") : l10n.t("Publish branch"),
+      sub: b.upstream
+        ? b.ahead
+          ? l10n.t("{0} to {1}", plural(b.ahead, "commit"), b.upstream)
+          : l10n.t("to {0}", b.upstream)
+        : l10n.t("create it on the remote and track it"),
+      icon: b.upstream ? "arrow-up" : "cloud-upload",
+      onClick: () =>
+        void run(
+          b.upstream ? l10n.t("push {0}", bn) : l10n.t("publish {0}", bn),
+          host.invoke("branch:push", { fullName: b.fullName }),
+        ),
+    });
+    items.push({ separator: true });
+    if (!b.current && !opts.checkoutFirst) items.push(checkout);
+    // Always offered while an upstream exists (a fetch from this very menu can
+    // surface new commits): pulls WITHOUT checking the branch out. The current
+    // branch gets a real pull instead, shown only when it's actually behind.
+    if (b.upstream && !b.current) {
+      items.push({
+        label: b.behind ? l10n.t("Pull {0} into {1}", b.behind, bn) : l10n.t("Pull latest into {0}", bn),
+        sub: l10n.t("fast-forward — no checkout"),
+        icon: "arrow-down",
+        onClick: () => void this.pullBranchLive(b),
+      });
+    } else if (b.current && b.behind && b.upstream) {
+      items.push({
+        label: b.behind === 1 ? l10n.t("Pull {0} commit", b.behind) : l10n.t("Pull {0} commits", b.behind),
+        sub: b.upstream,
+        icon: "arrow-down",
+        onClick: () => void this.pullBranchLive(b),
+      });
+    }
+    if (!b.current || b.behind) items.push({ separator: true });
+    if (!b.current) {
+      items.push({
+        label: l10n.t("Merge {0} into current", bn),
+        icon: "git-merge",
+        // in-the-way-reviewed: run() above says nothing on `cancelled`.
+        // By FULL name, and recorded as "Merge branch '<bn>'" (BranchOps).
+        onClick: () => void run(l10n.t("merge {0}", bn), host.invoke("branch:merge", { fullName: b.fullName })),
+      });
+      items.push({
+        label: l10n.t("Rebase current onto {0}…", bn),
+        icon: "git-pull-request",
+        // ASKED FIRST. Every other item in this menu is additive or reversible;
+        // this one rewrites the current branch's history, and it sat one
+        // mis-aimed click below "Merge" with nothing between the pointer and
+        // the rewrite. The ellipsis now tells the truth about what follows.
+        onClick: () =>
+          void (async () => {
+            const current = this.currentBranchName() ?? l10n.t("the current branch");
+            const ok = await confirmDialog({
+              title: l10n.t("Rebase {0} onto {1}?", current, bn),
+              message: l10n.t(
+                "Every commit on {0} that is not on {1} is rewritten with a new identity. If you have already pushed {0}, the next push needs a force.",
+                current,
+                bn,
+              ),
+              confirmLabel: l10n.t("Rebase"),
+              danger: true,
+            });
+            if (!ok) return;
+            // in-the-way-reviewed: run() above says nothing on `cancelled`.
+            await run(l10n.t("rebase onto {0}", bn), host.invoke("branch:rebase", { fullName: b.fullName }));
+          })(),
+      });
+      items.push({ separator: true });
+    }
+    items.push({
+      label: l10n.t("Copy branch name"),
+      icon: "copy",
+      onClick: () => void copyText(bn, l10n.t("Copied “{0}”.", bn)),
+    });
+    items.push({
+      label: l10n.t("Rename…"),
+      icon: "edit",
+      onClick: () => void this.renameBranchFlow(b),
+    });
+    items.push({
+      label: l10n.t("New branch from {0}…", bn),
+      icon: "add",
+      onClick: () =>
+        void createBranchFlow(
+          {
+            kind: "branch",
+            // The start point by FULL name: a bare "release" beside a tag of
+            // that name is the TAG.
+            ref: b.fullName,
+            label: bn,
+            sha: this.refs.find((r) => r.fullName === b.fullName)?.sha?.slice(0, 7),
+            current: this.currentBranchName(),
+          },
+          { refs: this.refs, after: () => this.refreshAfterBranchChange() },
+        ),
+    });
+    items.push({
+      label: l10n.t("Set upstream…"),
+      icon: "cloud",
+      onClick: () => {
+        void (async (): Promise<void> => {
+          const up = await promptInline(l10n.t("Set upstream"), "origin/" + bn, b.upstream ?? "", l10n.t("Set upstream"));
+          if (up && up.trim())
+            await run(l10n.t("set upstream"), host.invoke("branch:setUpstream", { fullName: b.fullName, upstream: up.trim() }));
+        })();
+      },
+    });
+    items.push({
+      label: l10n.t("Create tag here…"),
+      icon: "tag",
+      onClick: () => {
+        void (async (): Promise<void> => {
+          const name = await promptInline(l10n.t("Tag name"), "v1.0.0");
+          if (!name || !name.trim()) return;
+          // `allowEmpty` so Cancel is distinguishable from a deliberate blank.
+          // Without it both answered `null`, the flow could not tell them
+          // apart, and cancelling the OPTIONAL second prompt created the tag
+          // anyway — a Cancel that performs the action, on an object nothing in
+          // the app can delete afterwards.
+          const msg = await promptInline(
+            l10n.t("Tag message (optional — it rides with the tag)"),
+            "Release 1.0.0",
+            "",
+            l10n.t("Create tag"),
+            true,
+          );
+          if (msg === null) return;
+          await run(l10n.t("create tag"), host.invoke("tag:create", { name: name.trim(), ref: b.fullName, message: msg.trim() || undefined }));
+        })();
+      },
+    });
+    // Split from the upstream's FULL name (upstreamParts): the short one is
+    // "remotes/origin/x" beside a local branch called "origin/x", which named
+    // a remote called "remotes" and failed the delete.
+    const upParts = upstreamParts(b);
+    if (upParts) {
+      const { remote, branch: rname } = upParts;
+      const upName = `${remote}/${rname}`;
+      items.push({ separator: true });
+      items.push({
+        label: l10n.t("Delete remote branch ({0})", upName),
+        icon: "trash",
+        onClick: () => {
+          void (async (): Promise<void> => {
+            const ok = await confirmDialog({
+              title: l10n.t("Delete remote branch"),
+              message: l10n.t(
+                "Delete {0} from {1}? This affects everyone. You can push it back straight afterwards, as long as nobody has re-made it.",
+                upName,
+                remote,
+              ),
+              confirmLabel: l10n.t("Delete remote branch"),
+              danger: true,
+            });
+            if (!ok) return;
+            const gone = await host.invoke("branch:deleteRemote", { remote, name: rname });
+            if (!gone.ok) {
+              toast(gone.message ?? l10n.t("Couldn't delete {0}.", upName), gone.expected ? "info" : "error");
+              return;
+            }
+            bust("branches");
+            await this.refreshBranchesSoft();
+            // The undo is a push, so it can fail in ways the others cannot —
+            // it reports whatever the remote says rather than claiming success.
+            if (gone.was) {
+              const sha = gone.was;
+              didUndoable(l10n.t("Deleted {0} from {1}.", upName, remote), {
+                label: l10n.t("Push {0} back to {1}", rname, remote),
+                undo: async () => {
+                  const back = await host.invoke("branch:restoreRemote", { remote, name: rname, sha });
+                  if (!back.ok) return back.message ?? l10n.t("Couldn't push {0} back.", rname);
+                  bust("branches");
+                  return undefined;
+                },
+                after: () => this.refreshBranchesSoft(),
+              });
+            } else {
+              toast(l10n.t("Deleted {0} from {1}.", upName, remote), "success");
+            }
+          })();
+        },
+      });
+    }
+    // The two that take something away sit together at the bottom, in red.
+    const tail: MenuItem[] = [];
+    // "Throw everything local away and make it 1:1 with origin" (#32) — only
+    // for a branch that tracks a remote branch that still exists; the words
+    // are the VS Code extension's, so both products say the same thing.
+    if (upParts && !b.gone) {
+      const upName = `${upParts.remote}/${upParts.branch}`;
+      tail.push({
+        label: resetItemLabel(upName),
+        icon: "discard",
+        danger: true,
+        title: l10n.t("Drop what is only on {0} and make it match {1} — you'll see what goes first", bn, upName),
+        keepOpen: true,
+        onClick: (itemEl) => void this.resetToUpstreamFlow(b, itemEl, anchor),
+      });
+    }
+    // Deleting the LOCAL branch belongs here too. The row behind this menu
+    // offered it as a plain "Delete" button while the menu — reached from the
+    // branch's own peek, where you have just read its history and decided — did
+    // not, so the peek was a dead end for the one decision it prepares you for.
+    if (!b.current) {
+      tail.push({
+        label: l10n.t("Delete {0}", bn),
+        icon: "trash",
+        danger: true,
+        title: l10n.t("Delete the local branch {0}", bn),
+        onClick: () => void this.deleteBranch(b),
+      });
+    }
+    if (tail.length) items.push({ separator: true }, ...tail);
+    return items;
+  }
+
+  /**
+   * Reset a local branch to its upstream (#32): fetch it, say what goes, and
+   * only then move it — `git reset --hard` for the branch you are on, `git
+   * branch -f` for any other (main/branchReset.ts). The menu item spins while
+   * the fetch runs, the way Fetch's does; the question outlives the watcher
+   * refresh that fetch sets off, but not a switch to another repository.
+   */
+  private async resetToUpstreamFlow(b: BranchInfo, itemEl?: HTMLElement, anchor?: HTMLElement): Promise<void> {
+    const root = this.currentRepo?.root;
+    if (!root) return;
+    // One press, one reset: a second click on the spinning item is dropped.
+    if (itemEl?.classList.contains("is-busy-item")) return;
+    const g = itemEl?.querySelector(".glyph");
+    itemEl?.classList.add("is-busy-item");
+    g?.classList.add("spin");
+    const bn = branchName(b);
+    const stillHere = this.whileThisRepo();
+    const refresh = async (): Promise<void> => {
+      bust();
+      await this.updateSync();
+      if (b.current) await this.refreshAll();
+      await this.refreshBranchesSoft();
+    };
+    const out = await resetToUpstream({
+      plan: () => host.invoke("branch:resetPlan", { fullName: b.fullName }),
+      stillHere,
+      // Asked AFTER the fetch, which moved a ref: `holdWhile` keeps the question
+      // up through the watcher's refresh (memory: refresh-closing-dialogs).
+      ask: (q) => {
+        closeMenu();
+        // The keyboard goes back to the menu's trigger when the question is
+        // answered, as it does for every other item — the dialog returns focus
+        // to whatever had it when it opened.
+        if (anchor?.isConnected) anchor.focus();
+        return confirmDialog({ ...q, holdWhile: stillHere });
+      },
+      reset: (p) =>
+        host.invoke("branch:resetToUpstream", { root, fullName: b.fullName, from: p.from!, to: p.to! }),
+    }).finally(() => {
+      itemEl?.classList.remove("is-busy-item");
+      g?.classList.remove("spin");
+      closeMenu();
+    });
+    switch (out.kind) {
+      case "refused":
+      case "failed":
+        toast(cleanErr(out.message) || out.message, out.tone);
+        return;
+      case "nothing":
+        toast(out.message, "info");
+        // The fetch may still have moved the remote-tracking ref.
+        bust();
+        await this.refreshBranchesSoft();
+        return;
+      case "cancelled":
+        bust();
+        await this.refreshBranchesSoft();
+        return;
+      case "reset":
+        break;
+    }
+    await refresh();
+    const { plan, result } = out;
+    if (!result.was || !plan.to) {
+      toast(out.message, "success");
+      return;
+    }
+    const was = result.was;
+    const now = plan.to;
+    didUndoable(out.message, {
+      label: l10n.t("Put {0} back", bn),
+      undo: async () => {
+        const back = await host.invoke("branch:resetUndo", {
+          root,
+          fullName: b.fullName,
+          was,
+          now,
+          snapshot: result.snapshot,
+          current: !!result.current,
+        });
+        if (!back.ok) {
+          // Half of it may have happened (the branch is back, the changes
+          // could not be re-applied) — then the screen still has to show it.
+          if (back.changed) await refresh();
+          const why = back.message ?? l10n.t("Couldn't put {0} back.", bn);
+          return back.expected ? { info: why } : why;
+        }
+        return undefined;
+      },
+      after: refresh,
+    });
+  }
+
+  /** Fetch triggered from an open branch menu: spins the menu item in place
+   *  (the menu stays open) and live-refreshes every row's ↑/↓ counts — plus
+   *  the menu's own "Pull … into <branch>" label, so it never goes stale. */
+  private async fetchLiveInMenu(itemEl?: HTMLElement, b?: BranchInfo): Promise<void> {
+    const g = itemEl?.querySelector(".glyph");
+    itemEl?.classList.add("is-busy-item");
+    g?.classList.add("spin");
+    try {
+      const r = await host.invoke("sync:fetch", { prune: this.pruneOnFetchPref });
+      if (!r.ok) {
+        toast(r.message || l10n.t("Fetch failed."), "error");
+        return;
+      }
+      bust();
+      await this.updateSync();
+      await this.refreshBranchesSoft();
+      if (b) {
+        const fresh = (await gget("branches:list", undefined)).find(
+          (x) => x.fullName === b.fullName,
+        );
+        const pullLabel = itemEl
+          ?.closest(".dropdown")
+          ?.querySelector<HTMLElement>(".dropdown-item .codicon-arrow-down")
+          ?.parentElement?.querySelector(".dropdown-label");
+        if (fresh && pullLabel) {
+          pullLabel.textContent = fresh.current
+            ? (fresh.behind === 1 ? l10n.t("Pull {0} commit", fresh.behind) : l10n.t("Pull {0} commits", fresh.behind))
+            : fresh.behind
+              ? l10n.t("Pull {0} into {1}", fresh.behind, branchName(fresh))
+              : l10n.t("Pull latest into {0}", branchName(fresh));
+        }
+      }
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("Fetch failed."), "error");
+    } finally {
+      itemEl?.classList.remove("is-busy-item");
+      g?.classList.remove("spin");
+    }
+  }
+
+  /** Pull a branch live: the current branch does a real pull; any other local
+   *  fast-forwards straight from its upstream without a checkout. `btn` (the
+   *  row's ↓ pill) spins while the pull runs; rows then refresh in place. */
+  private async pullBranchLive(b: BranchInfo, btn?: HTMLButtonElement): Promise<void> {
+    const g = btn?.querySelector(".glyph");
+    const lbl = btn?.querySelector(".ab-lbl");
+    if (btn) {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.classList.add("busy");
+      g?.classList.remove("codicon-arrow-down");
+      g?.classList.add("codicon-sync", "spin");
+      if (lbl) lbl.textContent = l10n.t("Pulling…");
+    }
+    const bn = branchName(b);
+    try {
+      // The current branch is a real pull, so it can hit the divergence
+      // question — the same one the top bar's Pull asks, through the same
+      // helper. A branch you are NOT standing on fast-forwards or refuses —
+      // by its FULL name; there is nothing to reconcile without a worktree
+      // to reconcile it in.
+      const out = b.current
+        ? await this.pullAsking()
+        : {
+            result: await host.invoke("branch:pullFf", { fullName: b.fullName }),
+            cancelled: false,
+            mode: undefined,
+          };
+      const v = pullVerdict(out, l10n.t("Couldn't pull {0}.", bn));
+      if (v.kind !== "pulled") {
+        await this.settleUnpulled(v);
+        return;
+      }
+      toast(b.current ? v.message : l10n.t("Fast-forwarded {0}.", bn), "success");
+      bust();
+      await this.updateSync();
+      if (b.current) await this.refreshAll();
+      await this.refreshBranchesSoft();
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("Couldn't pull {0}.", bn), "error");
+    } finally {
+      // On success the live reload rebuilt the row (and this button); only a
+      // still-connected button — the failure path — needs restoring.
+      if (btn?.isConnected) {
+        btn.disabled = false;
+        btn.classList.remove("busy");
+        g?.classList.remove("codicon-sync", "spin");
+        g?.classList.add("codicon-arrow-down");
+        if (lbl) lbl.textContent = l10n.t("Pull {0}", b.behind);
+      }
+    }
+  }
+
+  /** The branch you are standing on, for a "you are still on X" sentence. */
+  private currentBranchName(): string | undefined {
+    const cur = this.refs.find((r) => r.type === "head" && r.isCurrent);
+    return cur ? branchName(cur) : undefined;
+  }
+
+  /** Whatever was showing the branch state, redrawn. Shared by every branch
+   *  mutation so they cannot drift into refreshing different things. */
+  private async refreshAfterBranchChange(): Promise<void> {
+    await this.refreshRefs();
+    await this.updateSync();
+    if (this.currentView === "branches") void this.showBranchesView();
+  }
+
+  /** New branch — from HEAD unless the caller says where. */
+  private newBranch(start?: BranchStart): void {
+    const head = this.refs.find((r) => r.type === "head" && r.isCurrent);
+    void createBranchFlow(
+      start ?? {
+        kind: "head",
+        label: head?.name ?? "HEAD",
+        sha: head?.sha?.slice(0, 7),
+        detached: !head,
+        current: head?.name,
+      },
+      { refs: this.refs, after: () => this.refreshAfterBranchChange() },
+    );
+  }
+
+  /**
+   * Rename a branch, then make the remote agree if it needs to.
+   *
+   * Deliberately NOT through the local `run()` helper: that toasts a literal
+   * "rename branch ✓" (which names nothing), refreshes even on failure, and
+   * would fire a second toast alongside the undo one below.
+   */
+  private async renameBranchFlow(b: BranchInfo): Promise<void> {
+    // The name under refs/heads/ — to show, to edit, and to rename back to.
+    // git's short "heads/release" (beside a tag "release") is none of those:
+    // `git branch -m heads/release …` finds no such branch.
+    const old = branchName(b);
+    const to = await promptInline(l10n.t("Rename {0}", old), "new-name", old, l10n.t("Rename"), false, {
+      hint: l10n.t("Only the local name changes — the commits, and the branch on the remote, stay where they are."),
+      validate: "refName",
+      extra: (v) =>
+        v !== old && this.refs.some((r) => r.fullName === `refs/heads/${v}`)
+          ? l10n.t("A branch called {0} already exists.", v)
+          : null,
+    });
+    if (!to || to === old) return;
+
+    const r = await host.invoke("branch:rename", { fullName: b.fullName, to });
+    if (!r.ok) {
+      toast(cleanErr(r.message) || l10n.t("Couldn't rename {0}.", old), r.expected ? "info" : "error");
+      return; // nothing changed — don't refresh as if it had
+    }
+
+    const fixed = await this.reconcileUpstreamAfterRename(b, to);
+    const back = { fullName: `refs/heads/${to}`, to: old };
+    const after = (): Promise<void> => this.refreshAfterBranchChange();
+    if (!fixed) {
+      didUndoable(l10n.t("Renamed {0} → {1}.", old, to), {
+        label: l10n.t("Rename {0} back to {1}", to, old),
+        undo: async () => {
+          const u = await host.invoke("branch:rename", back);
+          if (!u.ok) return cleanErr(u.message) || l10n.t("Couldn't rename {0} back.", to);
+          bust();
+          return undefined;
+        },
+        after,
+      });
+    } else if (fixed.done === "publish") {
+      didUndoable(l10n.t("Renamed {0} → {1}, and published it to {2}.", old, to, fixed.remote), {
+        // `${fixed.remote}/${to}` is deliberately left standing: creating a
+        // remote branch is not destructive, and deleting one other people may
+        // already have fetched is not an undo.
+        label: l10n.t("Rename {0} back to {1}", to, old),
+        undo: async () => {
+          const u = await host.invoke("branch:rename", back);
+          if (!u.ok) return cleanErr(u.message) || l10n.t("Couldn't rename {0} back.", to);
+          if (b.upstream) await host.invoke("branch:setUpstream", { fullName: b.fullName, upstream: b.upstream });
+          bust();
+          return undefined;
+        },
+        after,
+      });
+    } else {
+      didUndoable(l10n.t("Renamed {0} → {1}, on {2} too.", old, to, fixed.remote), {
+        label: l10n.t("Put {0} back", String(b.upstream)),
+        undo: async () => {
+          // The remote half is the destructive one and the only half that can
+          // refuse. Do it FIRST: the undo stack pops before running, so a
+          // half-done reversal gets no second try — better to fail having
+          // changed nothing than to leave the local rename undone against a
+          // remote that is still renamed.
+          if (fixed.was) {
+            const put = await host.invoke("branch:restoreRemote", {
+              remote: fixed.remote,
+              name: old,
+              sha: fixed.was,
+            });
+            if (!put.ok) return cleanErr(put.message) || l10n.t("Couldn't put {0} back.", String(b.upstream));
+          }
+          const u = await host.invoke("branch:rename", back);
+          if (!u.ok) return cleanErr(u.message) || l10n.t("Couldn't rename {0} back.", to);
+          // The rename took `${to}`'s tracking with it — the rename made the
+          // branch track `${fixed.remote}/${to}` — so renaming back left it
+          // tracking the new name. Point it at its own remote branch again,
+          // as the "publish" variant's undo does.
+          if (b.upstream) await host.invoke("branch:setUpstream", { fullName: b.fullName, upstream: b.upstream });
+          bust();
+          return undefined;
+        },
+        after,
+      });
+    }
+    await this.refreshAfterBranchChange();
+  }
+
+  /**
+   * A rename leaves a published branch tracking its OLD name on the remote.
+   *
+   * `git branch -m` keeps the tracking config on purpose — the branch on the
+   * server was not renamed — so the config still points at refs/heads/<old>.
+   * Everything downstream then quietly refers to the old branch: this row's
+   * ↑/↓ counts, the menu's Push, and for the current branch the top-bar push
+   * too. Renaming and then pushing "into the new branch" is the obvious thing
+   * to want, and it silently did not happen.
+   *
+   * Git cannot decide this for us — tracking a differently-named branch is
+   * legal and sometimes deliberate — so ask, common intent first. Only fires
+   * when the upstream actually named the OLD branch.
+   */
+  private async reconcileUpstreamAfterRename(
+    b: BranchInfo,
+    to: string,
+  ): Promise<{ done: "rename" | "publish"; remote: string; was?: string } | null> {
+    // Split from the upstream's FULL name (upstreamParts), not the short one
+    // ("remotes/origin/x" beside a local branch "origin/x").
+    const parts = upstreamParts(b);
+    if (!parts) return null; // unpublished, or tracking a local branch
+    // Against the name under refs/heads/: "origin/release" never equals the
+    // short "heads/release", so a branch beside a tag of its name was never
+    // offered the remote rename.
+    const old = branchName(b);
+    if (parts.branch !== old) return null; // deliberately tracking something else
+    return this.reconcileUpstream(to, `${parts.remote}/${parts.branch}`, old);
+  }
+
+  /** Offer to make the remote agree with `local`, which tracks `upstream`
+   *  under the name `onRemote`. */
+  private async reconcileUpstream(
+    local: string,
+    upstream: string,
+    onRemote: string,
+  ): Promise<{ done: "rename" | "publish"; remote: string; was?: string } | null> {
+    const remote = upstream.slice(0, upstream.indexOf("/"));
+    const ways = [
+      {
+        id: "rename",
+        label: l10n.t("Rename on {0}", remote),
+        sub: l10n.t("Push {0}, track it, and delete {1}.", local, upstream),
+        icon: "cloud-upload",
+      },
+      {
+        id: "publish",
+        label: l10n.t("Publish {0}, keep {1}", local, onRemote),
+        sub: l10n.t("Push {0} and track it, but leave {1} where it is.", local, upstream),
+        icon: "repo-forked",
+      },
+      {
+        id: "keep",
+        label: l10n.t("Keep tracking {0}", upstream),
+        sub: l10n.t("Git's default. The new name stays local-only."),
+        icon: "link",
+      },
+    ];
+    // The gate for the destructive half below: a modal the user must choose in,
+    // which absorbs a second click exactly as a confirm dialog does.
+    const choice = await promptChoice({
+      title: l10n.t("Rename {0} on {1} too?", onRemote, remote),
+      hint: l10n.t("{0} still tracks {1} — renaming it here doesn't rename it on the remote.", local, upstream),
+      choices: ways,
+      cancelId: "keep",
+      holdWhile: this.whileThisRepo(), // asked right after a ref moved — see promptChoice
+    });
+    if (choice === "keep") return null;
+
+    const pushed = await host.invoke("branch:publish", { name: local, remote });
+    if (!pushed.ok) {
+      const why = pushed.message ? ` — ${cleanErr(pushed.message)}` : "";
+      toast(
+        l10n.t("Renamed to {0}, but publishing it to {1} failed{2}. It still tracks {3}.", local, remote, why, upstream),
+        pushed.expected ? "info" : "error",
+      );
+      return null; // the rename stands, and stays undoable
+    }
+    if (choice === "publish") return { done: "publish", remote };
+
+    // The destructive half. A failure here is reported and never undoes the push.
+    const gone = await host.invoke("branch:deleteRemote", { remote, name: onRemote });
+    if (!gone.ok) {
+      toast(
+        l10n.t(
+          "{0} is published and tracked, but {1} couldn't be deleted{2}.",
+          local,
+          upstream,
+          gone.message ? ` — ${cleanErr(gone.message)}` : "",
+        ),
+        gone.expected ? "info" : "error",
+      );
+      return { done: "publish", remote }; // the half that worked is the half we can undo
+    }
+    return { done: "rename", remote, was: gone.was };
+  }
+
+  private async deleteBranch(b: BranchInfo): Promise<void> {
+    // Deleted by FULL name; named — and restored — by the name under
+    // refs/heads/. The short "heads/x" (beside a tag "x") names no branch to
+    // delete, and restored as a branch literally called "heads/x".
+    const name = branchName(b);
+    // Another worktree has it checked out: git refuses the delete. Say where
+    // BEFORE asking — the bridge refuses it too, in the same words, should
+    // this list be stale.
+    const worktreeList = await host.invoke("worktree:list", undefined).catch((): WorktreeInfo[] => []);
+    const holder = worktreeList.find((w) => !w.current && !w.bare && w.branch === name);
+    if (holder) {
+      toast(checkedOutElsewhereMessage(name, holder.shownPath ?? holder.path, "delete", !!(holder.missing || holder.prunable)), "info");
+      return;
+    }
+    // Confirm FIRST. This sits a few pixels from Checkout in a hover-revealed
+    // row cluster, and every other destructive action in the app asks before
+    // acting — deleting a branch outright was the one that did not. The
+    // force-delete prompt below is a different question (it only fires for an
+    // unmerged branch) and is not a substitute for this one.
+    const ok = await confirmDialog({
+      title: l10n.t("Delete branch"),
+      // Still worth asking — this removes a ref you meant to keep — but the
+      // second sentence now says what actually happens next.
+      message: l10n.t(
+        "Delete '{0}'? Commits that are only on this branch stop being reachable by name. You can undo this straight afterwards.",
+        name,
+      ),
+      confirmLabel: l10n.t("Delete branch"),
+      danger: true,
+    });
+    if (!ok) {
+      return;
+    }
+    let r = await host.invoke("branch:delete", { fullName: b.fullName });
+    // `notMerged` is main's answer, read from git's history rather than its
+    // words — a git speaking another language never matched the English.
+    if (!r.ok && (r.notMerged || (r.message && /not fully merged/i.test(r.message)))) {
+      const force = await confirmDialog({
+        title: l10n.t("Force-delete branch?"),
+        message: l10n.t("'{0}' isn't fully merged. Force-deleting may discard unmerged commits.", name),
+        confirmLabel: l10n.t("Force delete"),
+        danger: true,
+      });
+      if (!force) return;
+      r = await host.invoke("branch:delete", { fullName: b.fullName, force: true });
+    }
+    if (!r.ok) {
+      // `expected`: the person's state (another worktree has it checked out),
+      // said in words — not a failure.
+      toast(r.message || l10n.t("Couldn't delete branch '{0}'.", name), r.expected ? "info" : "error");
+      return; // branch still exists — don't refresh as if it were gone
+    }
+    // A branch is a name and a commit, so putting one back is genuinely
+    // possible — and the confirm above is exactly the moment people say yes
+    // and then realise. `was` is missing only if the tip could not be read,
+    // and no undo is offered then rather than a broken one.
+    const restore = r.was;
+    const upstream = r.upstream;
+    if (restore) {
+      didUndoable(l10n.t("Deleted {0}.", name), {
+        label: l10n.t("Restore {0}", name),
+        undo: async () => {
+          // in-the-way-reviewed: a restore never switches, so it changes no
+          // file and is never refused over uncommitted work.
+          const back = await host.invoke("branch:create", {
+            name,
+            startPoint: restore,
+            upstream,
+          });
+          if (!back.ok) return back.message ?? l10n.t("Couldn't restore {0}.", name);
+          bust();
+          return undefined;
+        },
+        after: async () => {
+          await this.refreshRefs();
+          if (this.currentView === "branches") void this.showBranchesView();
+        },
+      });
+    } else {
+      toast(l10n.t("Deleted {0}.", name), "success");
+    }
+    // The peek this was very likely launched from is ABOUT the branch that no
+    // longer exists. Leaving it open left a card offering Checkout, Merge,
+    // Rename and Push on a ref git would refuse — and a second Delete on
+    // nothing. A mutation that invalidates a card's subject closes the card;
+    // the stash peek already works this way.
+    closePeek();
+    bust();
+    await this.refreshRefs();
+    if (this.currentView === "branches") void this.showBranchesView();
+  }
+
+  /**
+   * Check out a ref by its FULL name, then refresh refs + the view.
+   *
+   * The namespace is not decoration: it decides what checking out MEANS. A
+   * local head attaches by name; a remote branch has to create a local
+   * tracking branch (issues #12/#19); a tag genuinely detaches. Sending a name
+   * down the plain `checkout` action instead runs `git checkout origin/foo`,
+   * which detaches HEAD onto the remote-tracking ref — no branch, no upstream,
+   * and the next commit lands where nothing points at it, under a toast
+   * saying "Checked out foo."
+   *
+   * And it is the FULL name (issue #30's follow-up), never `%(refname:short)`:
+   * with a tag of the same name the branch "release" is "heads/release", and
+   * `git checkout heads/release` detached HEAD here too. The request is built
+   * by refCheckoutRequest, the one builder every door uses.
+   */
+  private async checkoutRef(fullName: string, btn?: HTMLElement): Promise<void> {
+    const ref = refDisplay(fullName);
+    // Checking out is the slowest thing this list does — it rewrites the working
+    // tree — and it used to show nothing at all while it ran, so the row looked
+    // like it had ignored the click.
+    const b = btn as HTMLButtonElement | undefined;
+    if (b?.disabled) return;
+    const label = b?.textContent ?? "";
+    if (b) {
+      b.disabled = true;
+      b.classList.add("is-busy");
+      b.textContent = l10n.t("Checking out…");
+    }
+    const restore = (): void => {
+      if (!b || !b.isConnected) return;
+      b.disabled = false;
+      b.classList.remove("is-busy");
+      b.textContent = label;
+    };
+    let result;
+    try {
+      result = await host.invoke("commit:action", refCheckoutRequest(fullName));
+    } catch (e) {
+      restore();
+      toast(cleanErr(e) || l10n.t("Couldn't check out."), "error");
+      return;
+    }
+    restore();
+    // Uncommitted changes in the switch's way were asked about (Stash & Retry
+    // or Cancel — bridge.ts), and the user cancelled: nothing ran.
+    if (result?.cancelled) return;
+    // On failure HEAD didn't move — surface the reason and DON'T refresh as if
+    // it succeeded (which made the UI look like the branch was checked out
+    // when it wasn't). A refusal that is the user's state (`expected`) is said
+    // in the neutral tone.
+    //
+    // `result` is typed non-nullable but arrives over IPC: a channel that
+    // failed to register, or a main-process throw, hands back undefined, and
+    // reading `.ok` off it threw inside an async handler — no toast, no error,
+    // the click simply did nothing.
+    if (!result?.ok) {
+      // A branch named like an option: say why, and offer the rename.
+      if (explainRefusedCheckout(result, () => this.refreshAfterBranchChange())) return;
+      toast(result?.message || l10n.t("Couldn't check out."), result?.expected ? "info" : "error");
+      return;
+    }
+    toast(l10n.t("Checked out {0}.", ref), "success");
+    bust(); // checkout moves HEAD: refs/branches/status/graph/tree all change
+    await this.refreshRefs();
+    if (this.currentView === "branches") {
+      void this.showBranchesView();
+    }
+  }
+
+  // ── Compare view (base…head, GitHub-style: commits | files master/detail) ────
+
+  private async showCompareView(): Promise<void> {
+    const gen = this.routeGen;
+    await this.refreshRefs();
+    const current = this.refs.find((r) => r.type === "head" && r.isCurrent)?.name;
+    this.compareHead = this.compareHead ?? current ?? "HEAD";
+    // The base must never default to the ref we're already comparing FROM.
+    // It used to fall back to "main" unconditionally, so standing on main —
+    // the common case — opened this view on main…main and rendered an error
+    // the user could do nothing about.
+    const head = this.compareHead;
+    const heads = this.refs.filter((r) => r.type === "head");
+    this.compareBase =
+      this.compareBase ??
+      heads.find((r) => (r.name === "main" || r.name === "master") && r.name !== head)?.name ??
+      heads.find((r) => !r.isCurrent && r.name !== head)?.name ??
+      // …and past the local branches. A fresh clone has ONE local head, and
+      // stopping here left the view announcing that the repository has nothing
+      // to compare against while the picker eight pixels above it listed every
+      // remote-tracking branch and tag in the repo. The upstream is the base
+      // anyone actually wants there.
+      this.refs.find((r) => r.type === "remote" && r.name.endsWith(`/${head}`))?.name ??
+      this.refs.find((r) => r.type === "remote" && !isRemoteHead(r))?.name;
+
+    const wrap = el("div", "compare-view");
+
+    /** A side as the view names it in words: a commit (Compare these two
+     *  commits, issue #32) by its short sha — as its picker does — a ref by
+     *  its name. Forty hex characters in a sentence named the same commit two
+     *  ways, one line under the other. */
+    const sideLabel = (ref: string | undefined): string =>
+      ref && this.compareCommits.has(ref) ? ref.slice(0, 7) : (ref ?? "");
+    /** Either side is a commit, not a ref: a pull request needs two branches. */
+    const comparingCommits = (): boolean =>
+      [this.compareBase, this.compareHead].some((r) => !!r && this.compareCommits.has(r));
+
+    // ── Toolbar: base ⇄ compare pickers + the dot-mode toggle. ────────────────
+    const bar = el("div", "compare-bar");
+    const baseBtn = el("button", "ref-pick");
+    const headBtn = el("button", "ref-pick");
+    const setLabel = (btn: HTMLElement, ref: string): void => {
+      // A commit (Compare these two commits, issue #32) reads as one: its
+      // short sha with the commit glyph, the full one on hover.
+      const commit = this.compareCommits.has(ref);
+      btn.replaceChildren(glyph(commit ? "git-commit" : "git-branch"), span(commit ? ref.slice(0, 7) : ref), glyph("chevron-down"));
+      if (commit) btn.title = ref;
+      else btn.removeAttribute("title");
+    };
+    // With no second ref in the repo the picker says so rather than naming a
+    // ref that would compare against itself.
+    setLabel(baseBtn, this.compareBase ?? l10n.t("Choose a base…"));
+    setLabel(headBtn, this.compareHead);
+    baseBtn.addEventListener("click", () =>
+      this.pickRef(baseBtn, (r) => {
+        this.compareBase = r;
+        setLabel(baseBtn, r);
+        void runCompare();
+      }),
+    );
+    headBtn.addEventListener("click", () =>
+      this.pickRef(headBtn, (r) => {
+        this.compareHead = r;
+        setLabel(headBtn, r);
+        void runCompare();
+      }),
+    );
+    const baseLbl = el("span", "compare-lbl");
+    baseLbl.textContent = l10n.t("base");
+    const headLbl = el("span", "compare-lbl");
+    headLbl.textContent = l10n.t("compare");
+    // Was a bare `topbar-icon` glyph with no border or fill, wedged between two
+    // bordered ref pickers — it read as a decorative separator, like the tiny
+    // BASE/COMPARE labels around it. And `git-compare` is the view's own icon,
+    // not "swap"; the two-way arrow says what the button does.
+    const swap = el("button", "mini-btn gh-icon-btn cmp-swap");
+    swap.title = l10n.t("Swap base and compare");
+    swap.setAttribute("aria-label", l10n.t("Swap base and compare"));
+    swap.appendChild(glyph("arrow-swap"));
+    swap.addEventListener("click", () => {
+      // Both sides, or neither. With only one local branch there is no base to
+      // start with, and this exchanged `undefined` into the HEAD slot: the
+      // picker rendered an icon, a chevron and an EMPTY label, and the
+      // comparison ran against nothing.
+      if (!this.compareBase || !this.compareHead) return;
+      [this.compareBase, this.compareHead] = [this.compareHead, this.compareBase];
+      setLabel(baseBtn, this.compareBase);
+      setLabel(headBtn, this.compareHead);
+      void runCompare();
+    });
+    /** Swap needs two sides to exchange. */
+    const syncSwap = (): void => {
+      const ok = !!this.compareBase && !!this.compareHead;
+      (swap as HTMLButtonElement).disabled = !ok;
+      swap.title = ok ? l10n.t("Swap base and compare") : l10n.t("Pick a base first");
+      swap.setAttribute("aria-label", swap.title);
+    };
+    const modeWrap = el("div", "cmp-mode");
+    const dot3 = el("button", "cmp-mode-btn");
+    /** "What this branch adds" — or, when the compare side is a commit, what
+     *  THAT commit adds: its short sha, so the words stay right after a swap. */
+    const syncModeLabel = (): void => {
+      const head = this.compareHead;
+      dot3.textContent = head && this.compareCommits.has(head) ? l10n.t("What {0} adds", sideLabel(head)) : l10n.t("What this branch adds");
+    };
+    syncModeLabel();
+    dot3.title = l10n.t("Three-dot (base...compare): changes introduced since the common ancestor — GitHub's default");
+    const dot2 = el("button", "cmp-mode-btn");
+    dot2.textContent = l10n.t("Everything different");
+    dot2.title = l10n.t("Two-dot (base..compare): every difference between the two branch tips");
+    const syncMode = (): void => {
+      dot3.classList.toggle("active", this.compareMode === "three-dot");
+      dot2.classList.toggle("active", this.compareMode === "two-dot");
+    };
+    dot3.addEventListener("click", () => {
+      this.compareMode = "three-dot";
+      syncMode();
+      void runCompare();
+    });
+    dot2.addEventListener("click", () => {
+      this.compareMode = "two-dot";
+      syncMode();
+      void runCompare();
+    });
+    modeWrap.append(dot2, dot3);
+    // ✨ AI: explain or review what this comparison changes — opens a footer chat
+    // tab the user can keep talking to. The agent runs the diff itself.
+    const aiWrap = el("div", "cmp-ai");
+    aiWrap.hidden = true;
+    const nav = (v: string): void => this.routeView(v);
+    aiWrap.append(
+      aiChip(
+        l10n.t("Explain"),
+        () => {
+          const b = this.compareBase, h = this.compareHead;
+          openAssistantTab({
+            title: l10n.t("Explain {0}…{1}", sideLabel(b), sideLabel(h)),
+            goal: `Explain what changes between \`${b}\` and \`${h}\`. Run \`git diff ${b}..${h}\` to see the changes, then give a clear, structured summary of what changed and why it matters.`,
+            nav,
+          });
+        },
+        "comment",
+      ),
+      aiChip(
+        l10n.t("Review"),
+        () => {
+          const b = this.compareBase, h = this.compareHead;
+          openAssistantTab({
+            title: l10n.t("Review {0}…{1}", sideLabel(b), sideLabel(h)),
+            goal: `Review the changes between \`${b}\` and \`${h}\` for correctness bugs, security issues and risky changes. Run \`git diff ${b}..${h}\` to see them. Be specific and cite files.`,
+            nav,
+          });
+        },
+        "search",
+      ),
+    );
+    void aiEnabled().then((ok) => (aiWrap.hidden = !ok));
+    bar.append(baseLbl, baseBtn, swap, headLbl, headBtn, modeWrap);
+    syncMode();
+
+    // ── View toggle: Commits | Changed files, with live counts + a summary. ───
+    const viewBar = el("div", "cmp-viewbar");
+    const seg = el("div", "cmp-seg");
+    const commitsTab = el("button", "cmp-seg-btn");
+    commitsTab.append(glyph("git-commit"), span(l10n.t("Commits")));
+    const commitsCount = el("span", "cmp-seg-count");
+    commitsTab.appendChild(commitsCount);
+    const filesTab = el("button", "cmp-seg-btn");
+    filesTab.append(glyph("file"), span(l10n.t("Changed files")));
+    const filesCount = el("span", "cmp-seg-count");
+    filesTab.appendChild(filesCount);
+    seg.append(commitsTab, filesTab);
+    markSegment(seg, l10n.t("Comparison view"), ".cmp-seg-btn");
+    const summary = el("div", "cmp-summary");
+    // The one action GitHub makes PRIMARY on a comparison was missing entirely:
+    // you could line up base…head, read every commit and file — and then had
+    // to rebuild the same comparison on github.com to open the PR. The button
+    // carries this exact base/head into the create form.
+    const prBtn = el("button", "mini-btn cmp-pr-btn") as HTMLButtonElement;
+    prBtn.append(glyph("git-pull-request"), span(l10n.t("Create pull request")));
+    prBtn.title = l10n.t("Open a pull request from this comparison");
+    prBtn.hidden = true;
+    /** Whether GitHub could take a pull request at all — the swr answer, kept.
+     *
+     *  It used to be applied straight to `prBtn.hidden`, and the base===head
+     *  path then hid the button on its own. Nothing ever un-hid it: the swr
+     *  callback had already delivered its cached answer and never fires again,
+     *  and the success path never touched the button. So picking your own
+     *  current branch as the base once removed "Create pull request" for the
+     *  rest of the session — the view's whole purpose, gone, with no way back
+     *  short of a reload. */
+    let canPr = false;
+    /** The conditions, kept apart and re-asserted on every exit. Two
+     *  COMMITS are not a pull request's base and head: openCreatePr resolves
+     *  those against branch names, found neither sha, and opened a form for
+     *  the default branch and some other branch — nothing on this screen. */
+    const syncPrBtn = (): void => {
+      prBtn.hidden = !(canPr && !!this.compareBase && this.compareBase !== this.compareHead && !comparingCommits());
+    };
+    prBtn.addEventListener("click", () =>
+      void openCreatePr(() => this.routeView("prs", true), {
+        base: this.compareBase,
+        head: this.compareHead,
+      }),
+    );
+    // Through the cache, not a fresh round trip on every route. Whether you are
+    // signed in to GitHub cannot change between two clicks in the same app, and
+    // asking again each time was one of two calls that fired on EVERY entry to
+    // Compare and Changes — latency spent to re-learn something we already knew.
+    swr("github:status", undefined, {
+      // Signing in or out busts the cache explicitly, so a minute of staleness
+      // costs nothing and saves a round trip on every single route.
+      ttl: 60_000,
+      alive: () => prBtn.isConnected,
+      onData: (s) => {
+        canPr = s.connected && !!s.repo;
+        syncPrBtn();
+      },
+    });
+    // The Explain / Review actions live on the right of the results row — they act
+    // on the comparison's diff, so they belong with the results, not the pickers.
+    viewBar.append(seg, summary, prBtn, aiWrap);
+
+    const body = el("div", "cmp-body");
+    wrap.append(bar, viewBar, body);
+    this.viewHost.replaceChildren(wrap);
+
+    let last: CompareResult | undefined;
+    const renderBody = (): void => {
+      commitsTab.classList.toggle("active", this.compareView === "commits");
+      filesTab.classList.toggle("active", this.compareView === "files");
+      if (this.compareView === "commits") {
+        this.renderCompareCommits(body, last);
+      } else {
+        this.renderCompareFiles(body, last);
+      }
+    };
+    commitsTab.addEventListener("click", () => {
+      this.compareView = "commits";
+      this.persist();
+      renderBody();
+    });
+    filesTab.addEventListener("click", () => {
+      this.compareView = "files";
+      this.persist();
+      renderBody();
+    });
+
+    const runCompare = async (): Promise<void> => {
+      // "Comparing main … feature" belongs on a comparison you have not seen.
+      // Re-entering Compare on the SAME two refs used to blank the result and
+      // re-run the whole comparison, so returning to a screen you had just left
+      // cost a git round trip and a flash of a loading card — for an answer that
+      // was already on the page a second earlier.
+      const cmpKey =
+        this.compareBase && this.compareHead
+          ? { base: this.compareBase, head: this.compareHead, mode: this.compareMode }
+          : undefined;
+      if (!cmpKey || peek("compare:refs", cmpKey) === undefined) {
+        body.replaceChildren(loadingState(l10n.t("Comparing {0} … {1}", sideLabel(this.compareBase), sideLabel(this.compareHead))));
+      }
+      // The previous comparison's answer is no longer an answer to anything.
+      // `last` was only reassigned on the success path, so the early return
+      // below left it holding the PRIOR result — and the Commits/Changed-files
+      // panes went on rendering those commits and files as though they were the
+      // comparison now on screen, for refs that were never compared.
+      last = undefined;
+      // …and so are the numbers derived from it. `last` was nulled because the
+      // previous comparison's answer is no longer an answer to anything — but
+      // only the body honoured that. The summary and both tab badges went on
+      // showing the previous comparison's counts while a new one loaded, so
+      // "Comparing A … B" sat directly under "12 commits · 9 files" describing
+      // an entirely different pair of refs.
+      summary.textContent = "";
+      commitsCount.textContent = "";
+      filesCount.textContent = "";
+      syncPrBtn();
+      syncSwap();
+      syncModeLabel();
+      // Nothing to compare yet (a single-branch repo, or base === head):
+      // prompt for a second ref instead of running a doomed comparison.
+      if (!this.compareBase || this.compareBase === this.compareHead) {
+        summary.textContent = "";
+        commitsCount.textContent = "";
+        filesCount.textContent = "";
+        // …and you cannot open a pull request from a branch to itself. Through
+        // `syncPrBtn`, which owns BOTH conditions — a bare `hidden = true` here
+        // is what made this state permanent.
+        syncPrBtn();
+        body.replaceChildren(
+          emptyState(
+            l10n.t("Pick two refs to compare"),
+            this.compareBase
+              ? l10n.t("Base and compare are both {0}. Choose a different ref on either side.", sideLabel(this.compareHead))
+              : l10n.t("This repository has only one branch. Compare needs a second ref — create or fetch one first."),
+            { icon: "git-compare" },
+          ),
+        );
+        return;
+      }
+      // Through the cache: comparing the same two refs twice should not re-run
+      // the comparison. Any mutation that could change the answer already calls
+      // bust(), so this cannot go stale behind the user's back.
+      const res = await gget(
+        "compare:refs",
+        { base: this.compareBase, head: this.compareHead!, mode: this.compareMode },
+        15_000,
+      );
+      last = res ?? undefined;
+      if (!res) {
+        summary.textContent = "";
+        commitsCount.textContent = "";
+        filesCount.textContent = "";
+        body.replaceChildren(
+          errorState(
+            l10n.t("Couldn't compare these refs"),
+            l10n.t("Make sure {0} and {1} both exist.", sideLabel(this.compareBase), sideLabel(this.compareHead)),
+            () => void runCompare(),
+          ),
+        );
+        return;
+      }
+      // The COUNT is the real one; the LIST may be the first page of it. Showing
+      // `commits.length` made a 400-commit cap read as a fact, printed beside a
+      // `behind` that genuinely was one.
+      const n = res.ahead ?? res.commits.length;
+      const m = res.files.length;
+      commitsCount.textContent = String(n);
+      filesCount.textContent = String(m);
+      summary.textContent =
+        n === 0 && m === 0
+          ? `${sideLabel(this.compareHead)} is up to date with ${sideLabel(this.compareBase)}.`
+          : `${n} commit${n === 1 ? "" : "s"} · ${m} file${m === 1 ? "" : "s"} changed` +
+            // "redesign/issues-detail is 2 ahead" made the reader work out
+            // whose commits those were; say it straight.
+            (res.behind > 0
+              ? ` · ${res.behind} commit${res.behind === 1 ? "" : "s"} only on ${sideLabel(this.compareBase)}`
+              : "");
+      renderBody();
+    };
+    void runCompare();
+
+    // refreshAll's door. It used to routeView(force) this view like any other,
+    // and a comparison of two REFS is rebuilt from scratch by things that
+    // cannot change it: a save in your editor, ⌘R, `git status` in a terminal
+    // rewriting the index, a window focus after either. Every one closed the
+    // diff you were reading (issue #24, on this side of the product). Ask git
+    // again — the cache was just busted, so this is a real read — and if the
+    // answer is the one already on screen, leave the screen alone. Only a
+    // comparison that genuinely changed repaints, and `renderCompareFiles`
+    // then reopens the file you had open.
+    this.reloadCompare = async (): Promise<void> => {
+      if (gen !== this.routeGen) return;
+      // Nothing on screen to keep — an empty pair, an error, a comparison
+      // still loading. The full run already knows what to draw for each.
+      if (!last || !this.compareBase || this.compareBase === this.compareHead) {
+        await runCompare();
+        return;
+      }
+      const res = await gget(
+        "compare:refs",
+        { base: this.compareBase, head: this.compareHead!, mode: this.compareMode },
+        15_000,
+      );
+      if (gen !== this.routeGen) return;
+      if (res && JSON.stringify(res) === JSON.stringify(last)) return;
+      // The fresh answer is cached now, so runCompare paints it straight from
+      // the cache — no loading card in between.
+      await runCompare();
+    };
+  }
+
+  /** Commits-only view: the commits `compare` adds over `base`. */
+  private renderCompareCommits(body: HTMLElement, res: CompareResult | undefined): void {
+    body.replaceChildren();
+    // A capped list has to say it is capped, or the rows read as the whole set.
+    const capNote = (): void => {
+      if (!res?.commitsTruncated) return;
+      const note = el("div", "list-cap-note");
+      // NOT "the first": the list reads oldest-first, but the cap keeps the
+      // NEWEST N — so "first" named the wrong end of the range it dropped.
+      note.textContent = `Showing ${res.commits.length} of ${res.ahead} commits — the most recent.`;
+      body.appendChild(note);
+    };
+    if (!res || !res.commits.length) {
+      body.appendChild(
+        emptyState(l10n.t("No commits"), l10n.t("These refs share the same history in this direction."), {
+          icon: "git-commit",
+        }),
+      );
+      return;
+    }
+    // The SAME list the pull request's Commits tab draws. Both surfaces built
+    // their own rows out of the same five fields and had drifted apart: this
+    // one still announced "reveal in the graph" to assistive tech long after
+    // the click had been changed to open the commit page.
+    body.appendChild(
+      commitList(
+        res.commits.map((c) => ({
+          sha: c.sha,
+          shortSha: c.shortSha,
+          subject: c.subject,
+          body: c.body,
+          author: c.author,
+          date: c.date,
+          isMerge: c.isMerge,
+        })),
+        {
+          onOpen: (sha) => this.routeView("commit", false, { sha }),
+          onCopy: (sha) => void copyText(sha, l10n.t("Copied the full SHA.")),
+        },
+      ),
+    );
+    capNote();
+  }
+
+  /** Changed-files view: a GitHub-style master/detail — file list (left,
+   *  resizable + collapsible) and a native Monaco diff (right, inline/split). */
+  private renderCompareFiles(body: HTMLElement, res: CompareResult | undefined): void {
+    body.replaceChildren();
+    if (!res || !res.files.length) {
+      body.appendChild(
+        emptyState(l10n.t("No file changes"), l10n.t("Nothing differs between these refs in this direction."), {
+          icon: "git-compare",
+        }),
+      );
+      return;
+    }
+
+    const split = el("div", "cmp-split" + (this.compareFilesCollapsed ? " files-collapsed" : ""));
+    const left = el("div", "cmp-filelist");
+    left.style.flex = `0 0 ${this.compareFileListW}px`;
+    const lhead = el("div", "cmp-filelist-head");
+    const ltitle = el("span", "cmp-filelist-title");
+    ltitle.textContent = `${res.files.length} file${res.files.length === 1 ? "" : "s"}`;
+    const collapseBtn = el("button", "cmp-collapse");
+    collapseBtn.title = l10n.t("Hide file list");
+    collapseBtn.setAttribute("aria-label", l10n.t("Hide file list"));
+    collapseBtn.setAttribute("aria-expanded", "true");
+    collapseBtn.appendChild(glyph("chevron-left"));
+    lhead.append(ltitle, collapseBtn);
+    const fileScroll = el("div", "cmp-file-scroll");
+    left.append(lhead, fileScroll);
+
+    const divider = el("div", "cmp-vsplit");
+    divider.appendChild(el("div", "cmp-vsplit-grip"));
+
+    const right = el("div", "cmp-diffpane");
+    const restore = el("button", "cmp-restore");
+    restore.title = l10n.t("Show file list");
+    restore.setAttribute("aria-label", l10n.t("Show file list"));
+    restore.appendChild(glyph("chevron-right"));
+
+    split.append(left, divider, right, restore);
+    body.appendChild(split);
+
+    // Release the previous surface BEFORE taking its handle. Overwriting the
+    // handle orphaned a live Monaco editor — its models, its DOM and its
+    // listeners all still attached, with nothing left holding a reference to
+    // dispose them. Every rebuild of this pane leaked one. Every other
+    // assignment site already does this.
+    this.activeMonacoView?.dispose();
+    // The SAME panel every other diff surface uses — which is where the
+    // Inline/Split toggle lives. Compare had its own class (`CompareDiff`), so
+    // it had no toggle at all: "on the compare its missing the switch to toggle
+    // inline vs split view". Monaco's own width-driven
+    // `useInlineViewWhenSpaceIsLimited` was deciding for you, invisibly, and
+    // the segmented control already in Compare's header is the two-dot /
+    // three-dot RANGE toggle — so the switch looked present and was the wrong
+    // one.
+    const diff = new DiffPanel(right);
+    this.activeMonacoView = diff;
+    diff.showEmpty(l10n.t("Select a changed file to view its diff."));
+
+    let activeRow: HTMLElement | undefined;
+    const open = (path: string, row: HTMLElement, oldPath?: string): void => {
+      if (activeRow) activeRow.classList.remove("active");
+      activeRow = row;
+      row.classList.add("active");
+      void this.openCompareFile(diff, path, oldPath);
+    };
+
+    // Reopen the file that was open, when the comparison still has it; the
+    // first file is for a comparison you have not looked at yet. Everything
+    // below rebuilds the list from scratch — which is what closed the diff
+    // you were reading on every refresh that reached this far.
+    const reopen = res.files.some((f) => f.path === this.compareOpenPath)
+      ? this.compareOpenPath
+      : res.files[0]?.path;
+    res.files.forEach((f) => {
+      // Same two-line treatment the Changes list uses: the FILE NAME, then its
+      // directory. One path printed whole in a 370px column truncated from the
+      // right, which ate the only part that tells two files apart
+      // ("apps/desktop/src/renderer/diffPan…").
+      const row = el("button", `file-row dc-file status-${f.status}`);
+      const st = el("span", "file-status");
+      st.textContent = f.status;
+      const cut = f.path.lastIndexOf("/");
+      const meta = el("div", "dc-file-meta");
+      meta.appendChild(span(cut < 0 ? f.path : f.path.slice(cut + 1), "dc-file-name"));
+      if (cut > 0) meta.appendChild(span(f.path.slice(0, cut), "dc-file-dir"));
+      row.append(st, meta);
+      row.title = f.path;
+      // "The file you had open" is the one you CLICKED. The auto-opened first
+      // file used to be recorded too, so glancing at any comparison made its
+      // first file the one to reopen — and a later comparison of other refs
+      // that had that path (package.json, CHANGELOG.md) opened it instead of
+      // its own first file, with nothing on screen to say why.
+      row.addEventListener("click", () => {
+        this.compareOpenPath = f.path;
+        open(f.path, row, f.oldPath);
+      });
+      fileScroll.appendChild(row);
+      if (f.path === reopen) open(f.path, row, f.oldPath);
+    });
+
+    const setCollapsed = (c: boolean): void => {
+      this.compareFilesCollapsed = c;
+      split.classList.toggle("files-collapsed", c);
+      collapseBtn.setAttribute("aria-expanded", c ? "false" : "true");
+      requestAnimationFrame(() => diff.layout());
+    };
+    collapseBtn.addEventListener("click", () => setCollapsed(true));
+    restore.addEventListener("click", () => setCollapsed(false));
+    this.wireCompareResizer(divider, left, diff);
+  }
+
+  /** Drag the vertical divider to resize the file list; relayout the diff live. */
+  private wireCompareResizer(divider: HTMLElement, left: HTMLElement, diff: DiffPanel): void {
+    wireResizerKeys(divider, {
+      orientation: "vertical",
+      label: l10n.t("Resize file list"),
+      min: 180,
+      max: () => 580,
+      get: () => this.compareFileListW,
+      set: (w) => {
+        this.compareFileListW = w;
+        left.style.flex = `0 0 ${w}px`;
+        diff.layout();
+      },
+      onCommit: () => this.persist(),
+      disabled: () => this.compareFilesCollapsed,
+    });
+    divider.addEventListener("mousedown", (e: MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = left.getBoundingClientRect().width;
+      const onMove = (ev: MouseEvent): void => {
+        const w = Math.max(180, Math.min(580, startW + (ev.clientX - startX)));
+        this.compareFileListW = w;
+        left.style.flex = `0 0 ${w}px`;
+        diff.layout();
+      };
+      const onUp = (): void => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        document.body.classList.remove("resizing-h");
+        this.persist(); // remember the chosen file-list width
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      document.body.classList.add("resizing-h");
+    });
+  }
+
+  private async openCompareFile(diff: DiffPanel, path: string, oldPath?: string): Promise<void> {
+    // The same staleness guard openFile and openWorkingFile already use, and
+    // the only diff surface that was missing it. Click a big file then a small
+    // one and the big one's response lands last and paints over your actual
+    // selection — after which the file list and the pane disagree, and nothing
+    // short of picking a third file resolves it.
+    const gen = ++this.diffGen;
+    const fileDiff = await host.invoke("compare:fileDiff", {
+      base: this.compareBase!,
+      head: this.compareHead!,
+      path,
+      // A rename's base side lives under the OLD name.
+      leftPath: oldPath,
+      mode: this.compareMode,
+    });
+    if (gen !== this.diffGen) return;
+    if (fileDiff) {
+      // A file CAN legitimately have identical text on both sides — a mode
+      // change, or a rename with no edit — and `diff.show` says so itself.
+      diff.showDiff(fileDiff);
+      return;
+    }
+    // No answer is not the same as "no difference".
+    //
+    // `compareFileDiff` returns undefined only when there is no repository open
+    // or a ref failed its safety check — never because the two sides matched.
+    // Printing "These two refs have identical content for this file." asserted
+    // equality the app had no basis for, about a file that is in the changed
+    // list PRECISELY BECAUSE it differs. The same laundering of an absent
+    // answer into a reassuring one as "working tree clean" over uncommitted
+    // work, on a smaller surface.
+    diff.showEmpty(
+      l10n.t(
+        "{0} is listed as changed between these refs, so this is a failure to read it — not two sides that match.",
+        path,
+      ),
+      { title: l10n.t("Couldn't load this file's diff"), kind: "error" },
+    );
+  }
+
+  /** Open a branch/tag picker anchored to `anchor`; calls back with the ref name. */
+  private pickRef(anchor: HTMLElement, onPick: (ref: string) => void): void {
+    const items: MenuItem[] = [];
+    const add = (label: string, refs: RefInfo[], icon: string): void => {
+      if (!refs.length) return;
+      items.push({ separator: true, label });
+      for (const r of refs) {
+        items.push({ label: r.name, icon, onClick: () => onPick(r.name) });
+      }
+    };
+    add("Branches", this.refs.filter((r) => r.type === "head"), "git-branch");
+    add("Remotes", this.refs.filter((r) => r.type === "remote" && !isRemoteHead(r)), "cloud");
+    add("Tags", this.refs.filter((r) => r.type === "tag"), "tag");
+    if (items.length === 0) items.push({ label: l10n.t("No refs"), disabled: true });
+    openMenu(anchor, items);
+  }
+
+  // ── Settings view (appearance · account · git identity · SSH keys) ──────────
+
+  private async showSettingsView(): Promise<void> {
+    const wrap = el("div", "settings-view");
+    const head = el("div", "settings-head");
+    const h = el("div", "settings-title");
+    h.textContent = l10n.t("Settings");
+    head.appendChild(h);
+    const scroll = el("div", "settings-scroll");
+    scroll.append(
+      this.settingsAppearanceCard(),
+      this.settingsAccountCard(),
+      this.settingsRepositoriesCard(),
+      editorsCard(),
+      mergeSettingsCard(),
+      aiModelsCard(),
+      agentAccessCard(),
+      this.settingsIdentityCard(),
+      this.settingsGitCard(),
+      this.settingsSshCard(),
+      this.settingsAboutCard(),
+    );
+    wrap.append(head, scroll);
+    this.viewHost.replaceChildren(wrap);
+    // Settings is kept alive: a page restored from the cache is live again.
+    this.viewRevive.set(wrap, () => this.reviveAccountCard?.());
+  }
+
+  private settingsAppearanceCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("Appearance"), "gear");
+    const sub = el("div", "settings-sub");
+    sub.textContent = l10n.t("Choose how GitStudio looks. “System” follows your OS.");
+    const seg = el("div", "settings-seg");
+    const modes: Array<{ id: ThemeMode; label: string; icon: string }> = [
+      { id: "system", label: l10n.t("System"), icon: "device-desktop" },
+      { id: "light", label: l10n.t("Light"), icon: "color-mode" },
+      { id: "dark", label: l10n.t("Dark"), icon: "color-mode" },
+    ];
+    const btns: HTMLElement[] = [];
+    for (const m of modes) {
+      const b = el("button", "settings-seg-btn" + (this.themeMode === m.id ? " active" : ""));
+      b.append(span(m.label));
+      b.addEventListener("click", () => {
+        this.setThemeMode(m.id);
+        btns.forEach((x) => x.classList.toggle("active", x === b));
+        // The auto preview tracks the theme, so refresh it on a theme switch.
+        syncLogoPreview();
+      });
+      btns.push(b);
+      seg.appendChild(b);
+    }
+    markSegment(seg, "Theme");
+
+    // Dark style: the two dark looks, each shown as what it IS — its Dock
+    // tile beside a swatch of its window — and applying to both at once.
+    const styleLabel = el("div", "settings-field-label");
+    styleLabel.textContent = l10n.t("Dark style");
+    const styleSub = el("div", "settings-sub");
+    styleSub.textContent = l10n.t(
+      "The dark window and the Dock icon, together. Graphite matches the icon macOS shows while GitStudio is closed. With Neon the Dock icon turns neon while GitStudio runs; macOS still shows the Graphite icon while it is closed.",
+    );
+    const styleRow = el("div", "settings-style-row");
+    const styleInfo: Record<DarkStyle, { name: string; blurb: string }> = {
+      graphite: { name: "Graphite", blurb: l10n.t("Soft grey, the icon macOS shows") },
+      neon: { name: "Neon", blurb: l10n.t("Near-black, more violet") },
+    };
+    const styleBtns: HTMLElement[] = [];
+    for (const id of DARK_STYLES) {
+      const b = el("button", "settings-style-opt" + (this.darkStyle === id ? " active" : ""));
+      b.dataset.style = id;
+      const icon = el("img", "settings-style-icon") as HTMLImageElement;
+      icon.src = previewIconFor(id);
+      icon.alt = "";
+      // A few painted boxes in the style's own colours (app.css
+      // .settings-style-swatch[data-style]): the ground, the sidebar, a row,
+      // and a lit selected row — what the window will look like.
+      const swatch = el("div", "settings-style-swatch");
+      swatch.dataset.style = id;
+      swatch.setAttribute("aria-hidden", "true");
+      swatch.append(el("div", "sw-rail"), el("div", "sw-row sw-sel"), el("div", "sw-row"), el("div", "sw-row sw-short"));
+      const text = el("div", "settings-style-text");
+      const name = el("div", "settings-style-name");
+      name.textContent = styleInfo[id].name;
+      const blurb = el("div", "settings-style-blurb");
+      blurb.textContent = styleInfo[id].blurb;
+      text.append(name, blurb);
+      b.append(icon, swatch, text);
+      b.addEventListener("click", () => {
+        this.setDarkStyle(id);
+        styleBtns.forEach((x) => x.classList.toggle("active", x === b));
+        syncLogoPreview();
+      });
+      styleBtns.push(b);
+      styleRow.appendChild(b);
+    }
+    markSegment(styleRow, styleLabel);
+
+    // App icon: sits right next to the theme control, same card. "Auto" matches
+    // the theme; the others pin the dock mark regardless of the in-app theme.
+    const logoLabel = el("div", "settings-field-label");
+    logoLabel.textContent = l10n.t("App icon");
+    const logoSub = el("div", "settings-sub");
+    logoSub.textContent = l10n.t("Match the theme automatically, or pin the dock icon light or dark.");
+    const logoRow = el("div", "settings-logo-row");
+    const logoSeg = el("div", "settings-seg");
+    // A small live preview of the mark that will actually be shown on the dock.
+    const preview = el("img", "settings-logo-preview") as HTMLImageElement;
+    const syncLogoPreview = (): void => {
+      const light = this.dockVariant() === "light";
+      preview.src = light ? "./icon-light.png" : previewIconFor(this.darkStyle);
+      preview.alt = `Dock icon preview — the ${light ? "light" : "dark"} mark`;
+      preview.title = preview.alt;
+    };
+    const logoModes: Array<{ id: LogoMode; label: string }> = [
+      { id: "auto", label: l10n.t("Auto") },
+      { id: "light", label: l10n.t("Light") },
+      { id: "dark", label: l10n.t("Dark") },
+    ];
+    const logoBtns: HTMLElement[] = [];
+    for (const m of logoModes) {
+      const b = el("button", "settings-seg-btn" + (this.logoMode === m.id ? " active" : ""));
+      b.append(span(m.label));
+      b.addEventListener("click", () => {
+        this.setLogoMode(m.id);
+        logoBtns.forEach((x) => x.classList.toggle("active", x === b));
+        syncLogoPreview();
+      });
+      logoBtns.push(b);
+      logoSeg.appendChild(b);
+    }
+    markSegment(logoSeg, logoLabel);
+    syncLogoPreview();
+
+    // Author pictures. A lookup is a request to a third party that names the
+    // author, so it is the user's to turn off — and the words say exactly what
+    // is sent, and to whom (PRIVACY.md says the same).
+    const picRow = el("label", "settings-check settings-gravatar-row");
+    const picBox = document.createElement("input");
+    picBox.type = "checkbox";
+    picBox.checked = this.gravatarPref;
+    picBox.setAttribute("aria-label", l10n.t("Load author pictures from Gravatar"));
+    const picText = el("div", "settings-check-text");
+    const picTitle = el("div", "settings-check-title");
+    picTitle.textContent = l10n.t("Load author pictures from Gravatar");
+    const picSub = el("div", "settings-sub");
+    picSub.textContent = l10n.t(
+      "Sends an MD5 hash of each commit author's email address to gravatar.com (a GitHub noreply address is looked up on GitHub instead). Off, authors show as coloured initials and nothing is sent. Pictures on pull requests and issues come from GitHub and still show.",
+    );
+    picText.append(picTitle, picSub);
+    picRow.append(picBox, picText);
+    picBox.addEventListener("change", () => this.setGravatarPref(picBox.checked));
+
+    // Let a theme change from anywhere else — ⌘K, the menu, an OS flip — bring
+    // these controls up to date without rebuilding the page around them.
+    this.syncAppearanceCard = (): void => {
+      // NOT gated on `seg.isConnected`. Settings is a keep-alive view, so
+      // leaving it PARKS this card — detached, and re-attached verbatim on
+      // return. The guard that used to sit here unsubscribed the hook on the
+      // way out, so a theme changed from anywhere else while you were away
+      // left the card showing the old one for the rest of the session, with
+      // its highlight and its `aria-pressed` both stale.
+      //
+      // Nothing accumulates: this is a single slot, overwritten by the next
+      // build, so at most one closure is ever held. Same lesson the Assistant's
+      // `gs:ai-changed` listener carries — an `isConnected` guard on a
+      // keep-alive view fires on precisely the path that matters.
+      btns.forEach((b, i) => b.classList.toggle("active", modes[i].id === this.themeMode));
+      logoBtns.forEach((b, i) => b.classList.toggle("active", logoModes[i].id === this.logoMode));
+      styleBtns.forEach((b) => b.classList.toggle("active", b.dataset.style === this.darkStyle));
+      // `aria-pressed` too, not just the class. `markSegment` keeps it in step
+      // from a delegated CLICK listener, so a theme changed from anywhere else
+      // — ⌘K, the menu, an OS flip — moved the highlight while leaving the
+      // announced state on the button that is no longer chosen.
+      for (const b of [...btns, ...logoBtns, ...styleBtns]) {
+        b.setAttribute("aria-pressed", String(b.classList.contains("active")));
+      }
+      syncLogoPreview();
+      picBox.checked = this.gravatarPref;
+    };
+    // The preview trails the segment so the card's two segmented controls keep
+    // one left edge. What made it read as a fourth segment was its BORDER —
+    // a bordered, rounded box a hair from three bordered, rounded buttons —
+    // so it lost the border, gained a plinth, and stands off by --sp-4.
+    logoRow.append(logoSeg, preview);
+
+    body.append(sub, seg, styleLabel, styleSub, styleRow, logoLabel, logoSub, logoRow, picRow, ...this.settingsLanguageField());
+    return card;
+  }
+
+  /** Settings ▸ Appearance ▸ Language: a choice saved by main, applied at the next start. */
+  private settingsLanguageField(): HTMLElement[] {
+    const label = el("div", "settings-field-label");
+    label.textContent = l10n.t("Language");
+    const sub = el("div", "settings-sub");
+    sub.textContent = l10n.t("“System” follows your OS. Translations other than English are machine drafts; corrections are welcome on GitHub.");
+    const row = el("div", "settings-language-row");
+    const sel = document.createElement("select");
+    sel.className = "gh-form-select";
+    sel.setAttribute("aria-label", l10n.t("Language"));
+    const restart = el("button", "gh-btn");
+    restart.textContent = l10n.t("Restart to apply");
+    restart.hidden = true;
+    restart.addEventListener("click", () => void host.invoke("app:relaunch", undefined).catch(() => {}));
+    row.append(sel, restart);
+    void host
+      .invoke("language:get", undefined)
+      .then((view) => {
+        const name = (id: string): string => LANGUAGES.find((l) => l.id === id)?.name ?? id;
+        const options: Array<[LanguageSetting, string]> = [
+          ["system", l10n.t("System ({0})", name(view.active))],
+          ...LANGUAGES.filter((l) => view.available.includes(l.id)).map((l): [LanguageSetting, string] => [l.id, l.name]),
+        ];
+        for (const [id, text] of options) {
+          const o = document.createElement("option");
+          o.value = id;
+          o.textContent = text;
+          o.selected = id === view.setting;
+          sel.appendChild(o);
+        }
+        sel.addEventListener("change", () => {
+          // This run keeps the language it loaded; a different choice offers a restart.
+          void host.invoke("language:set", sel.value as LanguageSetting).then((next) => {
+            restart.hidden = next.setting === view.setting;
+          });
+        });
+      })
+      .catch(() => {});
+    return [label, sub, row];
+  }
+
+  /**
+   * The author-picture switch: applied to every surface at once, then saved.
+   * The graph, its details pane and its author card repaint themselves (they
+   * listen to graph/avatar.ts); a list drawn before the flip and parked since
+   * — Branches' people, the tags — is rebuilt on its next visit, in every tab.
+   */
+  private setGravatarPref(on: boolean): void {
+    this.gravatarPref = on;
+    setGravatarEnabled(on);
+    this.persist();
+    this.shell.dropEveryTabsKeptViews();
+  }
+
+  /** Fetch behavior (issue #23): whether fetch passes --prune. Default on —
+   *  stale remote-tracking branches silently pile up otherwise, and pruning
+   *  only ever drops refs the remote itself already deleted. */
+  private settingsGitCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("Fetch"), "sync");
+    const label = el("div", "settings-field-label");
+    label.textContent = l10n.t("Prune deleted remote branches");
+    const sub = el("div", "settings-sub");
+    sub.textContent =
+      l10n.t("When fetching, drop remote-tracking branches that were deleted on the remote so the branch list never goes stale. Local branches are never touched.");
+    const seg = el("div", "settings-seg");
+    const modes: Array<{ prune: boolean; label: string }> = [
+      { prune: true, label: l10n.t("Prune on fetch") },
+      { prune: false, label: l10n.t("Keep stale branches") },
+    ];
+    const btns: HTMLElement[] = [];
+    for (const m of modes) {
+      const b = el(
+        "button",
+        "settings-seg-btn" + (this.pruneOnFetchPref === m.prune ? " active" : ""),
+      );
+      b.append(span(m.label));
+      b.addEventListener("click", () => {
+        this.pruneOnFetchPref = m.prune;
+        this.persist();
+        btns.forEach((x) => x.classList.toggle("active", x === b));
+      });
+      btns.push(b);
+      seg.appendChild(b);
+    }
+    markSegment(seg, label);
+    body.append(label, sub, seg);
+    return card;
+  }
+
+  private settingsRepositoriesCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("Repositories"), "repo");
+    const sub = el("div", "settings-sub");
+    sub.textContent = l10n.t("Where one-click opens and clones from GitHub land on disk.");
+
+    const row = el("div", "settings-clonedir-row");
+    const rowText = el("div", "settings-clonedir-text");
+    const rowLabel = el("div", "settings-field-label");
+    rowLabel.textContent = l10n.t("Default clone folder");
+    const rowValue = el("div", "settings-clonedir-path");
+    rowValue.textContent = l10n.t("Loading…");
+    rowText.append(rowLabel, rowValue);
+    const rowBtns = el("div", "settings-clonedir-btns");
+    const changeBtn = el("button", "mini-btn");
+    changeBtn.append(glyph("folder-opened"), span(l10n.t("Change…")));
+    const resetBtn = el("button", "mini-btn");
+    resetBtn.textContent = l10n.t("Reset");
+    resetBtn.hidden = true;
+    rowBtns.append(changeBtn, resetBtn);
+    row.append(rowText, rowBtns);
+
+    const askRow = el("label", "settings-check settings-ask-row");
+    const askBox = document.createElement("input");
+    askBox.type = "checkbox";
+    askBox.setAttribute("aria-label", l10n.t("Ask where to put each clone"));
+    const askText = el("div", "settings-check-text");
+    // A checkbox's own text, not a group heading — micro-caps would shout a
+    // whole sentence at you.
+    const askTitle = el("div", "settings-check-title");
+    askTitle.textContent = l10n.t("Ask where to put each clone");
+    const askSub = el("div", "settings-sub");
+    askSub.textContent = l10n.t("Every one-click open shows the destination sheet first.");
+    askText.append(askTitle, askSub);
+    askRow.append(askBox, askText);
+
+    const apply = (v: AppSettingsView): void => {
+      rowValue.textContent = v.cloneDirDisplay;
+      rowValue.title = v.cloneDir;
+      resetBtn.hidden = v.cloneDirIsDefault;
+      askBox.checked = v.askWhereEveryTime;
+    };
+    // Both of these change the same setting the Repositories screen changes,
+    // and offer the same way back. A setting that is undoable on one screen and
+    // not on another is a seam the reader has to learn.
+    const cloneDirChanged = (v: AppSettingsView, before: string | null): void => {
+      apply(v);
+      bust("repos");
+      didUndoable(l10n.t("New clones will land in {0}.", v.cloneDirDisplay), {
+        label: l10n.t("Put the clone folder back"),
+        undo: async () => {
+          const back = await host.invoke("settings:update", { cloneDir: before });
+          apply(back);
+          bust("repos");
+        },
+      });
+    };
+    const cloneDirNow = async (): Promise<string | null> => {
+      const v = await host.invoke("settings:get", undefined);
+      return v.cloneDirIsDefault ? null : v.cloneDir;
+    };
+    changeBtn.addEventListener("click", () => {
+      void (async (): Promise<void> => {
+        try {
+          const before = await cloneDirNow();
+          const v = await host.invoke("settings:pickCloneDir", undefined);
+          if (v) cloneDirChanged(v, before);
+        } catch (e) {
+          toast(cleanErr(e) || l10n.t("Couldn't choose a folder."), "error");
+        }
+      })();
+    });
+    resetBtn.addEventListener("click", () => {
+      void (async (): Promise<void> => {
+        try {
+          const before = await cloneDirNow();
+          cloneDirChanged(await host.invoke("settings:update", { cloneDir: null }), before);
+        } catch (e) {
+          toast(cleanErr(e) || l10n.t("Couldn't reset the folder."), "error");
+        }
+      })();
+    });
+    askBox.addEventListener("change", () => {
+      void host
+        .invoke("settings:update", { askWhereEveryTime: askBox.checked })
+        .then(apply)
+        .catch((e) => {
+          askBox.checked = !askBox.checked;
+          toast(cleanErr(e) || l10n.t("Couldn't save the setting."), "error");
+        });
+    });
+    void host
+      .invoke("settings:get", undefined)
+      .then(apply)
+      .catch(() => {
+        rowValue.textContent = l10n.t("Unavailable");
+      });
+
+    // The list of every clone on this machine used to live here, 480px down a
+    // preferences page — with Open, Reveal in Finder and Delete from disk on
+    // each row. Choosing which repository to work on is the most frequent thing
+    // anyone does in a Git client and the one thing that must happen before
+    // anything else works; burying it under "Settings" put it behind the least
+    // likely door. And nothing on a preferences page should be able to move
+    // 2GB of someone's work to the Trash: Settings is where reversible knobs
+    // live. It has its own surface now, reachable from the repository chip in
+    // the top bar (and from ⌘K). What stays here is the actual preference —
+    // where clones land — plus a way in.
+    const manageRow = el("div", "settings-clonedir-row");
+    const manageText = el("div", "settings-clonedir-text");
+    const manageLabel = el("div", "settings-field-label");
+    manageLabel.textContent = l10n.t("On this machine");
+    const manageSub = el("div", "settings-sub");
+    manageSub.textContent = l10n.t("Open, reveal or remove any clone GitStudio knows about.");
+    manageText.append(manageLabel, manageSub);
+    const manageBtn = el("button", "mini-btn") as HTMLButtonElement;
+    manageBtn.append(glyph("repo"), span(l10n.t("Open repositories")));
+    manageBtn.addEventListener("click", () => this.routeView("repositories"));
+    manageRow.append(manageText, manageBtn);
+
+    body.append(sub, row, askRow, manageRow);
+    return card;
+  }
+
+  /**
+   * Every clone on this machine, as a surface of its own.
+   *
+   * Moved out of Settings wholesale — the same rows, the same actions — so that
+   * picking a repository is one gesture from the repository chip instead of a
+   * scroll through preferences, and so that "Delete from disk" sits in a file
+   * management context rather than beside the theme switcher.
+   */
+  // The "Manage repositories…" modal used to live here, with its row builder:
+  // a second surface titled Repositories, listing the same clones flat, with
+  // its own Open / Reveal / Forget / Trash. It was wired from the top-bar chip
+  // and from Settings while the actual Repositories destination was wired from
+  // neither — which is how "move the repos in a dedicated space" became three
+  // places that list repositories and disagree about what they show.
+  //
+  // Both doors route to `repositories` now, which does everything this did and
+  // also groups by folder, separates local from remote, and can clone.
+
+
+  /** One row in the local-copies manager: what it is, where it lives, and the
+   *  actions that only make sense for THAT copy (a missing folder can't be
+   *  opened; an unmanaged one can't be deleted from here). */
+
+
+  /** Resolves once the account card's async body has painted — see below. */
+  private accountCardReady: Promise<unknown> = Promise.resolve();
+
+  /** The account card's "ask again" for a name it does not have yet (see settingsAccountCard). */
+  private reviveAccountCard?: () => void;
+
+  private settingsAccountCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("GitHub Account"), "github");
+    body.appendChild(loadingState());
+    this.reviveAccountCard = undefined;
+    // AWAITABLE. `showSettingsView` returns as soon as the card's shell is in
+    // the DOM, and everything the card actually shows arrives in this async
+    // body — so "Switch account", which awaits `showSettingsView()` and then
+    // looks for the new Sign-in button, was searching a card that still held a
+    // loading spinner. It found nothing, started nothing, and left you signed
+    // out: a quieter Sign out under a label promising the opposite.
+    this.accountCardReady = (async () => {
+      let status: { connected: boolean; login?: string } = { connected: false };
+      try {
+        status = await host.invoke("github:status", undefined);
+      } catch {
+        // keep the disconnected default
+      }
+      body.replaceChildren();
+      if (status.connected) {
+        const who = el("div", "settings-account-who");
+        const name = el("span", "settings-account-name");
+        // The account, by name. Until GitHub has said which (offline, say),
+        // it is "Signed in to GitHub" under GitHub's mark — never "you" in a
+        // "YO" tile — and the card asks again until the name comes.
+        const paint = (login: string | undefined): void => {
+          const face = login
+            ? avatar(login, `https://github.com/${login}.png`, 36)
+            : el("span", "settings-account-mark");
+          if (!login) face.append(glyph("github"));
+          who.replaceChildren(face, name);
+          name.textContent = login ?? l10n.t("Signed in to GitHub");
+        };
+        paint(status.login);
+        if (!status.login) {
+          // Asked while the card is on screen. Settings is kept alive, so a
+          // page the user left and came back to is the same card: the asking
+          // stops while it is away and starts again when it is restored
+          // (showSettingsView's viewRevive) — it used to stop for good, and
+          // the card said "Signed in to GitHub" until something rebuilt it.
+          let timer = 0;
+          let named = false;
+          const ask = async (): Promise<void> => {
+            if (!who.isConnected || named) return;
+            const again = await host.invoke("github:status", undefined).catch(() => undefined);
+            if (!who.isConnected || !again?.connected) return;
+            if (again.login) {
+              named = true;
+              paint(again.login);
+            } else timer = window.setTimeout(() => void ask(), 3000);
+          };
+          timer = window.setTimeout(() => void ask(), 3000);
+          this.reviveAccountCard = () => {
+            window.clearTimeout(timer);
+            void ask();
+          };
+        }
+        const sub = el("div", "settings-sub");
+        sub.textContent = l10n.t("Signed in via OAuth Device Flow · access: repos, actions, org, gists, notifications.");
+        const actions = el("div", "settings-actions");
+        const switchBtn = el("button", "mini-btn");
+        switchBtn.append(glyph("sign-in"), span(l10n.t("Switch account")));
+        // Switching means signing in as SOMEONE ELSE. This ran the sign-out
+        // code and stopped there — not even the toast — so the button labelled
+        // "Switch account" was a quieter Sign out that left you on a
+        // signed-out card with nothing started and no account to switch to.
+        switchBtn.addEventListener("click", async () => {
+          await host.invoke("github:disconnect", undefined);
+          await this.authChanged();
+          // AWAITED, so the card really has been rebuilt before the new
+          // sign-in is opened against it. (Not a rAF: the callback would fire
+          // before the async rebuild had replaced the card.)
+          await this.showSettingsView();
+          // …and for the card INSIDE it, which paints on its own promise.
+          await this.accountCardReady;
+          const fresh = (this.screenEl ?? document).querySelector<HTMLElement>(".settings-view");
+          const btn = fresh?.querySelector<HTMLButtonElement>(".gh-signin-btn");
+          btn?.click();
+        });
+        const signOut = el("button", "mini-btn danger");
+        signOut.append(span(l10n.t("Sign out")));
+        signOut.addEventListener("click", async () => {
+          await host.invoke("github:disconnect", undefined);
+          await this.authChanged();
+          toast(l10n.t("Signed out of GitHub."), "info");
+          void this.showSettingsView();
+        });
+        actions.append(switchBtn, signOut);
+        body.append(who, sub, actions);
+      } else {
+        const sub = el("div", "settings-sub");
+        sub.textContent = l10n.t("Not connected. Sign in to review pull requests and issues and control GitHub Actions.");
+        const signIn = el("button", "btn btn-primary gh-signin-btn");
+        signIn.append(glyph("github"), span(l10n.t("Sign in with GitHub")));
+        const flow = el("div", "gh-flow");
+        signIn.addEventListener("click", () =>
+          void this.startDeviceFlow(card, flow, signIn, () => void this.showSettingsView()),
+        );
+        body.append(sub, signIn, flow);
+      }
+    })().catch(() => {
+      /* the card shows its own error; the promise exists only to be awaited */
+    });
+    return card;
+  }
+
+  private settingsIdentityCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("Git Identity"), "git-commit");
+    body.appendChild(loadingState());
+    void (async () => {
+      let id;
+      let failed = false;
+      try {
+        id = await host.invoke("git:identity", undefined);
+      } catch {
+        id = { name: "", email: "" };
+        failed = true;
+      }
+      body.replaceChildren();
+      const sub = el("div", "settings-sub");
+      sub.textContent = l10n.t("The author name and email stamped on your commits (git config --global).");
+      if (failed) {
+        const warn = el("div", "settings-sub settings-warn");
+        warn.textContent = l10n.t("Couldn't read your current git identity — you can still set it below.");
+        body.appendChild(warn);
+      }
+      const nameF = settingsField(l10n.t("Name"), id.name, l10n.t("Your Name"));
+      const emailF = settingsField(l10n.t("Email"), id.email, "you@example.com");
+      const save = el("button", "mini-btn settings-save");
+      save.append(glyph("check"), span(l10n.t("Save identity")));
+      save.addEventListener("click", async () => {
+        (save as HTMLButtonElement).disabled = true;
+        try {
+          const r = await host.invoke("git:setIdentity", {
+            name: nameF.input.value.trim(),
+            email: emailF.input.value.trim(),
+          });
+          if (r.ok) toast(l10n.t("Git identity updated."), "success");
+          else toast(r.message ?? l10n.t("Couldn't update identity."), "error");
+        } catch (e) {
+          toast(cleanErr(e) || l10n.t("Couldn't update identity."), "error");
+        } finally {
+          (save as HTMLButtonElement).disabled = false;
+        }
+      });
+      body.append(sub, nameF.row, emailF.row, save);
+    })();
+    return card;
+  }
+
+  private settingsSshCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("SSH Keys"), "key");
+    body.appendChild(loadingState());
+    void (async () => {
+      let keys: SshKey[] = [];
+      let failed = false;
+      try {
+        keys = await host.invoke("ssh:keys", undefined);
+      } catch {
+        keys = [];
+        failed = true;
+      }
+      body.replaceChildren();
+      const sub = el("div", "settings-sub");
+      // The card used to state "Public keys found in ~/.ssh" and then, on the
+      // very next line, "No SSH keys found in ~/.ssh" — contradicting itself.
+      // Describe the card, and let the body report what was actually found.
+      sub.textContent = keys.length
+        ? l10n.t("Public keys in ~/.ssh on this machine.")
+        : l10n.t("GitStudio looks for public keys in ~/.ssh on this machine.");
+      body.appendChild(sub);
+      if (failed) {
+        const none = el("div", "settings-empty");
+        none.textContent = l10n.t("Couldn't read ~/.ssh on this machine.");
+        body.appendChild(none);
+      } else if (!keys.length) {
+        const none = el("div", "settings-empty");
+        none.textContent = l10n.t("No SSH keys found in ~/.ssh.");
+        body.appendChild(none);
+      } else {
+        const list = el("div", "settings-keys");
+        for (const k of keys) {
+          const row = el("div", "settings-key");
+          row.appendChild(glyph("key"));
+          const meta = el("div", "settings-key-meta");
+          const top = el("div", "settings-key-file");
+          top.textContent = k.file;
+          const bottom = el("div", "settings-key-sub");
+          bottom.textContent = [k.type, k.comment].filter(Boolean).join(" · ");
+          meta.append(top, bottom);
+          row.appendChild(meta);
+          const copyBtn = el("button", "icon-btn");
+          copyBtn.title = l10n.t("Copy public key path");
+          copyBtn.setAttribute("aria-label", l10n.t("Copy public key path"));
+          copyBtn.appendChild(glyph("copy"));
+          copyBtn.addEventListener("click", () => void copyText(`~/.ssh/${k.file}`, l10n.t("Path copied.")));
+          row.appendChild(copyBtn);
+          list.appendChild(row);
+        }
+        body.appendChild(list);
+      }
+      const manage = el("button", "mini-btn") as HTMLButtonElement;
+      manage.append(glyph("link-external"), span(l10n.t("Manage SSH keys on GitHub")));
+      manage.addEventListener("click", () => window.open("https://github.com/settings/keys", "_blank"));
+      body.appendChild(manage);
+    })();
+    return card;
+  }
+
+  private settingsAboutCard(): HTMLElement {
+    const { card, body } = settingsCard(l10n.t("About"), "info");
+    const sub = el("div", "settings-sub");
+    sub.textContent = l10n.t("GitStudio — an open-source, JetBrains-grade Git client.");
+    const versionRow = el("div", "settings-sub");
+    versionRow.textContent = "…";
+    void host
+      .invoke("app:info", undefined)
+      .then((i) => {
+        versionRow.textContent = l10n.t("Version {0}", i.version);
+      })
+      .catch(() => {
+        versionRow.textContent = "";
+      });
+
+    // Check for updates — the manual end of the same poll→confirm→pull flow
+    // the background check drives. The status line doubles as the live
+    // download-progress label while a pull is running.
+    const updRow = el("div", "settings-update-row");
+    const checkBtn = el("button", "mini-btn") as HTMLButtonElement;
+    checkBtn.append(glyph("sync"), span(l10n.t("Check for updates")));
+    const status = el("span", "settings-sub settings-update-status");
+    this.updateProgressEl = status;
+    updRow.append(checkBtn, status);
+    checkBtn.addEventListener("click", async () => {
+      checkBtn.disabled = true;
+      status.textContent = l10n.t("Checking…");
+      try {
+        const r = await host.invoke("update:check", undefined);
+        if (r.status === "uptodate") {
+          // A newer release this Mac's macOS cannot run is said, not hidden.
+          status.textContent = r.message ?? l10n.t("You're on the latest version ({0}).", r.current);
+        } else if (r.status === "available" && r.version) {
+          status.textContent = l10n.t("GitStudio {0} is available.", r.version);
+          void this.promptUpdateAvailable({ version: r.version, current: r.current }, true);
+        } else if (r.status === "downloading") {
+          status.textContent = l10n.t("An update is downloading…");
+        } else if (r.status === "ready" && r.version) {
+          status.textContent = l10n.t("GitStudio {0} is ready to install.", r.version);
+          void host.invoke("update:download", undefined); // re-announces update:ready
+        } else {
+          status.textContent = r.message || l10n.t("Couldn't check for updates.");
+        }
+      } catch (e) {
+        status.textContent = cleanErr(e) || l10n.t("Couldn't check for updates.");
+      } finally {
+        checkBtn.disabled = false;
+      }
+    });
+
+    // One action language per card: a bordered button beside a bare purple
+    // text link made two peers look like a control and a footnote. Leaving the
+    // app is a mini-btn with an external glyph everywhere else in the product.
+    const repo = el("button", "mini-btn") as HTMLButtonElement;
+    repo.append(glyph("link-external"), span(l10n.t("View the project on GitHub")));
+    repo.addEventListener("click", () =>
+      window.open("https://github.com/GitStudioHQ/gitstudio", "_blank"),
+    );
+    updRow.insertBefore(repo, status);
+
+    // Support GitStudio: a place people come looking, so it can say it plainly
+    // — one sentence and the two ways, in the READMEs' words, in the card's own
+    // action language (shared/support.ts; Home's foot line and ⌘K offer the
+    // same two). Nothing here, or anywhere, opens by itself.
+    const supportLabel = el("div", "settings-field-label");
+    supportLabel.textContent = l10n.t("Support GitStudio");
+    const supportSub = el("div", "settings-sub");
+    supportSub.textContent = supportSentence();
+    const supportRow = el("div", "settings-actions settings-support");
+    supportRow.setAttribute("role", "group");
+    supportRow.setAttribute("aria-label", l10n.t("Support GitStudio"));
+    for (const link of SUPPORT_LINKS) {
+      const b = el("button", "mini-btn") as HTMLButtonElement;
+      b.dataset.support = link.id;
+      b.title = `${link.label} — ${link.blurb}`;
+      b.append(glyph(link.icon), span(link.label));
+      b.addEventListener("click", () => window.open(link.url, "_blank"));
+      supportRow.appendChild(b);
+    }
+    body.append(sub, versionRow, updRow, supportLabel, supportSub, supportRow);
+    return card;
+  }
+
+  // ── Code view (GitHub-style repo browser: breadcrumb + listing + README) ─────
+
+  /** Every folder hop routes through here (not a bare codePath mutation), so
+   *  each one is a navigation-history entry — back/forward walk the folder
+   *  trail exactly like a browser. */
+  private goCodePath(path: string): void {
+    this.routeView("code", false, { path });
+  }
+
+  private async showCodeView(): Promise<void> {
+    // Returning to the browser (Back / folder nav) bypasses routeView, so drop
+    // any open-file Monaco viewer here too.
+    this.activeMonacoView?.dispose();
+    this.activeMonacoView = undefined;
+    const wrap = el("div", "code-view");
+
+    // Breadcrumb: clickable path segments that reset this.codePath.
+    const crumbs = el("div", "code-crumbs");
+    const seg = (label: string, path: string, isLast: boolean): void => {
+      const btn = el("button", "code-crumb" + (isLast ? " is-current" : ""));
+      btn.append(glyph(path === "" ? "repo" : "folder"), span(label));
+      if (!isLast) {
+        btn.addEventListener("click", () => this.goCodePath(path));
+      }
+      crumbs.appendChild(btn);
+      if (!isLast) crumbs.appendChild(span("/", "code-crumb-sep"));
+    };
+    // At the ROOT the repo crumb carries nothing the top-bar switcher does not
+    // already show 45px above it, both with a folder-ish icon. Deeper in, it
+    // earns its place as the way back to the root.
+    const repoName = this.currentRepo?.name ?? "repo";
+    const parts = this.codePath ? this.codePath.split("/") : [];
+    if (parts.length > 0) seg(repoName, "", false);
+    parts.forEach((p, i) => {
+      seg(p, parts.slice(0, i + 1).join("/"), i === parts.length - 1);
+    });
+    // At the root there is no trail to draw; the folder listing below already
+    // says where you are.
+    if (parts.length === 0) crumbs.hidden = true;
+
+    const countChip = el("span", "code-count");
+    countChip.hidden = true;
+    // Instant in-folder filter — GitHub makes you leave the listing for its
+    // file finder; here the folder narrows as you type, with keyboard nav.
+    const filterInput = document.createElement("input");
+    filterInput.className = "code-filter";
+    filterInput.type = "text";
+    filterInput.placeholder = l10n.t("Filter files…  (/)");
+    filterInput.setAttribute("aria-label", l10n.t("Filter files in this folder"));
+    filterInput.spellcheck = false;
+    const refreshBtn = el("button", "topbar-icon");
+    refreshBtn.title = l10n.t("Refresh");
+    refreshBtn.setAttribute("aria-label", l10n.t("Refresh"));
+    refreshBtn.appendChild(glyph("refresh"));
+    refreshBtn.addEventListener("click", () =>
+      // BUST first. The listing is read through `gget("repo:tree", …)`, so a
+      // Refresh that only re-ran the view was answered from the cache — the
+      // commit bar and the README (which fetch separately) updated while the
+      // file list beneath them did not, which is the one thing Refresh is
+      // pressed for.
+      void this.refreshInPlace(refreshBtn, () => {
+        bust("repo:tree");
+        return this.showCodeView();
+      }),
+    );
+    const head = el("div", "code-head");
+    head.append(
+      crumbs,
+      countChip,
+      el("div", "topbar-spacer"),
+      filterInput,
+      refreshBtn,
+    );
+
+    // The connected "file card": a latest-commit header (repo root only), a
+    // Name / Size column header, then the rows — one bordered surface, the way
+    // github.com frames a directory listing.
+    const card = el("div", "code-filecard");
+    const latest = el("div", "code-latest-slot");
+    const colhead = el("div", "code-listing-head");
+    colhead.append(span(l10n.t("Name"), "code-col code-col-name"), span(l10n.t("Size"), "code-col code-col-size"));
+    const listing = el("div", "code-listing");
+    card.append(latest, colhead, listing);
+    const readme = el("div", "code-readme");
+    const scroll = el("div", "code-scroll");
+    scroll.append(card, readme);
+    listing.appendChild(skeletonList(8, false));
+    wrap.append(head, scroll);
+    this.viewHost.replaceChildren(wrap);
+    // The header's right inset is the column's inset PLUS whatever the column
+    // loses to a scroll bar (classic bars on Windows and Linux, "Always" on a
+    // Mac) — otherwise Refresh sits a bar's width past the card's edge.
+    const syncGutter = (): void => head.style.setProperty("--code-gutter", `${scroll.offsetWidth - scroll.clientWidth}px`);
+    syncGutter();
+    new ResizeObserver(syncGutter).observe(scroll);
+    // The view's own keys — "/" to jump to the filter, Backspace to go up a
+    // folder — are bound on `wrap`, so they only fire for keys pressed INSIDE
+    // it. Nothing here had focus after a render, so both were dead until you
+    // happened to click a row first, while the filter placeholder went on
+    // advertising "(/)". Making the view itself the focus target fixes that and
+    // the more general "nothing is focused after a folder hop".
+    wrap.tabIndex = -1;
+    if (document.activeElement === document.body || document.activeElement === null) {
+      wrap.focus({ preventScroll: true });
+    }
+
+    const gen = this.routeGen;
+    let entries;
+    try {
+      entries = await gget("repo:tree", { path: this.codePath });
+    } catch (e) {
+      if (gen !== this.routeGen) return;
+      colhead.hidden = true;
+      listing.replaceChildren(
+        errorState(l10n.t("Couldn't read this folder"), cleanErr(e) || l10n.t("git ls-tree failed."), () =>
+          void this.showCodeView(),
+        ),
+      );
+      return;
+    }
+    if (gen !== this.routeGen) return;
+    listing.replaceChildren();
+
+    // Folders first, then files — each group alphabetical (case-insensitive),
+    // the way github.com and every file browser orders a directory. `repo:tree`
+    // returns raw ls-tree order, which interleaves the two.
+    const sorted = [...entries].sort((a, b) => {
+      const ad = a.type === "tree" ? 0 : 1;
+      const bd = b.type === "tree" ? 0 : 1;
+      if (ad !== bd) return ad - bd;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+    });
+
+    // Summarise the folder / file split in the header chip.
+    const dirCount = sorted.filter((x) => x.type === "tree").length;
+    const fileCount = sorted.length - dirCount;
+    const summaryText =
+      [
+        dirCount ? (dirCount === 1 ? l10n.t("1 folder") : l10n.t("{0} folders", dirCount)) : "",
+        fileCount ? (fileCount === 1 ? l10n.t("1 file") : l10n.t("{0} files", fileCount)) : "",
+      ]
+        .filter(Boolean)
+        .join(" · ") || l10n.t("empty");
+    countChip.hidden = sorted.length === 0;
+    countChip.replaceChildren(glyph("list-unordered"), span(summaryText));
+
+    // ".." up-row when not at the repo root (styled as a folder row).
+    if (this.codePath) {
+      const up = el("button", "file-row code-row is-dir code-up");
+      up.append(glyph("arrow-up"), span("..", "file-path"), el("span", "code-row-size"));
+      up.addEventListener("click", () =>
+        this.goCodePath(this.codePath.split("/").slice(0, -1).join("/")),
+      );
+      listing.appendChild(up);
+    }
+
+    if (!sorted.length) {
+      colhead.hidden = true;
+      // A subfolder can be empty too — and used to render as a bare card with
+      // nothing in it and nothing said, which reads as a failed load rather
+      // than as an answer. The repository-level copy is only right at the root.
+      listing.appendChild(
+        this.codePath
+          ? emptyState(
+              l10n.t("This folder is empty"),
+              l10n.t("{0} has no tracked files at HEAD.", this.codePath),
+              { icon: "folder" },
+            )
+          : emptyState(l10n.t("Empty repository"), l10n.t("No tracked files at HEAD yet.")),
+      );
+    }
+
+    /** Rows in display order, so the filter and keyboard nav can drive them. */
+    const rows: Array<{ el: HTMLElement; name: string; label: HTMLElement }> = [];
+    for (const e of sorted) {
+      const isDir = e.type === "tree";
+      const row = el("button", "file-row code-row" + (isDir ? " is-dir" : ""));
+      const size = el("span", "code-row-size");
+      size.textContent = isDir ? "" : formatBytes(e.size);
+      const label = span(e.name, "file-path");
+      row.append(glyph(fileIcon(e.name, isDir)), label, size);
+      row.addEventListener("click", () => {
+        if (isDir) this.goCodePath(e.path);
+        else this.goCodeFile(e.path);
+      });
+      listing.appendChild(row);
+      rows.push({ el: row, name: e.name, label });
+    }
+
+    // ── filter + keyboard navigation ──
+    const upRow = listing.querySelector(".code-up") as HTMLElement | null;
+    const visibleRows = (): HTMLElement[] =>
+      rows.filter((r) => !r.el.hidden).map((r) => r.el);
+
+    const applyFilter = (): void => {
+      const q = filterInput.value.trim().toLowerCase();
+      let shown = 0;
+      for (const r of rows) {
+        const at = q ? r.name.toLowerCase().indexOf(q) : -1;
+        const match = !q || at >= 0;
+        r.el.hidden = !match;
+        if (match) shown++;
+        // Re-render the label so the matched run is highlighted (textContent
+        // everywhere — never innerHTML with a user-supplied filename).
+        r.label.replaceChildren();
+        if (q && at >= 0) {
+          r.label.append(
+            document.createTextNode(r.name.slice(0, at)),
+            (() => {
+              const m = document.createElement("mark");
+              m.textContent = r.name.slice(at, at + q.length);
+              return m;
+            })(),
+            document.createTextNode(r.name.slice(at + q.length)),
+          );
+        } else {
+          r.label.textContent = r.name;
+        }
+      }
+      if (upRow) upRow.hidden = q.length > 0;
+      countChip.hidden = false;
+      countChip.replaceChildren(
+        glyph("list-unordered"),
+        span(q ? `${shown} of ${rows.length} matching` : summaryText),
+      );
+      if (q && shown === 0) {
+        listing.classList.add("is-empty-filter");
+      } else {
+        listing.classList.remove("is-empty-filter");
+      }
+    };
+    filterInput.addEventListener("input", applyFilter);
+    filterInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        filterInput.value = "";
+        applyFilter();
+      } else if (ev.key === "Enter" || ev.key === "ArrowDown") {
+        ev.preventDefault();
+        visibleRows()[0]?.focus();
+      }
+    });
+
+    // Arrow keys walk the listing; "/" (or plain typing) jumps to the filter;
+    // Backspace goes up a folder — the shortcuts a file browser should have.
+    wrap.addEventListener("keydown", (ev) => {
+      const vis = visibleRows();
+      const idx = vis.indexOf(document.activeElement as HTMLElement);
+      if (ev.key === "ArrowDown" && idx >= 0) {
+        ev.preventDefault();
+        vis[Math.min(idx + 1, vis.length - 1)]?.focus();
+      } else if (ev.key === "ArrowUp" && idx >= 0) {
+        ev.preventDefault();
+        if (idx === 0) filterInput.focus();
+        else vis[idx - 1]?.focus();
+      } else if (ev.key === "/" && document.activeElement !== filterInput) {
+        ev.preventDefault();
+        filterInput.focus();
+        filterInput.select();
+      } else if (
+        ev.key === "Backspace" &&
+        document.activeElement !== filterInput &&
+        this.codePath
+      ) {
+        ev.preventDefault();
+        this.goCodePath(this.codePath.split("/").slice(0, -1).join("/"));
+      }
+    });
+
+    // The latest-commit bar — repo root only, mirroring github.com's repo page.
+    // Best-effort: if it can't be read, the bar is simply omitted.
+    //
+    // The ONE reader that wants the commit count, and it asks for it. Through
+    // the cache, because the count is a full history walk and this ran on
+    // every visit to the root: every mutation busts it, and a return trip
+    // inside the TTL now costs nothing.
+    if (!this.codePath) {
+      void gget("repo:headCommit", { count: true })
+        .then((hc) => {
+          if (gen !== this.routeGen || !hc) return;
+          latest.replaceChildren(this.codeLatestBar(hc));
+        })
+        .catch(() => {});
+    }
+
+    // README: case-insensitive readme / readme.md among THIS dir's blobs.
+    const readmeEntry = entries.find(
+      (e) => e.type === "blob" && /^readme(\.(md|markdown|txt|rst))?$/i.test(e.name),
+    );
+    if (readmeEntry) {
+      const card = el("div", "code-readme-card");
+      const rhead = el("div", "code-readme-head");
+      rhead.append(glyph("book"), span(readmeEntry.name));
+      const bodyEl = el("div", "code-md");
+      card.append(rhead, bodyEl);
+      readme.appendChild(card);
+      const file = await host.invoke("repo:file", { path: readmeEntry.path });
+      const text = file?.text ?? "";
+      if (file?.binary || file?.truncated) {
+        bodyEl.classList.add("code-md-plain");
+        bodyEl.textContent = file?.truncated ? "(README too large to preview)" : "(binary)";
+      } else if (/\.(md|markdown)$/i.test(readmeEntry.name)) {
+        // renderMarkdown is escape-first (XSS-safe); guard anyway so a malformed
+        // README can never abort the surrounding Code-view render.
+        try {
+          const baseDir = this.codePath;
+          // Relative images resolve to the file BESIDE the README on disk —
+          // the renderer's origin is the app's own index.html, and against
+          // that every `brand/icon.svg` in every README was a broken glyph.
+          const root = this.currentRepo?.root;
+          bodyEl.innerHTML = renderMarkdown(text, 0, {
+            resolveImage: root
+              ? (rel) => {
+                  const clean = rel.replace(/^\.\//, "");
+                  const joined = [root, baseDir, clean].filter(Boolean).join("/");
+                  return `file://${joined}`;
+                }
+              : undefined,
+          });
+          // README links to this repo's issues/PRs/commits stay IN the app —
+          // and RELATIVE links ("./docs/x.md") open in the Code browser.
+          wireProseNav(
+            bodyEl,
+            (v, t) => this.routeView(v, false, t),
+            undefined,
+            (rel) => {
+              const p = resolveRelative(baseDir, rel);
+              if (/\.[A-Za-z0-9]{1,8}$/.test(p.split("/").pop() ?? "")) this.goCodeFile(p);
+              else this.goCodePath(p);
+            },
+          );
+        } catch {
+          bodyEl.classList.add("code-md-plain");
+          bodyEl.textContent = text;
+        }
+      } else {
+        bodyEl.classList.add("code-md-plain");
+        bodyEl.textContent = text;
+      }
+    }
+  }
+
+  /** The GitHub-style "latest commit" header bar above the repo-root listing:
+   *  author chip · subject · short-sha (copy) · relative time · commit count. */
+  private codeLatestBar(hc: HeadCommit): HTMLElement {
+    const bar = el("div", "code-latest");
+
+    const av = el("span", "code-latest-av");
+    av.textContent = initials(hc.author);
+    const seed = hc.authorEmail || hc.author;
+    av.style.setProperty("--av", avatarHue(seed));
+    av.style.setProperty("--av-ink", avatarInk(seed));
+
+    const meta = el("div", "code-latest-meta");
+    const who = el("span", "code-latest-author");
+    who.textContent = hc.author || l10n.t("Unknown");
+    const subj = el("span", "code-latest-subject");
+    subj.textContent = hc.subject || l10n.t("(no commit message)");
+    meta.append(who, subj);
+
+    // The sha OPENS the commit. It only copied before, which made the one
+    // identifier on this bar a dead end: the commit it names is a click away in
+    // Commits, and reading it was the thing people actually wanted.
+    const sha = el("button", "code-latest-sha");
+    sha.title = l10n.t("Open {0} in Commits", hc.shortSha);
+    sha.setAttribute("aria-label", l10n.t("Open commit {0}", hc.shortSha));
+    sha.append(glyph("git-commit"), span(hc.shortSha));
+    sha.addEventListener("click", () => this.routeView("graph", false, { sha: hc.sha }));
+
+    // …and copying keeps its own affordance rather than being the only one.
+    const copy = el("button", "code-latest-copy");
+    copy.title = l10n.t("Copy full SHA");
+    copy.setAttribute("aria-label", l10n.t("Copy full SHA"));
+    copy.append(glyph("copy"));
+    copy.addEventListener("click", () => void copyText(hc.sha, l10n.t("Commit SHA copied")));
+
+    const when = el("span", "code-latest-when");
+    if (hc.date) {
+      when.textContent = relTime(hc.date);
+      when.title = absTime(hc.date);
+    }
+
+    // The history, from the page that shows the files it produced. The number
+    // is there only when the read asked for it; the door is there regardless.
+    const count = el("button", "code-latest-count");
+    count.title = l10n.t("Show this repository's commits");
+    const total = hc.total;
+    count.append(
+      glyph("history"),
+      span(
+        total === undefined
+          ? l10n.t("Commits")
+          : total === 1
+            ? l10n.t("1 commit")
+            : l10n.t("{0} commits", total.toLocaleString()),
+      ),
+    );
+    count.addEventListener("click", () => this.routeView("graph"));
+
+    bar.append(av, meta, sha, copy, when, count);
+    return bar;
+  }
+
+  /** Opens a tracked file read-only over the listing (Back restores the browser). */
+  /** Open a file AS A NAVIGATION — the sibling of `goCodePath` for blobs. The
+   *  folder rides along so Back returns to the listing the file came from. */
+  private goCodeFile(path: string): void {
+    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    this.routeView("code", true, { path: dir, file: path });
+  }
+
+  private async openCodeFile(path: string): Promise<void> {
+    const wrap = el("div", "code-view code-file-view");
+    const back = el("button", "mini-btn");
+    back.append(glyph("arrow-left"), span(l10n.t("Back")));
+    // Through routeView, like every other hop in this view — a bare
+    // `showCodeView()` repainted the listing without telling the navigation
+    // history anything, so the top-bar Back chevron (and ⌘[) still pointed at
+    // whatever you were doing before you opened the file: pressing it from the
+    // listing jumped out of Code entirely, and Forward came back to the FILE,
+    // a page you had already left.
+    back.addEventListener("click", () =>
+      this.goCodePath(path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ""),
+    );
+    // The tree header carries a clickable trail, a count and a filter; opening a
+    // file used to replace all of it with "Back" and a raw path string, so the
+    // routine things — go up a folder, copy this path, see it on GitHub, reload
+    // it — all became "Back, then find the file again".
+    const crumbs = el("div", "code-crumbs code-file-crumbs");
+    const parts = path.split("/");
+    const seg = (label: string, dir: string, isLast: boolean): void => {
+      const btn = el("button", "code-crumb" + (isLast ? " is-current" : ""));
+      btn.append(glyph(isLast ? "file" : dir === "" ? "repo" : "folder"), span(label));
+      if (!isLast) btn.addEventListener("click", () => this.goCodePath(dir));
+      crumbs.appendChild(btn);
+      if (!isLast) crumbs.appendChild(span("/", "code-crumb-sep"));
+    };
+    seg(this.currentRepo?.name ?? "repo", "", false);
+    parts.forEach((p, i) => {
+      seg(p, parts.slice(0, i + 1).join("/"), i === parts.length - 1);
+    });
+
+    const copyBtn = el("button", "topbar-icon");
+    copyBtn.title = l10n.t("Copy this file's path");
+    copyBtn.setAttribute("aria-label", copyBtn.title);
+    copyBtn.appendChild(glyph("copy"));
+    copyBtn.addEventListener("click", () => void copyText(path, l10n.t("Path copied.")));
+
+    const reloadBtn = el("button", "topbar-icon");
+    reloadBtn.title = l10n.t("Reload this file");
+    reloadBtn.setAttribute("aria-label", reloadBtn.title);
+    reloadBtn.appendChild(glyph("refresh"));
+    reloadBtn.addEventListener("click", () =>
+      void this.refreshInPlace(reloadBtn, () => this.openCodeFile(path)),
+    );
+
+    const bar = el("div", "code-head");
+    bar.append(back, crumbs, el("div", "topbar-spacer"), copyBtn, reloadBtn);
+    const surface = el("div", "diff-surface code-file-surface");
+    // Something to look at while the read lands. The surface was mounted empty
+    // and filled only once the file came back, so opening or reloading a file
+    // showed a blank pane under a full toolbar — indistinguishable from a file
+    // that is genuinely empty, or from a load that failed. Every other surface
+    // in the app paints a skeleton first.
+    surface.appendChild(skeletonList(8, false));
+    wrap.append(bar, surface);
+    this.viewHost.replaceChildren(wrap);
+
+    // Reuse one viewer; dispose any prior Monaco surface so files don't leak.
+    this.activeMonacoView?.dispose();
+    const viewer = new ReadonlyFileView(surface);
+    this.activeMonacoView = viewer;
+    // Which route this read belongs to. `routeView` disposes `activeMonacoView`
+    // and clears it the moment you navigate, so leaving while this fetch is in
+    // flight meant the editor was built AFTER its owner had let go of it: a
+    // Monaco instance in a detached node, with nothing holding a reference that
+    // could ever dispose it. `showCodeView` already guards its own read this
+    // way; this one did not.
+    const gen = this.routeGen;
+    const file = await host.invoke("repo:file", { path });
+    if (gen !== this.routeGen || !surface.isConnected) {
+      viewer.dispose();
+      return;
+    }
+    if (!file) {
+      viewer.showMessage(l10n.t("Couldn't read this file."));
+    } else if (file.binary) {
+      viewer.showMessage(l10n.t("Binary file — not shown."));
+    } else if (file.truncated) {
+      viewer.showMessage(l10n.t("File is too large to preview."));
+    } else {
+      viewer.show(path, file.text);
+    }
+  }
+
+  // ── Changes view (working tree: stage / commit) ─────────────────────────────
+
+  private async showChangesView(): Promise<void> {
+    const wrap = el("div", "changes-view");
+
+    const composer = el("div", "dc-composer");
+    // Built from the awaited `head:get` (what the top bar uses), not from
+    // `refs`, which is filled by a fire-and-forget refreshRefs() and is empty
+    // on first paint — the old fallback told you that you were on a detached
+    // HEAD while the top bar said "main" one row above. When HEAD is not known
+    // yet the label is a placeholder that syncComposerBranch() fills in.
+    const head = this.headInfo;
+    const refsKnown = !!head;
+    const curBranch =
+      head && !head.detached
+        ? head.branch
+        : this.refs.find((r) => r.type === "head" && r.isCurrent)?.name;
+    const branchLine = el("div", "dc-branch");
+    const branchSummary = span("", "dc-branch-sum");
+    branchLine.append(
+      glyph("git-branch"),
+      span(curBranch ?? (refsKnown ? "detached HEAD" : "…"), "dc-branch-name"),
+      branchSummary,
+    );
+    const msgWrap = el("div", "dc-message-wrap");
+    const textarea = document.createElement("textarea");
+    textarea.className = "dc-message";
+    textarea.placeholder = l10n.t("Message (what & why)…");
+    textarea.rows = 2;
+    // Every stage / unstage / discard re-runs showChangesView(), which rebuilds
+    // this whole subtree. Without a surviving draft, typing a commit message and
+    // then staging one more file silently threw the message away.
+    textarea.value = this.composerDraft.message;
+    // The repo this composer BELONGS to, captured now — not read at event time.
+    // An `input` fires for a streaming AI message too, and that stream outlives
+    // a repo switch: repo A's generated message landed in repo B's box, stamped
+    // with B, so the guard above then PROTECTED it and it survived every later
+    // re-open of B. Stamping the repo the composer was built for makes the
+    // guard drop it instead, which is what it is for.
+    const composerRepo = this.currentRepo?.root;
+    // The caret, not just the text. `showChangesView()` rebuilds this whole
+    // subtree on every stage, unstage, discard and filesystem-watcher tick, and
+    // a rebuilt textarea is a NEW element: focus fell to <body> and the caret
+    // went to 0. Typing a paragraph of commit message while a build tool
+    // touched a file meant the next keystroke landed at the START of it.
+    const rememberCaret = (): void => {
+      this.composerDraft.caret = { start: textarea.selectionStart, end: textarea.selectionEnd };
+    };
+    for (const ev of ["keyup", "click", "select", "input"] as const) {
+      textarea.addEventListener(ev, rememberCaret);
+    }
+    textarea.addEventListener("input", () => {
+      this.composerDraft.message = textarea.value;
+      // Whose draft this is. Without it the reset above cannot tell a repo
+      // SWITCH (drop it) from a re-open of the same repo (keep it).
+      this.composerDraftRoot = composerRepo;
+    });
+    /**
+     * Put text in the composer the way a keystroke would.
+     *
+     * Assigning `.value` fires no `input` event, so everything hanging off that
+     * event goes stale: the surviving draft, and — worse — the commit buttons'
+     * enabled state. Ticking "Amend last commit" prefilled the previous
+     * message and then left BOTH Commit and Commit & Push greyed out, insisting
+     * you "write a commit message first" while it sat in front of you.
+     */
+    /** The exact text the amend prefill put in the box, while it is untouched. */
+    let prefilled: string | undefined = this.composerDraft.prefilled;
+    const setMessage = (text: string): void => {
+      textarea.value = text;
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    textarea.addEventListener("input", () => {
+      if (prefilled !== undefined && textarea.value !== prefilled) {
+        prefilled = undefined;
+        this.composerDraft.prefilled = undefined;
+      }
+    });
+    // ⌘/Ctrl+Enter commits. Every commit box in every tool does this, and here
+    // it did nothing at all — the only way to commit was to leave the keyboard.
+    textarea.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || !(e.metaKey || e.ctrlKey)) return;
+      e.preventDefault();
+      if (commitBtn.hasAttribute("disabled")) return;
+      commitBtn.click();
+    });
+    msgWrap.append(textarea);
+    // ✨ Write the message from the staged diff — sits up in the branch header row
+    // (right-aligned), not inside the textarea. Shown only when a model is connected.
+    const writeBtn = aiChip(l10n.t("Write message"), () =>
+      void streamInto("commitMessage", {}, textarea, writeBtn as HTMLButtonElement),
+    );
+    writeBtn.classList.add("dc-ai-write");
+    writeBtn.hidden = true;
+    branchLine.append(writeBtn);
+    // ✨ Review the working changes — lives in the toolbar (it acts on the diff,
+    // not the message). Built here so aiEnabled() can toggle both at once.
+    const reviewBtn = el("button", "mini-btn dc-review");
+    reviewBtn.append(glyph("sparkle"), span(l10n.t("Review with AI")));
+    reviewBtn.hidden = true;
+    reviewBtn.addEventListener("click", () =>
+      openAssistantTab({
+        title: l10n.t("Review changes"),
+        goal: "Review my current working-tree changes for correctness bugs, security issues and risky changes. Run `git diff` (and check staged changes) to see them. Be specific and cite files.",
+        nav: (v) => this.routeView(v),
+      }),
+    );
+    void aiEnabled().then((ok) => {
+      writeBtn.hidden = !ok;
+      reviewBtn.hidden = !ok;
+    });
+    // Commit options: amend the last commit, append a Signed-off-by trailer, or
+    // add Co-authored-by trailers — the depth a power committer expects.
+    let amend = this.composerDraft.amend;
+    let signoff = this.composerDraft.signoff;
+    const coAuthors: string[] = [...this.composerDraft.coAuthors];
+    const getOpts = (): { amend: boolean; signoff: boolean; coAuthors: string[] } => ({
+      amend,
+      signoff,
+      coAuthors,
+    });
+    const optsRow = el("div", "dc-options");
+    const amendToggle = el("button", "dc-toggle") as HTMLButtonElement;
+    amendToggle.setAttribute("role", "switch");
+    amendToggle.setAttribute("aria-checked", "false");
+    amendToggle.append(glyph("git-commit"), span(l10n.t("Amend last commit")));
+    const signoffToggle = el("button", "dc-toggle") as HTMLButtonElement;
+    signoffToggle.setAttribute("role", "switch");
+    signoffToggle.setAttribute("aria-checked", "false");
+    signoffToggle.append(glyph("verified"), span(l10n.t("Sign off")));
+    const coAuthorBtn = el("button", "dc-toggle") as HTMLButtonElement;
+    coAuthorBtn.append(glyph("person-add"), span(l10n.t("Add co-author")));
+    const coAuthorChips = el("div", "dc-coauthors");
+    const renderChips = (): void => {
+      this.composerDraft.coAuthors = [...coAuthors];
+      coAuthorChips.replaceChildren();
+      coAuthors.forEach((ca, i) => {
+        const chip = el("span", "dc-coauthor-chip");
+        chip.append(span(ca));
+        const x = el("button", "dc-chip-x") as HTMLButtonElement;
+        x.setAttribute("aria-label", l10n.t("Remove co-author {0}", ca));
+        x.appendChild(glyph("close"));
+        x.addEventListener("click", () => {
+          coAuthors.splice(i, 1);
+          renderChips();
+        });
+        chip.appendChild(x);
+        coAuthorChips.appendChild(chip);
+      });
+    };
+    amendToggle.addEventListener("click", () => {
+      amend = !amend;
+      this.composerDraft.amend = amend;
+      amendToggle.classList.toggle("is-on", amend);
+      amendToggle.setAttribute("aria-checked", amend ? "true" : "false");
+      syncCommitLabel();
+      // Amending needs no changes — rewording the last commit is a commit with
+      // nothing staged — so the enable rule has to be re-evaluated here too.
+      syncCommitEnabled();
+      // Prefill the last commit message when amending an empty composer.
+      if (amend && !textarea.value.trim()) {
+        void host.invoke("repo:headCommit", undefined).then((hc) => {
+          // The WHOLE message. Prefilling only the subject meant that ticking
+          // Amend and pressing commit silently deleted the body and every
+          // trailer — the box looked like the commit, so nothing warned you.
+          const prefill = hc?.message || hc?.subject;
+          if (amend && prefill && !textarea.value.trim()) {
+            setMessage(prefill);
+            prefilled = prefill;
+            this.composerDraft.prefilled = prefill;
+          }
+        });
+      } else if (!amend && prefilled !== undefined && textarea.value === prefilled) {
+        // Un-ticking takes the prefill back. It is the LAST COMMIT'S text, and
+        // leaving it in the box with amend off armed the composer to create a
+        // brand-new commit carrying the previous one's exact message — with
+        // nothing on screen to distinguish it from something you wrote. Only
+        // withdrawn when untouched: the moment you edit it, it is yours.
+        setMessage("");
+        prefilled = undefined;
+      }
+    });
+    signoffToggle.addEventListener("click", () => {
+      signoff = !signoff;
+      this.composerDraft.signoff = signoff;
+      signoffToggle.classList.toggle("is-on", signoff);
+      signoffToggle.setAttribute("aria-checked", signoff ? "true" : "false");
+    });
+    coAuthorBtn.addEventListener("click", async () => {
+      const v = await promptInline(l10n.t("Add co-author"), "Name <email@example.com>", "", l10n.t("Add"));
+      if (v && v.trim()) {
+        coAuthors.push(v.trim());
+        renderChips();
+      }
+    });
+    // Paint the restored toggle state — the buttons are built in the "off" shape.
+    if (amend) {
+      amendToggle.classList.add("is-on");
+      amendToggle.setAttribute("aria-checked", "true");
+    }
+    if (signoff) {
+      signoffToggle.classList.add("is-on");
+      signoffToggle.setAttribute("aria-checked", "true");
+    }
+    renderChips();
+    optsRow.append(amendToggle, signoffToggle, coAuthorBtn, coAuthorChips);
+
+    const commitRow = el("div", "dc-commit-row");
+    const commitBtn = el("button", "btn btn-primary dc-commit");
+    const commitLabel = span(curBranch ? l10n.t("Commit to {0}", curBranch) : l10n.t("Commit"), "dc-commit-label");
+    commitBtn.append(glyph("git-commit"), commitLabel);
+    /**
+     * The primary button's label, from the one state that decides it.
+     *
+     * It used to be written in two places, and the second one — the repaint
+     * after status loads — did not consult `amend`. So staging a file with
+     * Amend on left the toggle lit, the label reading "Commit to main", and a
+     * click still sending `amend: true`. The button promised a new commit and
+     * rewrote the last one.
+     */
+    const syncCommitLabel = (): void => {
+      // Reads `this.headInfo` LIVE rather than the `curBranch` const captured
+      // when the composer was built. HEAD is often still resolving at that
+      // moment, so the const is undefined and stays undefined — which meant
+      // ticking Amend and un-ticking it turned "Commit to main" into a bare
+      // "Commit" and shrank the button by 51px, with the branch line right
+      // beside it still reading "main". syncComposerBranch used to paper over
+      // it by writing this element's text directly; now it calls this.
+      const head = this.headInfo;
+      const branch = head && !head.detached ? head.branch : undefined;
+      const name = branch ?? curBranch;
+      commitLabel.textContent = amend ? l10n.t("Amend commit") : name ? l10n.t("Commit to {0}", name) : l10n.t("Commit");
+    };
+    this.syncCommitLabel = syncCommitLabel;
+    commitBtn.addEventListener("click", () => void this.doDesktopCommit(textarea, commitBtn, false, getOpts()));
+    const pushBtn = el("button", "btn dc-commit dc-push");
+    pushBtn.append(glyph("arrow-up"), span(l10n.t("Commit & Push")));
+    pushBtn.addEventListener("click", () => void this.doDesktopCommit(textarea, pushBtn, true, getOpts()));
+    commitRow.append(commitBtn, pushBtn);
+    // A commit needs a message, so the buttons must LOOK unavailable until
+    // there is one. They used to sit in full accent and swallow the click in
+    // silence — the app's most important action, dead on arrival.
+    const syncCommitEnabled = (): void => {
+      const written = textarea.value.trim().length > 0;
+      // A message is not enough. On a CLEAN working tree the button was a live
+      // accent control that could only ever produce git's "nothing to commit",
+      // because it gated on the text alone. Amend is the exception and a real
+      // one: rewording the last commit needs no changes at all.
+      const somethingToCommit = amend || this.changesHaveWork;
+      const ready = written && somethingToCommit;
+      for (const b of [commitBtn, pushBtn]) {
+        b.toggleAttribute("disabled", !ready);
+        b.title = !written
+          ? l10n.t("Write a commit message first")
+          : somethingToCommit
+            ? ""
+            : l10n.t("Nothing to commit — the working tree is clean");
+      }
+    };
+    this.syncCommitEnabled = syncCommitEnabled;
+    textarea.addEventListener("input", syncCommitEnabled);
+    syncCommitEnabled();
+    // Commit options on the left, the commit buttons up on the right — one row.
+    const actionsRow = el("div", "dc-actions");
+    actionsRow.append(optsRow, commitRow);
+    composer.append(branchLine, msgWrap, actionsRow);
+
+    const toolbar = el("div", "dc-toolbar");
+    const tTitle = el("span", "dc-toolbar-title");
+    tTitle.textContent = l10n.t("Changes");
+    const tSpacer = el("div", "topbar-spacer");
+    // Switch how this view presents staging (issue #16): the staged/unstaged
+    // split, or one list with a tick per file. A preference, not a migration —
+    // the split stays the default because the separation is clearer to read.
+    const modelBtn = el("button", "mini-btn dc-model");
+    const syncModelBtn = (): void => {
+      const checks = this.stagingModel() === "checkboxes";
+      modelBtn.replaceChildren(
+        glyph(checks ? "list-selection" : "list-flat"),
+        span(checks ? l10n.t("Checkboxes") : l10n.t("Staged / Unstaged")),
+      );
+      modelBtn.title = checks
+        ? l10n.t("Showing one list with a tick per file — click for the staged/unstaged split")
+        : l10n.t("Showing the staged/unstaged split — click for one list with checkboxes");
+    };
+    syncModelBtn();
+    modelBtn.addEventListener("click", () => {
+      this.stagingModelPref = this.stagingModel() === "checkboxes" ? "split" : "checkboxes";
+      this.persist();
+      syncModelBtn();
+      void this.showChangesView();
+    });
+
+    const stageAllBtn = el("button", "mini-btn");
+    stageAllBtn.append(glyph("check-all"), span(l10n.t("Stage all")));
+    stageAllBtn.addEventListener("click", () => void this.changesAction("stageAll", undefined));
+    // Create a PR from the branch you're working on — closes the local→remote→PR
+    // loop right where you commit. Shown only when the repo is on GitHub.
+    const createPrBtn = el("button", "mini-btn dc-createpr");
+    createPrBtn.append(glyph("git-pull-request"), span(l10n.t("Create pull request")));
+    createPrBtn.hidden = true;
+    createPrBtn.addEventListener("click", () => {
+      // LIVE, for the same reason syncCommitLabel above reads it live: the
+      // `curBranch` const is resolved when the composer is BUILT, and HEAD is
+      // usually still resolving at that moment — so the form opened with no
+      // head branch at all, and after a checkout it opened with the branch you
+      // had left. A form that pre-fills the wrong side of a pull request is
+      // worse than one that pre-fills nothing.
+      const h = this.headInfo;
+      const live = h && !h.detached ? h.branch : undefined;
+      void openCreatePr(() => this.routeView("prs", true), { head: live ?? curBranch });
+    });
+    swr("github:status", undefined, {
+      ttl: 60_000,
+      alive: () => createPrBtn.isConnected,
+      onData: (s) => {
+        createPrBtn.hidden = !(s.connected && !!s.repo);
+      },
+    });
+    // Hunk / line staging: stage (or unstage) exactly the lines selected in the
+    // open file's diff. Hidden until a file is open; relabelled by stage state.
+    let openFile: { path: string; staged: boolean } | null = null;
+    let whitespaceIgnored = false;
+    const stageLinesBtn = el("button", "mini-btn dc-stagelines") as HTMLButtonElement;
+    // Disabled, not hidden: hiding these two made every button to their left
+    // slide ~160px sideways the instant you clicked a file — the control you
+    // were aiming at moved out from under the cursor.
+    stageLinesBtn.disabled = true;
+    const stageLinesLabel = span(l10n.t("Stage lines"));
+    stageLinesBtn.append(glyph("list-selection"), stageLinesLabel);
+    stageLinesBtn.title = l10n.t("Stage (or unstage) the lines selected in the diff");
+    stageLinesBtn.addEventListener("click", async () => {
+      if (!openFile) return;
+      const lines = diffPanel.getSelectedLines();
+      if (!lines || !lines.length) {
+        toast(l10n.t("Select lines in the diff first."), "info");
+        return;
+      }
+      try {
+        const boundaries = diffPanel.getSelectedBoundaries() ?? undefined;
+        const r = await host.invoke("stage:lines", {
+          path: openFile.path,
+          lines,
+          ...(boundaries ? { boundaries } : {}),
+          reverse: openFile.staged,
+        });
+        if (!r.ok) toast(r.message || l10n.t("Couldn't apply the selected lines."), "error");
+        else toast(openFile.staged ? l10n.t("Unstaged selected lines.") : l10n.t("Staged selected lines."), "success");
+      } catch (e) {
+        toast(cleanErr(e) || l10n.t("Couldn't apply the selected lines."), "error");
+      }
+      void this.repaintChanges();
+    });
+    const wsBtn = el("button", "topbar-icon dc-ws") as HTMLButtonElement;
+    wsBtn.disabled = true;
+    wsBtn.title = l10n.t("Ignore leading and trailing whitespace");
+    wsBtn.setAttribute("aria-label", l10n.t("Ignore leading and trailing whitespace"));
+    wsBtn.appendChild(glyph("whitespace"));
+    wsBtn.setAttribute("aria-pressed", "false");
+    // A toggle you cannot read is a toggle you cannot trust: this one was an
+    // unlabelled glyph whose title said the same thing whichever way it was
+    // set, and which announced no state at all.
+    const syncWs = (): void => {
+      wsBtn.classList.toggle("is-on", whitespaceIgnored);
+      wsBtn.setAttribute("aria-pressed", String(whitespaceIgnored));
+      wsBtn.title = whitespaceIgnored
+        ? l10n.t("Leading and trailing whitespace is ignored — click to show it")
+        : l10n.t("Ignore leading and trailing whitespace");
+      wsBtn.setAttribute("aria-label", wsBtn.title);
+    };
+    syncWs();
+    wsBtn.addEventListener("click", () => {
+      whitespaceIgnored = !whitespaceIgnored;
+      syncWs();
+      diffPanel.setRenderOptions({ whitespace: whitespaceIgnored ? "trailing" : "none" });
+    });
+    const refreshBtn = el("button", "topbar-icon");
+    refreshBtn.title = l10n.t("Refresh");
+    refreshBtn.setAttribute("aria-label", l10n.t("Refresh"));
+    refreshBtn.appendChild(glyph("refresh"));
+    refreshBtn.addEventListener("click", () => void this.refreshInPlace(refreshBtn, () => this.showChangesView()));
+    // A stash button that follows the selection and relabels itself, matching the
+    // extension. Without one, the toolbar could stage everything but never stash
+    // anything, and the only stash route was a right-click most people never try.
+    // Stashing moves your working tree; its only affordance used to be an
+    // unlabelled glyph sitting between two text buttons. Label it. Its glyph
+    // is codicon's stash one — every stash control here and in the extension
+    // wears it (it was an archive box, which says "archive", not "stash").
+    const stashBtn = el("button", "mini-btn") as HTMLButtonElement;
+    stashBtn.append(glyph("git-stash"), span(l10n.t("Stash")));
+    // What the button will actually do, captured when its label is written.
+    //
+    // The label used to be computed from `selectionPaths()` at toolbar-build
+    // time, when `this.rowOrder` still held the PREVIOUS render's keys — and
+    // the click then called `selectionPaths()` AGAIN, against the rebuilt
+    // order, where those keys no longer matched. So the button could read
+    // "Stash 1 selected file…" and hand `[]` to `stashPaths`, which means the
+    // whole working tree. A control must do what it says, even when the state
+    // underneath it has moved.
+    let stashScope: string[] = [];
+    const syncStashBtn = (): void => {
+      stashScope = this.selectionPaths();
+      const n = stashScope.length;
+      const label =
+        n === 0
+          ? l10n.t("Stash all changes…")
+          : n === 1
+            ? l10n.t("Stash 1 selected file…")
+            : l10n.t("Stash {0} selected files…", n);
+      stashBtn.title = label;
+      stashBtn.setAttribute("aria-label", label);
+      stashBtn.classList.toggle("is-on", n > 0);
+    };
+    this.syncStashButton = syncStashBtn;
+    syncStashBtn();
+    stashBtn.addEventListener("click", () => {
+      // With a selection live it follows it; otherwise it means the whole tree,
+      // and the title has already said which. `stashScope` is what the title
+      // was written from, so the two can never disagree.
+      void this.stashPaths(stashScope).then(() => this.clearSelection(lists, selBar));
+    });
+
+    toolbar.append(tTitle, tSpacer, modelBtn, reviewBtn, createPrBtn, stageLinesBtn, wsBtn, stashBtn, stageAllBtn, refreshBtn);
+
+    const body = el("div", "dc-body");
+    const lists = el("div", "dc-lists");
+    // ↑/↓ and j/k, the same as every other list in the app — and the same as the
+    // app's own cheat sheet has been promising. Five lists wired this; the
+    // LANDING view was not one of them, so the first list most people ever touch
+    // was the one where the documented keys did nothing.
+    wireListNav(lists, ".dc-file");
+    lists.style.flex = `0 0 ${this.changesListW}px`;
+    // Only when there is nothing cached to draw. See the status load below.
+    if (peek("status", undefined) === undefined) lists.appendChild(skeletonList(6));
+
+    // Selection bar — present only while a selection exists, so the view is
+    // unchanged for anyone who never selects.
+    const selBar = el("div", "dc-selbar");
+    selBar.hidden = true;
+    const selCount = el("span", "dc-selbar-count");
+    const selStash = textBtn(l10n.t("Stash"), l10n.t("Stash the selected files"), () => {
+      const paths = this.selectionPaths();
+      if (paths.length === 0) return;
+      void this.stashPaths(paths).then(() => this.clearSelection(lists, selBar));
+    });
+    const selClear = textBtn(l10n.t("Clear"), l10n.t("Clear the selection"), () =>
+      this.clearSelection(lists, selBar),
+    );
+    const selActions = el("div", "dc-selbar-actions");
+    selActions.append(selStash, selClear);
+    selBar.append(selCount, selActions);
+
+    // The stash drop target, revealed only mid-drag.
+    const dropZone = el("div", "dc-stash-drop");
+    dropZone.hidden = true;
+    dropZone.append(glyph("git-stash"), span(l10n.t("Drop to stash"), "dc-drop-label"));
+    // dragover must be cancelled or the browser refuses the drop entirely and
+    // the whole gesture silently does nothing.
+    dropZone.addEventListener("dragover", (ev) => {
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+      dropZone.classList.add("is-over");
+    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("is-over"));
+    dropZone.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      const paths = this.dragPaths.slice();
+      this.hideStashDrop(dropZone);
+      if (paths.length === 0) return;
+      void this.stashPaths(paths).then(() => this.clearSelection(lists, selBar));
+    });
+    // A draggable divider between the file list and the diff (persisted width).
+    const divider = el("div", "cmp-vsplit dc-vsplit");
+    divider.append(el("div", "cmp-vsplit-grip"));
+    // The diff surface survives this rebuild (see `changesPanel`): same
+    // repository, panel still alive → the SAME element, with the merge editor,
+    // the dashboard and any confirm in it, moves into the new view.
+    const kept =
+      this.changesPanel &&
+      !this.changesPanel.panel.isDisposed &&
+      this.changesPanel.root === this.currentRepo?.root
+        ? this.changesPanel
+        : undefined;
+    const surface = kept ? kept.surface : el("div", "diff-surface");
+    // ONE writer for the width, because there were two and they disagreed: the
+    // keyboard set `listCol`, the pointer drag set `lists` — the inner list
+    // INSIDE that column — to `0 0 Wpx`, which also destroyed the `1 1 auto`
+    // the list needs to fill its column. Dragging appeared to do nothing to the
+    // column it was dragging, and left the list in a state the keyboard path
+    // never produced. `listCol` is declared below; this only ever runs after
+    // the view is built, so there is no temporal-dead-zone hit.
+    const setListW = (w: number): void => {
+      this.changesListW = w;
+      listCol.style.flex = `0 1 ${w}px`;
+    };
+    wireResizerKeys(divider, {
+      orientation: "vertical",
+      label: l10n.t("Resize file list"),
+      min: 220,
+      max: () => 640,
+      get: () => this.changesListW,
+      set: setListW,
+      onCommit: () => this.persist(),
+    });
+    divider.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      document.body.classList.add("resizing-h");
+      const startX = e.clientX;
+      const startW = this.changesListW;
+      const move = (ev: PointerEvent): void => {
+        setListW(Math.max(220, Math.min(640, startW + (ev.clientX - startX))));
+      };
+      const up = (): void => {
+        document.body.classList.remove("resizing-h");
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        this.persist();
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    });
+    // The list column carries its own selection bar and drop target beneath it,
+    // so both stay put while `lists` itself is cleared and refilled on repaint.
+    const listCol = el("div", "dc-listcol");
+    // `0 1` — the basis is the width the user chose, but the column SHRINKS
+    // before the diff does. Pinned at `0 0` it held that width at every window
+    // size and the diff paid for all of it: 529px of file names beside a 254px
+    // diff pane at 1000px, which cannot show a diff at all.
+    listCol.style.flex = `0 1 ${this.changesListW}px`;
+    lists.style.flex = "1 1 auto";
+    listCol.append(lists, selBar, dropZone);
+    body.append(listCol, divider, surface);
+    wrap.append(composer, toolbar, body);
+    // Whether the composer had the keyboard is read HERE, immediately before
+    // the swap — not at the top of this method, which is several awaits away
+    // and could have been true about a textarea the user has since left.
+    const composerHadFocus = document.activeElement?.classList.contains("dc-message") === true;
+    this.viewHost.replaceChildren(wrap);
+    if (composerHadFocus) {
+      textarea.focus({ preventScroll: true });
+      const caret = this.composerDraft.caret;
+      const end = textarea.value.length;
+      textarea.setSelectionRange(Math.min(caret?.start ?? end, end), Math.min(caret?.end ?? end, end));
+    }
+
+    let diffPanel: DiffPanel;
+    if (kept) {
+      diffPanel = kept.panel;
+      // Moved, not rebuilt: tell the editors their box may have changed.
+      window.setTimeout(() => {
+        if (!diffPanel.isDisposed) diffPanel.layout();
+      }, 0);
+    } else {
+      if (this.activeMonacoView !== this.changesPanel?.panel) this.activeMonacoView?.dispose();
+      this.changesPanel?.panel.dispose();
+      this.changesDash = undefined;
+      diffPanel = new DiffPanel(surface);
+      this.changesPanel = { root: this.currentRepo?.root ?? "", surface, panel: diffPanel };
+      diffPanel.showEmpty(l10n.t("Select a file to view its diff."));
+    }
+    this.activeMonacoView = diffPanel;
+
+    // Paint from what we already know, and only rebuild if the tree ACTUALLY
+    // moved. Before this, the file list was a 6-row skeleton on every entry and
+    // the answer was re-fetched past a 3s TTL — so clicking away for four
+    // seconds and coming back cost a git round trip and a flash of nothing, on
+    // the app's landing view, for a working tree that had not changed. The
+    // skeleton now appears only when there is genuinely nothing to show yet.
+    let files: ChangedFile[];
+    const known = peek("status", undefined);
+    if (known !== undefined) {
+      files = known;
+      void gget("status", undefined, 0)
+        .then((fresh) => {
+          // Drop an answer for a view the user has already left, and repaint
+          // only on a real difference — a rebuild here would otherwise throw
+          // away the open file, the scroll position and the selection every
+          // few seconds for no reason.
+          this.staleTreeWarned = false;
+          if (this.currentView !== "changes" || !lists.isConnected) return;
+          if (sameData(fresh, known)) return;
+          void this.showChangesView();
+        })
+        .catch((e) => {
+          // Keep the last good tree on screen — blanking it would turn a
+          // transient blip into a visible regression — but SAY that we could not
+          // confirm it. Silence here means a genuinely broken repo goes on
+          // showing a stale working tree that the user believes is current.
+          if (this.currentView !== "changes" || !lists.isConnected) return;
+          if (this.staleTreeWarned) return;
+          this.staleTreeWarned = true;
+          toast(
+            cleanErr(e) || l10n.t("Couldn't re-read the working tree — showing the last known state."),
+            "error",
+          );
+        });
+    } else {
+      try {
+        files = await gget("status", undefined, 3000);
+      } catch (e) {
+        // A failed status load must not leave the skeleton spinning forever.
+        lists.replaceChildren(
+          errorState(l10n.t("Couldn't read the working tree"), cleanErr(e) || l10n.t("Git status failed."), () =>
+            void this.showChangesView(),
+          ),
+        );
+        return;
+      }
+    }
+    const staged = files.filter((f) => f.staged);
+    const unstaged = files.filter((f) => !f.staged);
+    syncCommitLabel();
+    // A quiet context line: how many changes are staged vs. still to stage.
+    //
+    // In the same UNITS as the rows underneath it. `staged` and `unstaged` are
+    // status RECORDS, and a partially staged file (git's `MM`) appears in both
+    // — which is correct for the two-list model, where it really does have a
+    // row in each. The checkbox model deliberately collapses it to ONE row with
+    // an indeterminate tick, so counting records there put "5 staged · 6 to
+    // stage" directly above a header reading "Changes (10)": two numbers about
+    // the same list that cannot both be right.
+    const sumBits: string[] = [];
+    if (this.stagingModel() === "checkboxes") {
+      const paths = new Set([...staged, ...unstaged].map((f) => f.path));
+      const stagedPaths = new Set(staged.map((f) => f.path));
+      const unstagedPaths = new Set(unstaged.map((f) => f.path));
+      const partial = [...stagedPaths].filter((p) => unstagedPaths.has(p)).length;
+      const fully = stagedPaths.size - partial;
+      sumBits.push(fully ? l10n.t("{0} staged", fully) : l10n.t("nothing staged"));
+      if (partial) sumBits.push(l10n.t("{0} partly staged", partial));
+      const todo = paths.size - fully - partial;
+      if (todo) sumBits.push(l10n.t("{0} to stage", todo));
+    } else {
+      sumBits.push(staged.length ? l10n.t("{0} staged", staged.length) : l10n.t("nothing staged"));
+      if (unstaged.length) sumBits.push(l10n.t("{0} to stage", unstaged.length));
+    }
+    branchSummary.textContent = `· ${sumBits.join(" · ")}`;
+
+    // Mid-operation: the conflicts dashboard — the component the extension and
+    // Merge Studio mount too — where the banner used to be. It fills the diff
+    // surface while no file is open; with a file open, a strip across the top
+    // names the operation and leads back to it.
+    //
+    // The banner's two guards carry over, moved to where they now belong:
+    // every destructive verb confirms (inline, in the dashboard), and a verb in
+    // flight locks every control — `exclusive()` in mergeParity is ONE lock for
+    // the dashboard and the merge editor, because the main process queues a
+    // second call rather than dropping it.
+    const deselectRows = (): void => {
+      lists.querySelectorAll(".file-row.active").forEach((n) => n.classList.remove("active"));
+      openFile = null;
+      this.changesOpenKey = undefined;
+      stageLinesBtn.disabled = true;
+      wsBtn.disabled = true;
+    };
+    const openConflictRow = (path: string): void => {
+      const rows = [...lists.querySelectorAll<HTMLElement>(".dc-file")].filter((r) => r.dataset.path === path);
+      const row = rows.find((r) => r.dataset.kind === "unstaged") ?? rows[0];
+      const f = row ? (row.dataset.kind === "staged" ? staged : unstaged).find((x) => x.path === path) : undefined;
+      if (row && f) {
+        selectRow(row, f);
+        row.scrollIntoView({ block: "nearest" });
+        return;
+      }
+      // Not in the list — a file deleted on both sides has no working copy to
+      // list. Open it all the same.
+      deselectRows();
+      void this.openWorkingFile(diffPanel, path);
+    };
+    let conflictsUi: { fileOpened(): void } | undefined;
+    void host
+      .invoke("git:opState", undefined)
+      .then(async (op) => {
+        this.syncOpIndicators(op);
+        if (this.currentView !== "changes" || !wrap.isConnected) return;
+        // The host decides WHAT is in progress; nothing here re-derives it.
+        if (!op || (!op.kind && op.conflicts === 0)) {
+          // A stash apply's last conflict just resolved: git keeps no
+          // operation for it, so "nothing stopped" is its end — the dashboard
+          // stays up to say so (the rows, "Stash applied", the stash still in
+          // the list), until a file is opened. Read once more to know: a
+          // resolution made in a terminal reached here without one.
+          if (this.conflictsCtl?.watchingStash() && this.changesOpenKey === undefined) {
+            await this.conflictsCtl.refresh();
+            if (this.currentView !== "changes" || !wrap.isConnected) return;
+          }
+          if (this.conflictsCtl?.hasFinished() && this.changesOpenKey === undefined) {
+            conflictsUi = this.mountChangesConflicts(wrap, diffPanel, {
+              openMerge: openConflictRow,
+              deselect: deselectRows,
+            });
+            return;
+          }
+          this.changesShowConflicts = undefined;
+          this.changesOpenMerge = undefined;
+          // Nothing stopped any more: a dashboard kept in the surface from
+          // before this repaint has nothing left to show.
+          if (diffPanel.hostElement("dc-conflicts")) {
+            this.changesDash = undefined;
+            diffPanel.showEmpty(l10n.t("Select a file to view its diff."));
+          }
+          return;
+        }
+        conflictsUi = this.mountChangesConflicts(wrap, diffPanel, {
+          openMerge: openConflictRow,
+          deselect: deselectRows,
+        });
+      })
+      .catch(() => {
+        /* no operation state: the list itself still works */
+      });
+
+    /** Select a row and open its diff — the one path a click and a restore share. */
+    const selectRow = (row: HTMLElement, f: ChangedFile): void => {
+      conflictsUi?.fileOpened();
+      lists.querySelectorAll(".file-row.active").forEach((n) => n.classList.remove("active"));
+      row.classList.add("active");
+      openFile = { path: f.path, staged: !!f.staged };
+      this.changesOpenKey = rowKey(f.staged ? "staged" : "unstaged", f.path);
+      stageLinesLabel.textContent = f.staged ? l10n.t("Unstage lines") : l10n.t("Stage lines");
+      // Held CLOSED until the diff actually arrives and turns out to have a
+      // line editor in it. These used to be opened by the click that selected
+      // the row, before the diff had even been asked for — so over a binary, a
+      // conflict, a truncated file or a failed read they sat lit above a pane
+      // with no editor, and answered a press with "select some lines first":
+      // advice that cannot be followed, about a control that could never work
+      // on this file.
+      stageLinesBtn.disabled = true;
+      wsBtn.disabled = true;
+      // `finally`, not `then`: these buttons start CLOSED, so a rejection here
+      // would leave them shut over a file whose diff is on screen, and the only
+      // way out would be to pick a different file. A read that failed has no
+      // line editor either, which is the state this settles them into.
+      void this.openWorkingFile(diffPanel, f.path).finally(() => {
+        if (this.changesOpenKey !== rowKey(f.staged ? "staged" : "unstaged", f.path)) return;
+        const live = diffPanel.hasLineEditor();
+        stageLinesBtn.disabled = !live;
+        wsBtn.disabled = !live;
+        const why = l10n.t("This file has no line-by-line diff to work with.");
+        stageLinesBtn.title = live ? "" : why;
+        // `syncWs` OWNS this title — it depends on whether whitespace is
+        // currently ignored, not only on whether there is a diff to ignore it
+        // in. Writing the "turn it on" text here unconditionally relabelled a
+        // toggle that was already ON as though it were off, on every file you
+        // opened: the exact "titles never change with their state" defect the
+        // log toolbar was fixed for, reintroduced one toolbar over.
+        if (live) syncWs();
+        else wsBtn.title = why;
+      });
+    };
+
+    const fileRow = (f: ChangedFile, kind: "staged" | "unstaged"): HTMLElement => {
+      const row = el("button", `file-row dc-file status-${f.status}`);
+      const slash = f.path.lastIndexOf("/");
+      const base = slash >= 0 ? f.path.slice(slash + 1) : f.path;
+      const dir = slash >= 0 ? f.path.slice(0, slash) : "";
+      // NAME the row explicitly, because it is a <button> that CONTAINS
+      // buttons. Without a name of its own it derives one from its contents,
+      // so giving the row actions labels that name their file — the right fix
+      // for the actions — folded that path into the row's announcement three
+      // times over: "app.css Stage app.css Discard app.css". Carrying the
+      // status letter and the staged side says what the path alone cannot.
+      row.setAttribute(
+        "aria-label",
+        `${kind === "staged" ? "Staged" : "Unstaged"} ${statusWord(f.status)} ${f.path}`,
+      );
+      row.appendChild(glyph(fileIcon(base)));
+      const meta = el("div", "dc-file-meta");
+      meta.appendChild(span(base, "dc-file-name"));
+      if (dir) meta.appendChild(span(dir, "dc-file-dir"));
+      row.appendChild(meta);
+      const st = el("span", "file-status");
+      st.textContent = f.status;
+      row.appendChild(st);
+      row.title = f.path;
+      const actions = el("div", "row-actions");
+      if (kind === "staged") {
+        actions.appendChild(
+          textBtn(l10n.t("Unstage"), l10n.t("Unstage this file"), () => void this.changesAction("unstage", f.path), false, f.path),
+        );
+      } else {
+        actions.appendChild(
+          textBtn(l10n.t("Stage"), l10n.t("Stage this file"), () => void this.changesAction("stage", f.path), false, f.path),
+        );
+        actions.appendChild(
+          textBtn(l10n.t("Discard"), l10n.t("Discard changes to this file"), () => {
+            void confirmDialog(this.discardConfirm([f.path])).then((ok) => {
+              if (ok) void this.changesAction("discard", f.path);
+            });
+          }, true, f.path),
+        );
+      }
+      row.appendChild(actions);
+
+      const key = rowKey(kind, f.path);
+      row.dataset.path = f.path;
+      row.dataset.kind = kind;
+      row.dataset.key = key;
+      this.rowOrder.push(key);
+      if (this.selectedRows.has(key)) {
+        row.classList.add("is-selected");
+        row.setAttribute("aria-selected", "true");
+      }
+
+      row.addEventListener("click", (ev) => {
+        // A modifier click selects; a plain one opens the file, as before.
+        if (this.handleSelectionClick(ev, key, lists, selBar)) return;
+        selectRow(row, f);
+      });
+
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        // Right-clicking outside the selection acts on THAT row, so a menu can
+        // never quietly operate on files scrolled out of sight.
+        if (this.selectedRows.size > 0 && !this.selectedRows.has(key)) {
+          this.clearSelection(lists, selBar);
+        }
+        const multi = this.selectedRows.has(key) && this.selectedRows.size > 1;
+        openMenu(row, multi ? this.multiRowMenu(lists, selBar) : this.singleRowMenu(f, kind, lists, selBar));
+      });
+
+      // Drag a row — or the whole selection — onto the stash target.
+      row.draggable = true;
+      row.addEventListener("dragstart", (ev) => {
+        if (!this.selectedRows.has(key)) {
+          this.selectedRows.clear();
+          this.selectedRows.add(key);
+          this.selectionAnchor = key;
+          this.paintSelection(lists, selBar);
+        }
+        const paths = this.selectionPaths();
+        this.dragPaths = paths;
+        ev.dataTransfer?.setData("text/plain", paths.join("\n"));
+        if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+        row.classList.add("dragging");
+        this.showStashDrop(dropZone, paths.length);
+      });
+      row.addEventListener("dragend", () => {
+        this.dragPaths = [];
+        row.classList.remove("dragging");
+        this.hideStashDrop(dropZone);
+      });
+
+      return row;
+    };
+
+    lists.replaceChildren();
+    // What the composer's enable rule needs to know: is there anything here to
+    // commit at all. Set on every render, before the empty-tree early return.
+    this.changesHaveWork = files.length > 0;
+    this.syncCommitEnabled?.();
+    // Rebuilt with the rows below, so a shift-range always covers what is on
+    // screen rather than what was there before the last stage.
+    this.rowOrder = [];
+    if (files.length === 0) {
+      lists.appendChild(
+        emptyState(l10n.t("Working tree clean"), l10n.t("No changes to commit."), { icon: "check-all" }),
+      );
+      // Reconcile before leaving, exactly as the populated path does. Returning
+      // early left `selectedRows` holding keys for files that no longer exist,
+      // so the selection bar and the stash button went on describing a
+      // selection over a clean tree.
+      this.reconcileSelection(lists, selBar);
+      return;
+    }
+    if (this.stagingModel() === "checkboxes") {
+      // One list, a tick per file (issue #16). The tick IS the index: ticking
+      // stages, unticking unstages, and the checked state is read back from what
+      // git reports — so there is no shadow selection able to drift away from the
+      // repository, and an external `git add` keeps agreeing with the UI.
+      // ONE row per FILE. Concatenating the two lists gave a partially-staged
+      // file (git's `MM`: a staged edit plus a newer unstaged one) two rows —
+      // the same path listed twice, once ticked and once not, contradicting
+      // itself, and counted twice in "Changes (N)". In a model whose entire
+      // promise is "the tick is the index", one file cannot be both.
+      //
+      // Partial is a real third state, and a checkbox has one: indeterminate.
+      const byPath = new Map<string, { f: ChangedFile; staged: boolean; partial: boolean }>();
+      for (const f of staged) byPath.set(f.path, { f, staged: true, partial: false });
+      for (const f of unstaged) {
+        const prior = byPath.get(f.path);
+        // The UNSTAGED record wins the row: it is the one with unstaged hunks
+        // to open, which is what a partial file needs its twisty for.
+        byPath.set(f.path, { f, staged: false, partial: !!prior });
+      }
+      const all = [...byPath.values()].sort((a, b) => a.f.path.localeCompare(b.f.path));
+
+      // Selecting a "section" here means the CHECKED rows or the UNCHECKED ones:
+      // this model deliberately has no Staged/Unstaged split to click on.
+      const head = this.checklistHeader(l10n.t("Changes ({0})", all.length), all, lists, selBar);
+      const master = document.createElement("input");
+      master.type = "checkbox";
+      master.className = "dc-ck dc-ck-master";
+      master.checked = staged.length > 0 && unstaged.length === 0;
+      master.indeterminate = staged.length > 0 && unstaged.length > 0;
+      master.title = master.checked ? l10n.t("Uncheck all") : l10n.t("Check all");
+      master.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        // From a partial selection, one click means "include everything" — not a
+        // per-row toggle.
+        void this.changesAction(unstaged.length === 0 ? "unstageAll" : "stageAll", undefined);
+      });
+      head.insertBefore(master, head.firstChild);
+      lists.appendChild(head);
+
+      for (const { f, staged: isStaged, partial } of all) {
+        const row = fileRow(f, isStaged ? "staged" : "unstaged");
+        const ck = document.createElement("input");
+        ck.type = "checkbox";
+        ck.className = "dc-ck";
+        ck.checked = isStaged;
+        // Partly in, partly out — the state the two-row version could not say.
+        ck.indeterminate = partial;
+        // NAMED FOR THE FILE, not just the state.
+        //
+        // Every tick in the list said "Not included" or "Included in the
+        // commit", so three of them shared one name — which is useless to a
+        // screen reader ("not included" — WHAT isn't?) and actively harmful to
+        // the focus rescue: `sameThing` matches on `title`, so after the
+        // rebuild a tick took focus from the FIRST checkbox with that state,
+        // and ticking the fourth file moved the keyboard to the first.
+        const stateWord = partial
+          ? l10n.t("Partly included — some changes to this file are staged")
+          : isStaged
+            ? l10n.t("Included in the commit")
+            : l10n.t("Not included");
+        ck.title = l10n.t("{0} — {1}", stateWord, f.path);
+        ck.setAttribute("aria-label", ck.title);
+        ck.addEventListener("click", (ev) => {
+          // The row opens the diff; the tick must not.
+          ev.stopPropagation();
+          // Ticking the whole file supersedes any hunk view of it: those indexes
+          // describe a state that is about to stop existing.
+          this.expandedHunks.delete(f.path);
+          // From partial, one click means "include the whole file" — matching
+          // the master tick above, and the only reading that leaves the file in
+          // a state the checkbox can then describe.
+          void this.changesAction(partial ? "stage" : isStaged ? "unstage" : "stage", f.path);
+        });
+        row.insertBefore(ck, row.firstChild);
+
+        // A file with unstaged work opens up to tick individual changes (#20), so
+        // partial staging survives the move away from the staged/unstaged split.
+        const expandable = !isStaged;
+        if (expandable) {
+          const open = this.expandedHunks.has(f.path);
+          const tw = el("button", "dc-hunk-twisty" + (open ? " open" : ""));
+          tw.append(glyph("chevron-right"));
+          tw.title = open ? l10n.t("Hide individual changes") : l10n.t("Show individual changes");
+          tw.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            if (this.expandedHunks.has(f.path)) {
+              this.expandedHunks.delete(f.path);
+            } else {
+              this.expandedHunks.add(f.path);
+            }
+            void this.showChangesView();
+          });
+          row.insertBefore(tw, row.firstChild);
+        } else {
+          // Staged rows have no twisty, so without a spacer their content
+          // started ~29px left of the unstaged rows and the list read as two
+          // ragged columns. The cell is always there; only its ink isn't.
+          const spacer = el("span", "dc-hunk-twisty is-spacer");
+          spacer.setAttribute("aria-hidden", "true");
+          row.insertBefore(spacer, row.firstChild);
+        }
+        lists.appendChild(row);
+
+        if (expandable && this.expandedHunks.has(f.path)) {
+          const holder = el("div", "dc-hunks");
+          holder.append(span(l10n.t("Reading changes…"), "dc-hunk-empty"));
+          lists.appendChild(holder);
+          // Asked fresh every time: the file may have changed on disk since the
+          // list was built, and these indexes are positional.
+          void this.fillHunks(holder, f.path);
+        }
+      }
+      // NO `return` here: the tail below is model-agnostic — it keys off the
+      // `.dc-file` rows this branch emits too — and skipping it threw the open
+      // diff away on every tick, in the one model whose whole interaction is
+      // "tick boxes while reading the diff".
+    } else {
+      if (staged.length) {
+        lists.appendChild(
+          this.sectionHeader(l10n.t("Staged ({0})", staged.length), "staged", staged, lists, selBar),
+        );
+        staged.forEach((f) => lists.appendChild(fileRow(f, "staged")));
+      }
+      if (unstaged.length) {
+        lists.appendChild(
+          // "Changes" already names the view and the pane; this group is the
+          // UNSTAGED half, and calling it "Changes" beside "Staged" made the two
+          // read as unrelated rather than as a pair.
+          this.sectionHeader(l10n.t("Unstaged ({0})", unstaged.length), "unstaged", unstaged, lists, selBar),
+        );
+        unstaged.forEach((f) => lists.appendChild(fileRow(f, "unstaged")));
+      }
+    }
+    this.reconcileSelection(lists, selBar);
+
+    // Put the view back where the user left it. Everything above rebuilt the
+    // list from scratch — which is what closed the diff you were reading,
+    // deselected the row you had picked and scrolled you back to the top on
+    // every single stage, unstage, discard or refresh.
+    lists.addEventListener("scroll", () => {
+      this.changesScroll = lists.scrollTop;
+    });
+    const reopen = this.changesOpenKey;
+    if (reopen) {
+      const rows = [...lists.querySelectorAll<HTMLElement>(".dc-file")];
+      // Reopen the exact HALF that was open, matched by row KEY. A partially-
+      // staged file (git's `MM`) is two rows sharing one path in the split
+      // model, and the STAGED one renders first — so matching on the path alone
+      // always landed on it. Having the unstaged half open and touching
+      // anything at all (stage, unstage, discard, Refresh, a watcher tick)
+      // moved you to the staged half, which relabels this toolbar's
+      // "Stage lines" to "Unstage lines" and flips the `reverse` its click
+      // sends. `file:diff` is HEAD↔working tree either way, so the pane looked
+      // identical and the next click unstaged what you meant to stage.
+      //
+      // The half can legitimately be gone — staged in full, or discarded — and
+      // the file's other half is then the right place to land; only when no row
+      // is left for the path at all is the open diff actually dropped.
+      const row =
+        rows.find((r) => r.dataset.key === reopen) ??
+        rows.find((r) => r.dataset.path === parseRowKey(reopen).path);
+      // The ROW decides which record to reopen with, not the other way round.
+      // A partially-staged file has a record on both sides, and the checkbox
+      // model renders only the UNSTAGED one — reading `staged` first there
+      // reopened it labelled "Unstage lines" against an unstaged row.
+      const f = row
+        ? (row.dataset.kind === "staged" ? staged : unstaged).find(
+            (x) => x.path === row.dataset.path,
+          )
+        : undefined;
+      if (f && row) selectRow(row, f);
+      else this.changesOpenKey = undefined;
+    }
+    // A KEPT surface still shows what it showed before this repaint. With no
+    // file to reopen, that is stale — unless it is the conflicts dashboard,
+    // which the operation check below keeps or retires.
+    if (kept && this.changesOpenKey === undefined && !diffPanel.hostElement("dc-conflicts")) {
+      diffPanel.showEmpty(l10n.t("Select a file to view its diff."));
+    }
+    if (this.changesScroll > 0) lists.scrollTop = this.changesScroll;
+  }
+
+  /**
+   * Which staging model the Changes view presents: the staged/unstaged split, or
+   * one list with a tick per file (issue #16). Persisted with the other UI prefs
+   * and flipped from the View menu.
+   */
+  /**
+   * Populate one file's tickable changes. Ticking one stages exactly that change
+   * and leaves the rest of the file — and the working tree — alone.
+   */
+  private async fillHunks(holder: HTMLElement, path: string): Promise<void> {
+    const hunks = await host.invoke("hunks:list", path);
+    if (!this.expandedHunks.has(path)) {
+      return; // collapsed again while we were reading
+    }
+    holder.replaceChildren();
+    if (hunks.length === 0) {
+      holder.append(span(l10n.t("No separate changes to pick from."), "dc-hunk-empty"));
+      return;
+    }
+    for (const h of hunks) {
+      const row = el("div", "dc-hunk-row");
+      const ck = document.createElement("input");
+      ck.type = "checkbox";
+      ck.className = "dc-ck";
+      ck.checked = false; // by construction these are the UNSTAGED changes
+      ck.title = l10n.t("Include this change in the commit");
+      ck.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        void (async () => {
+          const r = await host.invoke("hunks:stage", { path, index: h.index });
+          if (!r.ok) {
+            toast(r.message || l10n.t("Couldn't stage that change."), r.expected ? "info" : "error");
+          }
+          void this.repaintChanges();
+        })();
+      });
+      // 1-based, matching what an editor's gutter shows.
+      const lines = span(
+        h.lineCount > 1 ? `L${h.start + 1}–${h.end + 1}` : `L${h.start + 1}`,
+        "dc-hunk-lines",
+      );
+      const preview = span(h.preview || "(whitespace only)", "dc-hunk-preview");
+      row.append(ck, lines, preview);
+      holder.append(row);
+    }
+  }
+
+  private stagingModel(): "split" | "checkboxes" {
+    return this.stagingModelPref;
+  }
+
+  private async openWorkingFile(diffPanel: DiffPanel, path: string): Promise<void> {
+    // Same staleness guard as openFile: a slow diff must not overwrite the file
+    // the user selected after it.
+    const gen = ++this.diffGen;
+    const diff = await host.invoke("file:diff", { path });
+    if (gen !== this.diffGen) return;
+    if (!diff) {
+      // NOT "no changes". `fileDiff` returns undefined when there is no
+      // repository open or the path failed its containment check — never
+      // because the two sides matched. This file is in the changed list
+      // PRECISELY BECAUSE it differs, so claiming equality here asserts
+      // something the app has no basis for. The same laundering of an absent
+      // answer into a reassuring one that "working tree clean" over
+      // uncommitted work would be.
+      diffPanel.showEmpty(
+        l10n.t("{0} is listed as changed, so this is a failure to read it — not a file that matches HEAD.", path),
+        { title: l10n.t("Couldn't read this file"), kind: "error" },
+      );
+      return;
+    }
+    if (diff.conflicted) {
+      // A read git could not answer (a killed or locked git now reports a
+      // failure instead of "nothing conflicted") says so here, rather than
+      // escaping as an unhandled rejection with the panel left as it was.
+      let model: ConflictModel | undefined;
+      try {
+        model = await host.invoke("conflict:model", path);
+      } catch (e) {
+        if (gen !== this.diffGen) return;
+        diffPanel.showEmpty(l10n.t("Couldn't read the conflict in {0}: {1}", path, cleanErr(e)), {
+          title: l10n.t("Couldn't read this conflict"),
+          kind: "error",
+        });
+        return;
+      }
+      if (gen !== this.diffGen) return;
+      if (model) {
+        // The shared merge shell decides between the three-pane editor and the
+        // no-text panel (a binary, a deleted side, a file too large to read
+        // whole) from the model's shape — never a text merge over bytes.
+        const handlers: ConflictHandlers = {
+          // Resolved: back to the dashboard, which shows the file done and —
+          // once nothing is left — the way to continue.
+          onResolved: () => {
+            this.returnKeyboardToDashboard(path);
+            this.changesOpenKey = undefined;
+            void this.repaintChanges();
+          },
+          onExit: () => {
+            this.returnKeyboardToDashboard(path);
+            if (this.changesShowConflicts) this.changesShowConflicts();
+            else diffPanel.showEmpty(l10n.t("Select a file to view its diff."));
+          },
+          onOperationChanged: (outcome) => {
+            this.changesOpenKey = undefined;
+            this.conflicts().setOutcome(outcome);
+            void this.afterOperationVerb(outcome);
+          },
+        };
+        const want = this.changesShellFocus;
+        this.changesShellFocus = undefined;
+        handlers.focusOnMount = !!want && want.path === path && Date.now() - want.at < 5000;
+        diffPanel.showConflict(model, handlers);
+        return;
+      }
+    }
+    diffPanel.showDiff(diff);
+  }
+
+  /**
+   * The merge editor is about to go (Exit viewer, or the file was resolved)
+   * and the dashboard to come back in its place. The editor takes the focused
+   * button with it, and the dashboard is rebuilt without the keyboard — so it
+   * landed on <body> and a keyboard user started over from the top bar. Ask
+   * the next dashboard paint to put it on this file's row instead; only when
+   * the keyboard was IN the editor (or already nowhere), and only for a
+   * moment, so a later repaint never pulls focus from wherever it has gone.
+   */
+  private returnKeyboardToDashboard(path: string): void {
+    const active = document.activeElement as HTMLElement | null;
+    // The editor, or the pane that stands in for it.
+    const inEditor = !active || active === document.body || !!active.closest(".merge-wrap, .ms-shell, .diff-empty");
+    this.changesDashFocus = inEditor ? { path, at: Date.now() } : undefined;
+  }
+
+  /** A dashboard just painted: honour a pending `returnKeyboardToDashboard`. */
+  private settleDashboardFocus(dash: ConflictsDashboard): void {
+    const want = this.changesDashFocus;
+    if (!want) return;
+    const active = document.activeElement as HTMLElement | null;
+    // Lost: nowhere, or on something no longer on screen (a button that hid
+    // itself as the dashboard came up still holds focus until the browser's
+    // next rendering update notices).
+    const lost =
+      !active ||
+      active === document.body ||
+      !active.isConnected ||
+      active.getClientRects().length === 0 ||
+      dash.element.contains(active);
+    if (Date.now() - want.at > 5000 || !lost) {
+      this.changesDashFocus = undefined;
+      return;
+    }
+    if (dash.focusFile(want.path)) this.changesDashFocus = undefined;
+  }
+
+  /** The app-lifetime conflicts controller (see `conflictsCtl`). */
+  private conflicts(): DesktopConflicts {
+    this.conflictsCtl ??= new DesktopConflicts({
+      invoke: host.invoke,
+      openMerge: (path) => {
+        // Merge… is a dashboard button, and the merge editor takes the
+        // dashboard's place with the button in it: the keyboard goes INTO
+        // the editor once it is up (openWorkingFile), not to <body>.
+        this.changesShellFocus = { path, at: Date.now() };
+        this.changesOpenMerge?.(path);
+      },
+      onFileChanged: () => void this.repaintChanges(),
+      onOperationChanged: (outcome) => void this.afterOperationVerb(outcome),
+      notify: (message, kind, action) => toast(message, kind, action ? 8000 : undefined, action),
+      undoable: didUndoable,
+      // A row's Accept says what it did in the row itself; ⌘Z still undoes it.
+      pushUndo: pushUndoable,
+    });
+    return this.conflictsCtl;
+  }
+
+  /**
+   * Mount the conflicts dashboard into the Changes view: the strip across the
+   * top, and the dashboard itself in the diff surface while no file is open.
+   * Returns the hook `selectRow` calls when a file takes the surface over.
+   */
+  private mountChangesConflicts(
+    wrap: HTMLElement,
+    diffPanel: DiffPanel,
+    hooks: { openMerge(path: string): void; deselect(): void },
+  ): { fileOpened(): void } {
+    const ctl = this.conflicts();
+    const strip = el("div", "dc-opstrip");
+    strip.hidden = true;
+    strip.setAttribute("role", "status");
+    const chip = span("", "dc-opstrip-chip");
+    const title = span("", "dc-opstrip-title");
+    const count = span("", "dc-opstrip-count");
+    const back = el("button", "mini-btn dc-opstrip-back") as HTMLButtonElement;
+    back.append(glyph("git-merge"), span(l10n.t("Show conflicts")));
+    back.title = l10n.t("Back to the conflicted files, and the way to continue or abort");
+    strip.append(glyph("warning"), chip, title, count, back);
+    wrap.insertBefore(strip, wrap.firstChild);
+
+    let dash: ConflictsDashboard | undefined;
+    const paintStrip = (): void => {
+      const s = ctl.current();
+      const covered = !dash || !dash.element.isConnected;
+      if (!s || !covered) {
+        strip.hidden = true;
+        return;
+      }
+      const t = stripText(s);
+      chip.textContent = t.chip;
+      title.textContent = t.title;
+      title.title = t.title;
+      count.textContent = t.pending
+        ? (t.pending === 1 ? l10n.t("1 file still conflicted") : l10n.t("{0} files still conflicted", t.pending))
+        : s.op.canContinue && s.op.verbs.continue
+          ? l10n.t("Ready: {0}", s.op.verbs.continue)
+          : "";
+      strip.hidden = false;
+    };
+    const render = (state: ConflictsState): void => {
+      if (dash?.element.isConnected) {
+        dash.render(state);
+        this.settleDashboardFocus(dash);
+      }
+      paintStrip();
+    };
+    const handle = ctl.attach(render);
+    const show = (): void => {
+      if (!wrap.isConnected) return;
+      hooks.deselect();
+      // Still on screen from before this repaint (the surface is kept): keep
+      // it, and any confirm open in it — rebuilding answered "Abort?" with
+      // nothing the moment the repository watcher fired.
+      const hosted = diffPanel.hostElement("dc-conflicts");
+      if (hosted && this.changesDash && hosted.contains(this.changesDash.element)) {
+        dash = this.changesDash;
+        strip.hidden = true;
+        void ctl.refresh();
+        return;
+      }
+      const hostEl = diffPanel.showHost("dc-conflicts");
+      // The pane is the dashboard's whole height: its list scrolls, and Abort
+      // and Continue stay on screen with thirty files in it (conflicts.css).
+      hostEl.classList.add("cd-host-fill");
+      // The dashboard announces itself (`ready`); the controller answers with
+      // the state, asynchronously, by which time `dash` is assigned.
+      dash = new ConflictsDashboard(hostEl, { post: handle, closable: false });
+      this.changesDash = dash;
+      strip.hidden = true;
+    };
+    back.addEventListener("click", () => {
+      // The strip hides itself as the dashboard comes up, with the keyboard
+      // on its button: send it to the row of the file that was open.
+      const open = this.changesOpenKey;
+      if (open && document.activeElement === back) {
+        this.changesDashFocus = { path: parseRowKey(open).path, at: Date.now() };
+      }
+      show();
+    });
+    this.changesShowConflicts = show;
+    this.changesOpenMerge = hooks.openMerge;
+    if (this.changesOpenKey === undefined) show();
+    else void ctl.refresh();
+    return {
+      fileOpened: () => {
+        // The file replaces the dashboard in the surface: the strip carries
+        // the operation until it comes back. A finished stash apply's card
+        // has been seen: it does not come back.
+        ctl.clearFinished();
+        window.setTimeout(paintStrip, 0);
+      },
+    };
+  }
+
+  /** After Continue / Skip / Abort — from the dashboard or the merge editor. */
+  private async afterOperationVerb(outcome: { kind: "done" | "stopped" | "failed"; text: string }): Promise<void> {
+    // A failure is always shown as one; a stop is news, not an error.
+    toast(outcome.text, outcome.kind === "done" ? "success" : outcome.kind === "failed" ? "error" : "info");
+    bust();
+    await this.refreshRefs();
+    await this.updateSync();
+    if (this.currentView === "changes") void this.showChangesView();
+  }
+
+  /**
+   * The Changes rail item's badge and the top-bar chip: an operation stopped
+   * for you is visible from every view, not only from Changes.
+   */
+  private syncOpIndicators(op: GitOpState | undefined): void {
+    const ind = opIndicator(op);
+    const item = this.railEl?.querySelector<HTMLElement>('.nav-item[data-view="changes"]');
+    if (item) {
+      item.dataset.baseTitle ??= item.title;
+      item.dataset.baseLabel ??= item.getAttribute("aria-label") ?? "Changes";
+      let badge = item.querySelector<HTMLElement>(".nav-badge");
+      if (ind) {
+        if (!badge) {
+          badge = span("", "nav-badge");
+          badge.setAttribute("aria-hidden", "true");
+          item.appendChild(badge);
+        }
+        badge.textContent = ind.badge;
+        item.title = `${item.dataset.baseTitle} — ${ind.title}`;
+        item.setAttribute("aria-label", `${item.dataset.baseLabel} — ${ind.title}`);
+      } else {
+        badge?.remove();
+        item.title = item.dataset.baseTitle;
+        item.setAttribute("aria-label", item.dataset.baseLabel);
+      }
+    }
+    const chip = this.opChipEl;
+    if (chip) {
+      const was = chip.hidden;
+      chip.hidden = !ind;
+      if (ind) {
+        chip.replaceChildren(glyph("git-merge"), span(ind.label, "topbar-opchip-label"));
+        chip.title = ind.title;
+        chip.setAttribute("aria-label", ind.title);
+      }
+      if (was !== chip.hidden) this.fitTopbar?.();
+    }
+  }
+
+  /** Selection helpers — see selectedRows for why the key is kind:path. */
+  /**
+   * The confirmation for a Discard, told truthfully for these exact files.
+   *
+   * Discard means two different things and the dialog only ever described one.
+   * For a TRACKED file it reverts edits and the file stays. For an UNTRACKED one
+   * the bridge runs `git clean`, which deletes the file from disk — and git has
+   * no copy of it, so there is nothing to restore it from, ever. Both cases said
+   * "Discard your changes to <path>? This can't be undone", which someone with a
+   * brand-new file reasonably reads as "revert my edits". They lose the file.
+   */
+  private discardConfirm(paths: string[]): {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    danger: true;
+  } {
+    const files = peek("status", undefined) ?? [];
+    const untrackedPaths = new Set(
+      files.filter((f) => f.status === "?" && !f.staged).map((f) => f.path),
+    );
+    const conflictedPaths = new Set(files.filter((f) => f.conflicted).map((f) => f.path));
+    const gone = paths.filter((p) => untrackedPaths.has(p));
+    const reverted = paths.filter((p) => !untrackedPaths.has(p));
+    const one = paths.length === 1;
+
+    // A CONFLICTED path is a third thing, and the dialog described neither of
+    // the two it knew about. Discard here does not delete the file and does not
+    // revert it to HEAD — it recreates the conflict from the index, throwing
+    // away the resolution work and nothing else. Said as "permanently discard",
+    // it read as if the file were about to be destroyed.
+    const stuck = paths.filter((p) => conflictedPaths.has(p));
+    if (stuck.length) {
+      const onlyStuck = stuck.length === paths.length;
+      // Every OTHER kind in the selection still has to be described. This
+      // branch used to return the moment it saw one conflicted path, so a
+      // selection holding a conflicted file AND an untracked one lost the
+      // sentence saying the untracked file would be DELETED from disk with
+      // nothing to restore it from — the single most important sentence this
+      // dialog can say, dropped because something else in the list was
+      // conflicted.
+      const alsoGone = gone.filter((p) => !conflictedPaths.has(p));
+      const alsoReverted = reverted.filter((p) => !conflictedPaths.has(p));
+      const parts: string[] = [
+        stuck.length === 1
+          ? l10n.t(
+              "{0} is still conflicted: discarding puts its conflict back exactly as git left it, and whatever you have resolved in it is lost. The file itself stays.",
+              stuck[0],
+            )
+          : l10n.t(
+              "{0} of these files are still conflicted: their conflicts come back as git left them, and the resolution work in them is lost. The files themselves stay.",
+              stuck.length,
+            ),
+      ];
+      if (alsoGone.length) {
+        parts.push(
+          alsoGone.length === 1
+            ? l10n.t(
+                "{0} isn't tracked by git, so discarding it DELETES the file from disk. Git has no copy of it — there is nothing to restore it from.",
+                alsoGone[0],
+              )
+            : l10n.t(
+                "{0} of them aren't tracked by git, so discarding them DELETES those files from disk. Git has no copy of them — there is nothing to restore them from.",
+                alsoGone.length,
+              ),
+        );
+      }
+      if (alsoReverted.length) {
+        parts.push(
+          alsoReverted.length === 1
+            ? l10n.t("The other file has its changes reverted.")
+            : l10n.t("The other {0} have their changes reverted.", alsoReverted.length),
+        );
+      }
+      if (!onlyStuck) parts.push(l10n.t("None of it can be undone."));
+      return {
+        title: alsoGone.length
+          ? l10n.t("Discard changes and delete files?")
+          : stuck.length === 1
+            ? l10n.t("Start this conflict again?")
+            : l10n.t("Start these conflicts again?"),
+        message: parts.join(" "),
+        confirmLabel: alsoGone.length
+          ? l10n.t("Discard and delete")
+          : stuck.length === 1
+            ? l10n.t("Restore the conflict")
+            : l10n.t("Restore the conflicts"),
+        danger: true,
+      };
+    }
+
+    if (gone.length === 0) {
+      // Tracked files are recoverable now: the app records a restore point
+      // before the discard and offers Undo. Still a confirm — this throws away
+      // work — but the dialog must not go on claiming otherwise.
+      return {
+        title: l10n.t("Discard changes?"),
+        message: one
+          ? l10n.t("Discard your changes to {0}? You can undo this straight afterwards.", paths[0])
+          : l10n.t("Discard your changes to {0} files? You can undo this straight afterwards.", paths.length),
+        confirmLabel: l10n.t("Discard"),
+        danger: true,
+      };
+    }
+    if (reverted.length === 0) {
+      return {
+        title: one ? l10n.t("Delete this file?") : l10n.t("Delete {0} files?", gone.length),
+        message: one
+          ? l10n.t(
+              "{0} isn't tracked by git, so discarding it DELETES the file from disk. Git has no copy of it — there is nothing to restore it from.",
+              gone[0],
+            )
+          : l10n.t(
+              "{0} of these files aren't tracked by git, so discarding them DELETES them from disk. Git has no copy of them — there is nothing to restore them from.",
+              gone.length,
+            ),
+        confirmLabel: one ? l10n.t("Delete file") : l10n.t("Delete {0} files", gone.length),
+        danger: true,
+      };
+    }
+    return {
+      title: l10n.t("Discard changes and delete files?"),
+      message: l10n.t(
+        "{0} of these {1} files aren't tracked by git and will be DELETED from disk with no way to restore them. The other {2} will have their changes reverted, and that part can be undone.",
+        gone.length,
+        paths.length,
+        reverted.length,
+      ),
+      confirmLabel: l10n.t("Discard and delete"),
+      danger: true,
+    };
+  }
+
+  private selectionEntries(): Array<{ kind: string; path: string }> {
+    return selectionEntries(this.rowOrder, this.selectedRows);
+  }
+
+  /** Distinct paths in the selection — what git actually needs. */
+  private selectionPaths(): string[] {
+    return selectionPaths(this.rowOrder, this.selectedRows);
+  }
+
+  private paintSelection(lists: HTMLElement, selBar: HTMLElement): void {
+    lists.querySelectorAll<HTMLElement>(".dc-file").forEach((r) => {
+      const on = !!r.dataset.key && this.selectedRows.has(r.dataset.key);
+      r.classList.toggle("is-selected", on);
+      if (on) r.setAttribute("aria-selected", "true");
+      else r.removeAttribute("aria-selected");
+    });
+    const n = this.selectionPaths().length;
+    selBar.hidden = n === 0;
+    const count = selBar.querySelector(".dc-selbar-count");
+    if (count) count.textContent = n === 1 ? l10n.t("1 file selected") : l10n.t("{0} files selected", n);
+    this.syncStashButton?.();
+  }
+
+  private clearSelection(lists: HTMLElement, selBar: HTMLElement): void {
+    this.selectedRows.clear();
+    this.selectionAnchor = undefined;
+    this.paintSelection(lists, selBar);
+  }
+
+  /**
+   * Returns true when the click was a SELECTION gesture, so the row's normal
+   * action should not also run. A plain click is not one: it clears the
+   * selection and opens the file, exactly as before.
+   */
+  private handleSelectionClick(
+    ev: MouseEvent,
+    key: string,
+    lists: HTMLElement,
+    selBar: HTMLElement,
+  ): boolean {
+    const intent = clickIntent(ev, this.selectionAnchor !== undefined);
+    if (intent === "range") {
+      const range = rangeBetween(this.rowOrder, this.selectionAnchor!, key);
+      if (range.length > 0) {
+        this.selectedRows = new Set(range);
+        this.paintSelection(lists, selBar);
+        return true;
+      }
+    }
+    if (intent === "toggle") {
+      if (this.selectedRows.has(key)) this.selectedRows.delete(key);
+      else this.selectedRows.add(key);
+      this.selectionAnchor = key;
+      this.paintSelection(lists, selBar);
+      return true;
+    }
+    if (this.selectedRows.size > 0) {
+      this.selectedRows.clear();
+      this.paintSelection(lists, selBar);
+    }
+    this.selectionAnchor = key;
+    return false;
+  }
+
+  private showStashDrop(zone: HTMLElement, count: number): void {
+    const label = zone.querySelector(".dc-drop-label");
+    if (label) {
+      label.textContent = count === 1 ? l10n.t("Drop to stash 1 file") : l10n.t("Drop to stash {0} files", count);
+    }
+    zone.hidden = false;
+  }
+
+  private hideStashDrop(zone: HTMLElement): void {
+    zone.hidden = true;
+    zone.classList.remove("is-over");
+  }
+
+  /**
+   * Drop selected rows that no longer exist, after a repaint.
+   *
+   * A file that was selected and has since been staged, committed or reverted is
+   * simply gone from the list; a selection still counting it would offer to
+   * stash files that are not there. rowOrder is everything the repaint emitted,
+   * so anything outside it is stale.
+   */
+  private reconcileSelection(lists: HTMLElement, selBar: HTMLElement): void {
+    this.selectedRows = reconcile(this.rowOrder, this.selectedRows);
+    if (this.selectionAnchor && !this.rowOrder.includes(this.selectionAnchor)) {
+      this.selectionAnchor = undefined;
+    }
+    this.paintSelection(lists, selBar);
+  }
+
+  /**
+   * A group label that also selects its whole section on ctrl/cmd-click.
+   *
+   * Same modifier the rows use, so there is one convention rather than a second
+   * mechanism beside it. Clicking again clears the section, which is what makes
+   * it a toggle rather than a trap.
+   */
+  private sectionHeader(
+    text: string,
+    kind: "staged" | "unstaged",
+    files: readonly ChangedFile[],
+    lists: HTMLElement,
+    selBar: HTMLElement,
+  ): HTMLElement {
+    const head = groupLabel(text);
+    head.title = l10n.t("{0} — Ctrl/Cmd-click to select every file in this section", text);
+    head.addEventListener("click", (ev) => {
+      if (!(ev.ctrlKey || ev.metaKey)) return;
+      ev.preventDefault();
+      const keys = files.map((f) => rowKey(kind, f.path));
+      const allOn = keys.length > 0 && keys.every((k) => this.selectedRows.has(k));
+      for (const k of keys) {
+        if (allOn) this.selectedRows.delete(k);
+        else this.selectedRows.add(k);
+      }
+      this.selectionAnchor = keys.length > 0 ? keys[keys.length - 1] : undefined;
+      this.paintSelection(lists, selBar);
+    });
+    return head;
+  }
+
+  /**
+   * The checkbox model's single header, with section selection on it.
+   *
+   * Ctrl/cmd-click takes everything, matching the split model's headers.
+   * Right-click names the two halves, because there is no second header to
+   * modifier-click — in this model "the sections" are checked and unchecked.
+   */
+  private checklistHeader(
+    text: string,
+    all: ReadonlyArray<{ f: ChangedFile; staged: boolean }>,
+    lists: HTMLElement,
+    selBar: HTMLElement,
+  ): HTMLElement {
+    const head = groupLabel(text);
+    head.title = l10n.t(
+      "{0} — Ctrl/Cmd-click to select every file, right-click to select just the checked or unchecked ones",
+      text,
+    );
+
+    const keysFor = (which: "all" | "checked" | "unchecked"): string[] =>
+      all
+        .filter((x) => which === "all" || (which === "checked") === x.staged)
+        .map((x) => rowKey(x.staged ? "staged" : "unstaged", x.f.path));
+
+    const selectKeys = (keys: string[]): void => {
+      this.selectedRows = new Set(keys);
+      this.selectionAnchor = keys.length > 0 ? keys[keys.length - 1] : undefined;
+      this.paintSelection(lists, selBar);
+    };
+
+    head.addEventListener("click", (ev) => {
+      if (!(ev.ctrlKey || ev.metaKey)) return;
+      ev.preventDefault();
+      const every = keysFor("all");
+      const allOn = every.length > 0 && every.every((k) => this.selectedRows.has(k));
+      selectKeys(allOn ? [] : every);
+    });
+
+    head.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      const checked = keysFor("checked");
+      const unchecked = keysFor("unchecked");
+      const items: MenuItem[] = [
+        { label: l10n.t("Select all ({0})", all.length), icon: "check-all", onClick: () => selectKeys(keysFor("all")) },
+      ];
+      if (checked.length > 0) {
+        items.push({ label: l10n.t("Select checked ({0})", checked.length), icon: "check", onClick: () => selectKeys(checked) });
+      }
+      if (unchecked.length > 0) {
+        items.push({ label: l10n.t("Select unchecked ({0})", unchecked.length), icon: "circle-outline", onClick: () => selectKeys(unchecked) });
+      }
+      items.push({ separator: true });
+      items.push({
+        label: l10n.t("Stash all changes"), icon: "git-stash",
+        onClick: () => void this.stashPaths([]).then(() => this.clearSelection(lists, selBar)),
+      });
+      openMenu(head, items);
+    });
+
+    return head;
+  }
+
+  /** The row menu for a single file. */
+  private singleRowMenu(
+    f: ChangedFile,
+    kind: "staged" | "unstaged",
+    lists: HTMLElement,
+    selBar: HTMLElement,
+  ): MenuItem[] {
+    const items: MenuItem[] = [];
+    if (kind === "staged") {
+      items.push({
+        label: l10n.t("Unstage"), icon: "remove",
+        onClick: () => void this.changesAction("unstage", f.path),
+      });
+    } else {
+      items.push({
+        label: l10n.t("Stage"), icon: "add",
+        onClick: () => void this.changesAction("stage", f.path),
+      });
+    }
+    items.push({ separator: true });
+    items.push({
+      label: l10n.t("Stash this file"), icon: "git-stash",
+      onClick: () => void this.stashPaths([f.path]).then(() => this.clearSelection(lists, selBar)),
+    });
+    items.push({
+      label: l10n.t("Stash all changes"), icon: "git-stash",
+      onClick: () => void this.stashPaths([]).then(() => this.clearSelection(lists, selBar)),
+    });
+    if (kind !== "staged") {
+      items.push({ separator: true });
+      items.push({
+        label: l10n.t("Discard changes"), icon: "discard",
+        onClick: () => {
+          void confirmDialog(this.discardConfirm([f.path])).then((ok) => {
+            if (ok) void this.changesAction("discard", f.path);
+          });
+        },
+      });
+    }
+    return items;
+  }
+
+  /** The row menu when several rows are selected. Counts are files, not rows. */
+  private multiRowMenu(lists: HTMLElement, selBar: HTMLElement): MenuItem[] {
+    const entries = this.selectionEntries();
+    const paths = this.selectionPaths();
+    // Sentence case, like every other menu in the app — this one read
+    // "Stash 3 Files" beside a "Stash all changes" twin three lines above it.
+    const noun = (n: number) => (n === 1 ? l10n.t("1 file") : l10n.t("{0} files", n));
+    const stageable = entries.filter((e) => e.kind !== "staged");
+    const unstageable = entries.filter((e) => e.kind === "staged");
+
+    const items: MenuItem[] = [
+      {
+        label: l10n.t("Stash {0}", noun(paths.length)), icon: "git-stash",
+        onClick: () => void this.stashPaths(paths).then(() => this.clearSelection(lists, selBar)),
+      },
+      { separator: true },
+    ];
+    if (stageable.length > 0) {
+      items.push({
+        label: l10n.t("Stage {0}", noun(stageable.length)), icon: "add",
+        onClick: () => void this.bulkAction("stage", stageable.map((e) => e.path), lists, selBar),
+      });
+    }
+    if (unstageable.length > 0) {
+      items.push({
+        label: l10n.t("Unstage {0}", noun(unstageable.length)), icon: "remove",
+        onClick: () => void this.bulkAction("unstage", unstageable.map((e) => e.path), lists, selBar),
+      });
+    }
+    const discardable = entries.filter((e) => e.kind === "unstaged").map((e) => e.path);
+    if (discardable.length > 0) {
+      items.push({ separator: true });
+      items.push({
+        label: l10n.t("Discard {0}", noun(discardable.length)), icon: "discard",
+        onClick: () => {
+          void confirmDialog(this.discardConfirm(discardable)).then((ok) => {
+            if (ok) void this.bulkAction("discard", discardable, lists, selBar);
+          });
+        },
+      });
+    }
+    return items;
+  }
+
+  /**
+   * Apply one staging action to several paths, repainting ONCE at the end.
+   *
+   * changesAction repaints per call, so looping it over ten files rebuilds the
+   * view ten times — visibly, and with the list jumping under the cursor.
+   */
+  private async bulkAction(
+    channel: "stage" | "unstage" | "discard",
+    paths: string[],
+    lists: HTMLElement,
+    selBar: HTMLElement,
+  ): Promise<void> {
+    const restore = channel === "discard" ? await this.beforeDiscard(paths) : undefined;
+    let failed = 0;
+    for (const path of paths) {
+      const r = await host.invoke(channel, path);
+      if (!r.ok) failed++;
+    }
+    if (failed > 0) {
+      toast(failed === paths.length ? l10n.t("Nothing could be applied.") : l10n.t("{0} of {1} failed.", failed, paths.length), "error");
+    }
+    this.clearSelection(lists, selBar);
+    void this.repaintChanges();
+    if (!failed) this.offerDiscardUndo(restore);
+  }
+
+  /**
+   * Record where the working tree was, just before a discard throws part of it
+   * away.
+   *
+   * Only the TRACKED paths: an untracked file is deleted by `git clean` and git
+   * has no copy of it to restore from, so it must not be listed as recoverable
+   * — the confirm dialog says as much, and an Undo that silently skipped it
+   * would contradict the sentence the user just read.
+   */
+  private async beforeDiscard(
+    paths: string[],
+  ): Promise<{ sha: string; paths: string[] } | undefined> {
+    const files = peek("status", undefined) ?? [];
+    const untracked = new Set(
+      files.filter((f) => f.status === "?" && !f.staged).map((f) => f.path),
+    );
+    // Only paths this list can actually vouch for. A path the cached status
+    // knows nothing about might be an untracked file — which `git clean`
+    // deletes and no snapshot holds — and offering to bring back something
+    // that cannot come back is the one thing this must not do.
+    const known = new Set(files.map((f) => f.path));
+    const restorable = paths.filter((p) => known.has(p) && !untracked.has(p));
+    if (!restorable.length) return undefined;
+    try {
+      const snap = await host.invoke("discard:snapshot", undefined);
+      return snap.sha ? { sha: snap.sha, paths: restorable } : undefined;
+    } catch {
+      return undefined; // no restore point, so no undo is offered
+    }
+  }
+
+  private offerDiscardUndo(restore: { sha: string; paths: string[] } | undefined): void {
+    if (!restore) return;
+    const n = restore.paths.length;
+    didUndoable(
+      n === 1 ? l10n.t("Discarded changes to {0}.", restore.paths[0]) : l10n.t("Discarded changes to {0} files.", n),
+      {
+        label: n === 1 ? l10n.t("Bring the changes back") : l10n.t("Bring {0} files' changes back", n),
+        undo: async () => {
+          const r = await host.invoke("discard:undo", restore);
+          if (r.ok) return undefined;
+          const why = r.message ?? l10n.t("Couldn't bring them back.");
+          // Edited again since the discard: refused, and said as the user's
+          // state (an info toast) rather than as an error.
+          return r.expected ? { info: why } : why;
+        },
+        after: () => this.repaintChanges(),
+      },
+    );
+  }
+
+  /** Stash the given paths, then refresh. Empty means the whole tree. */
+  private async stashPaths(paths: string[]): Promise<void> {
+    const r = await host.invoke("stash:save", { paths, message: undefined });
+    if (!r.ok) {
+      toast(r.message ?? l10n.t("Could not stash."), r.expected ? "info" : "error");
+      return;
+    }
+    // An empty `paths` means "the whole working tree", which is how the Stash
+    // button on the toolbar calls this — and it read as "Stashed 0 files.",
+    // which says the opposite of what just happened.
+    toast(
+      paths.length === 0
+        ? l10n.t("Stashed all changes.")
+        : paths.length === 1
+          ? l10n.t("Stashed 1 file.")
+          : l10n.t("Stashed {0} files.", paths.length),
+    );
+    void this.repaintChanges();
+  }
+
+  /**
+   * Re-read the working tree IN PLACE, then repaint Changes.
+   *
+   * `bust("status")` DELETES the cached tree, so `showChangesView`'s
+   * paint-from-what-we-know path found nothing and fell back to a 6-row
+   * skeleton — on every stage, unstage, discard, stash and hunk apply. The
+   * list you were working in blanked and the open diff went back to "Select a
+   * file to view its diff.", several times a minute, for an operation that
+   * usually moves one row.
+   *
+   * Re-reading into the same cache entry keeps a real tree on screen the whole
+   * time, and the existing change-diff gate then swaps in only what moved. The
+   * status read must land BEFORE `bust("diff")`, because a bust supersedes
+   * every request already in flight — including this one.
+   */
+  private async repaintChanges(): Promise<void> {
+    try {
+      await gget("status", undefined, 0);
+    } catch {
+      // Leave the last-known tree up; showChangesView reports the failure.
+    }
+    bust("diff"); // a staged/unstaged file's diff genuinely changed
+    if (this.currentView === "changes") void this.showChangesView();
+  }
+
+  private async changesAction(
+    channel: "stage" | "unstage" | "discard" | "stageAll" | "unstageAll",
+    path: string | undefined,
+  ): Promise<void> {
+    const restore = channel === "discard" && path ? await this.beforeDiscard([path]) : undefined;
+    try {
+      const r =
+        channel === "stageAll"
+          ? await host.invoke("stageAll", undefined)
+          : channel === "unstageAll"
+            ? await host.invoke("unstageAll", undefined)
+            : await host.invoke(channel, path ?? "");
+      if (!r.ok) {
+        const verb =
+          channel === "stageAll" ? l10n.t("stage all changes")
+          : channel === "unstageAll" ? l10n.t("unstage all changes")
+          : `${channel} ${path ?? ""}`.trim();
+        toast(r.message || l10n.t("Couldn't {0}.", verb), "error");
+      } else if (restore) {
+        this.offerDiscardUndo(restore);
+      }
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("The operation failed."), "error");
+    }
+    void this.repaintChanges();
+  }
+
+  private async doDesktopCommit(
+    textarea: HTMLTextAreaElement,
+    btn: HTMLElement,
+    push: boolean,
+    opts?: { amend?: boolean; signoff?: boolean; coAuthors?: string[] },
+  ): Promise<void> {
+    let message = textarea.value.trim();
+    if (!message) {
+      textarea.focus();
+      return;
+    }
+    // Append trailers: co-authors first, then a Signed-off-by line if requested.
+    const trailers: string[] = [];
+    for (const ca of opts?.coAuthors ?? []) {
+      if (ca.trim()) trailers.push(`Co-authored-by: ${ca.trim()}`);
+    }
+    if (opts?.signoff) {
+      try {
+        const id = await host.invoke("git:identity", undefined);
+        if (id?.name && id?.email) trailers.push(`Signed-off-by: ${id.name} <${id.email}>`);
+      } catch {
+        /* identity unavailable — skip the sign-off trailer */
+      }
+    }
+    if (trailers.length) message = `${message}\n\n${trailers.join("\n")}`;
+    // Both commit buttons go out together. Disabling only the one you pressed
+    // left "Commit & Push" fully clickable while a commit was already in
+    // flight, so an impatient second click started a second commit of the same
+    // staged tree.
+    const row = btn.closest(".dc-commit-row");
+    const pair = row
+      ? [...row.querySelectorAll<HTMLButtonElement>("button")]
+      : [btn as HTMLButtonElement];
+    for (const b of pair) b.disabled = true;
+    btn.classList.add("is-busy");
+    try {
+      // Nothing staged, but there IS work? Offer to commit all of it rather than
+      // refusing (issue #16) — VS Code and JetBrains both do this. The
+      // confirmation is the point: you see what is about to be included first.
+      if (!opts?.amend) {
+        const status = await host.invoke("status", undefined);
+        const stagedNow = status.filter((f) => f.staged);
+        const unstagedNow = status.filter((f) => !f.staged);
+        if (stagedNow.length === 0 && unstagedNow.length > 0) {
+          const n = unstagedNow.length;
+          const yes = await confirmDialog({
+            title: n === 1 ? l10n.t("Commit all 1 changed file?") : l10n.t("Commit all {0} changed files?", n),
+            message: l10n.t(
+              "Nothing is staged, so everything currently changed will be included — new files too. Stage individually first if you only want some of it.",
+            ),
+            confirmLabel: n === 1 ? l10n.t("Commit all 1") : l10n.t("Commit all {0}", n),
+          });
+          if (!yes) {
+            for (const b of pair) b.disabled = false;
+            btn.classList.remove("is-busy");
+            return;
+          }
+          // Stage for real rather than using commit -a: -a skips untracked files
+          // and bypasses the index, so what landed would not match the list.
+          const staged = await host.invoke("stageAll", undefined);
+          if (!staged.ok) {
+            toast(staged.message || l10n.t("Couldn't stage the changes."), "error");
+            for (const b of pair) b.disabled = false;
+            btn.classList.remove("is-busy");
+            return;
+          }
+        }
+      }
+      const r = await host.invoke("commit", { message, amend: opts?.amend });
+      if (!r.ok) {
+        // `expected` marks a state the user is allowed to be in — nothing staged,
+        // a clean tree — so it reads as information, not as a red failure. It is
+        // the same flag the crash reporter reads, which keeps the two decisions
+        // ("do we report this?" / "does this look like an error?") from drifting.
+        toast(r.message || l10n.t("Commit failed."), r.expected ? "info" : "error");
+        // Repaint either way: reaching "nothing is staged" means the list on
+        // screen disagreed with the repo, and leaving those rows up would
+        // contradict the message we just showed.
+        bust("status");
+        bust("diff");
+        if (this.currentView === "changes") void this.showChangesView();
+        return;
+      }
+      if (push) {
+        let p = await host.invoke(
+          "sync:push",
+          this.syncStatus?.noUpstream ? { setUpstream: true } : undefined,
+        );
+        // Amending a commit the remote already has leaves the branch diverged,
+        // and a plain push is then refused every time. Rather than report a
+        // dead end, offer the one thing that can work — with the lease, so a
+        // colleague's commits are still safe.
+        if (!p.ok && /non-fast-forward|fetch first|behind its remote/i.test(p.message ?? "")) {
+          const forced = await confirmDialog({
+            title: l10n.t("Force push?"),
+            message: l10n.t(
+              "The remote still has the version of this commit you rewrote, so a normal push was refused. Force pushing replaces only commits you rewrote — if anyone else's are there, it is refused.",
+            ),
+            confirmLabel: l10n.t("Force push"),
+            danger: true,
+          });
+          if (forced) {
+            p = await host.invoke("sync:push", { force: true });
+          }
+        }
+        // The commit already happened — be explicit if only the push failed.
+        //
+        // …and do not call it a failure when it was not one. A force push the
+        // bridge REFUSED (the remote has commits that are not this branch's to
+        // replace — somebody else's, or the same commit amended on another
+        // machine) is the repository's state, marked `expected`: the commit is
+        // made, nothing was pushed, and the way on is to pull those commits
+        // in. It used to arrive as "Committed, but push failed: …" in red,
+        // for a refusal that was the app doing its job.
+        if (!p.ok && p.expected) {
+          toast(
+            l10n.t("Committed, not pushed. {0}", p.message ?? "").trim(),
+            "info",
+            undefined,
+            p.pullFirst ? { label: l10n.t("Pull"), onClick: () => void this.doSync("pull") } : undefined,
+          );
+        } else if (!p.ok) {
+          toast(l10n.t("Committed, but push failed: {0}", p.message ?? l10n.t("unknown error")), "error");
+        } else {
+          toast(l10n.t("Committed and pushed."), "success");
+        }
+      } else {
+        toast(l10n.t("Changes committed."), "success");
+      }
+      textarea.value = "";
+      // The draft has been spent — do not carry it into the next commit.
+      this.composerDraft = { message: "", amend: false, signoff: false, coAuthors: [], prefilled: undefined, caret: undefined };
+      this.composerDraftRoot = undefined;
+      bust(); // a commit (± push) touches refs/branches/status/sync/graph
+      await this.refreshRefs();
+      await this.updateSync();
+      if (this.currentView === "changes") void this.showChangesView();
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("Commit failed."), "error");
+    } finally {
+      for (const b of pair) b.disabled = false;
+            btn.classList.remove("is-busy");
+    }
+  }
+
+  /** Kick off the OAuth Device Flow: fetch a user code, show it, open GitHub, poll. */
+  private async startDeviceFlow(
+    wrap: HTMLElement,
+    flow: HTMLElement,
+    signIn: HTMLElement,
+    onConnected: () => void,
+  ): Promise<void> {
+    (signIn as HTMLButtonElement).disabled = true;
+    flow.replaceChildren(loadingState(l10n.t("Starting sign-in…")));
+    let dc;
+    try {
+      dc = await host.invoke("github:deviceStart", undefined);
+    } catch (e) {
+      dc = { ok: false, message: cleanErr(e) };
+    }
+    if (!dc.ok || !dc.deviceCode || !dc.userCode) {
+      flow.replaceChildren(
+        errorState(l10n.t("Couldn't start sign-in"), dc.message ?? l10n.t("Try again in a moment."), () =>
+          void this.startDeviceFlow(wrap, flow, signIn, onConnected),
+        ),
+      );
+      (signIn as HTMLButtonElement).disabled = false;
+      return;
+    }
+
+    const openUrl = dc.verificationUriComplete ?? dc.verificationUri ?? "https://github.com/login/device";
+    const card = el("div", "gh-device");
+    const step = el("div", "gh-device-step");
+    step.append(span(l10n.t("Enter this code at ")), (() => { const b = el("b"); b.textContent = "github.com/login/device"; return b; })());
+    const codeRow = el("div", "gh-device-code-row");
+    const code = el("div", "gh-device-code");
+    code.textContent = dc.userCode;
+    const copyBtn = el("button", "icon-btn gh-device-copy");
+    copyBtn.title = l10n.t("Copy code");
+    copyBtn.setAttribute("aria-label", l10n.t("Copy code"));
+    copyBtn.appendChild(glyph("copy"));
+    copyBtn.addEventListener("click", () => void copyText(dc.userCode!, l10n.t("Code copied.")));
+    codeRow.append(code, copyBtn);
+    // ONE explicit action, nothing automatic. Auto-copying + auto-opening the
+    // browser yanked users to GitHub before they'd even read the screen — most
+    // didn't know the code was "already on the clipboard". Now the user reads
+    // the code, then clicks: the click copies (a real user gesture, so the
+    // clipboard write always lands) and opens GitHub. The code stays on screen
+    // the whole time for retyping if the clipboard is lost.
+    const openBtn = el("button", "btn btn-primary gh-device-open");
+    openBtn.append(glyph("link-external"), span(l10n.t("Copy code & open GitHub")));
+    openBtn.addEventListener("click", () => {
+      void copyText(dc.userCode!, l10n.t("Code copied — paste it on GitHub."));
+      window.open(openUrl, "_blank");
+    });
+    const status = el("div", "gh-device-status");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.append(el("div", "spinner"), span(l10n.t("Waiting for you to authorize…")));
+    card.append(step, codeRow, openBtn, status);
+    flow.replaceChildren(card);
+
+    this.pollDeviceFlow(wrap, dc.deviceCode, dc.interval ?? 5, dc.expiresIn ?? 900, status, signIn, onConnected);
+  }
+
+  /** Poll the device-flow token endpoint until authorized / expired / dismissed.
+   *  Also polls IMMEDIATELY when the window regains focus: the user authorizes
+   *  in the browser and switches back, and the old fixed 5-second cadence made
+   *  that moment feel laggy — now success lands the instant they return. */
+  private pollDeviceFlow(
+    wrap: HTMLElement,
+    deviceCode: string,
+    interval: number,
+    expiresIn: number,
+    status: HTMLElement,
+    signIn: HTMLElement,
+    onConnected: () => void,
+  ): void {
+    const deadline = Date.now() + expiresIn * 1000;
+    let intervalSec = interval;
+    let timer = 0;
+    let inFlight = false;
+    let done = false;
+    const cleanup = (): void => {
+      done = true;
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+    const fail = (msg: string): void => {
+      cleanup();
+      status.replaceChildren(span(msg));
+      status.classList.add("gh-device-failed");
+      // Every failure message says "try again" — the button must be pressable.
+      (signIn as HTMLButtonElement).disabled = false;
+    };
+    const interrupted = (): void => {
+      // The settings DOM was detached (view switch) — polling must stop, but
+      // the card may be RESTORED from the keep-alive cache later. Leave an
+      // actionable message instead of an eternal spinner.
+      fail(l10n.t("Sign-in was interrupted — click “Sign in with GitHub” to try again."));
+    };
+    const tick = async (): Promise<void> => {
+      if (done) return;
+      if (!wrap.isConnected) {
+        interrupted();
+        return;
+      }
+      if (Date.now() > deadline) {
+        fail(l10n.t("The code expired. Click “Sign in with GitHub” to try again."));
+        return;
+      }
+      if (inFlight) return; // a focus-poll raced the timer — one at a time
+      inFlight = true;
+      let r;
+      try {
+        r = await host.invoke("github:devicePoll", { deviceCode });
+      } catch {
+        r = { state: "pending" as const };
+      } finally {
+        inFlight = false;
+      }
+      if (done) return;
+      if (!wrap.isConnected) {
+        interrupted();
+        return;
+      }
+      if (r.state === "authorized") {
+        cleanup();
+        // Every cached GitHub answer was computed while signed OUT — the empty
+        // issue lists, the hidden PR buttons, the connect prompts. None of it is
+        // true any more.
+        //
+        // Dropped WHOLESALE, because the prefixes this replaced matched almost
+        // nothing: the channels are `issue:list`, `pr:list`,
+        // `notifications:list`, `actions:runs`, `release:list`, `orgs:list`,
+        // `gist:list`, `project:list` — only `github:status` and
+        // `github:myWork` ever began with "github:", and no channel at all
+        // begins with "gh".
+        void this.authChanged();
+        toast(l10n.t("Signed in as @{0}.", String(r.login)), "success");
+        onConnected();
+        return;
+      }
+      if (r.state === "denied" || r.state === "expired" || r.state === "error") {
+        fail(r.message ?? l10n.t("Sign-in failed. Try again."));
+        return;
+      }
+      if (r.state === "slow_down") intervalSec += 5;
+      timer = window.setTimeout(() => void tick(), intervalSec * 1000);
+    };
+    const onFocus = (): void => {
+      if (done || inFlight) return;
+      window.clearTimeout(timer);
+      void tick();
+    };
+    window.addEventListener("focus", onFocus);
+    timer = window.setTimeout(() => void tick(), intervalSec * 1000);
+  }
+
+
+  /** The commit graph + a collapsible / drag-resizable commit-details panel. */
+  private showGraphView(force = false): void {
+    // KEEP-ALIVE: the graph is the most expensive surface in the app, and it
+    // used to be torn down and refetched on EVERY tab switch — leave Commits
+    // for two seconds and coming back cost a full reload, a loading flash, and
+    // your scroll position. The mount owns no Monaco (the diff lives in the
+    // dock; the details panel is a plain custom element), so the live DOM can
+    // simply be re-attached. `graphDirty` re-syncs data in place when the repo
+    // changed underneath while another view was showing.
+    if (!force && this.graphViewWrap && this.graph) {
+      this.viewHost.replaceChildren(this.graphViewWrap);
+      this.detailsEl = this.graphDetailsPane;
+      if (this.graphDirty) {
+        this.graphDirty = false;
+        void this.graph.reload();
+      }
+      return;
+    }
+    // Graph LEFT, commit details RIGHT — the same side-by-side arrangement the
+    // extension's commit panel uses. Details used to live in the bottom dock,
+    // which stacked them under the graph and left the dock competing with the
+    // terminal for height.
+    const wrap = el("div", "graph-view graph-split");
+    const graphHost = el("div", "graph-host graph-host-full");
+    const detailsPane = el("div", "graph-details");
+    this.graphDetailsPane = detailsPane;
+    wrap.append(graphHost, this.graphSplitResizer(wrap), detailsPane);
+    this.viewHost.replaceChildren(wrap);
+    this.graphViewWrap = wrap;
+    this.graphDirty = false;
+
+    this.detailsEl = detailsPane;
+    this.showDetailsPlaceholder();
+
+    this.graph?.dispose(); // tear down a prior mount before replacing it
+    const graph = new GraphMount(graphHost, {
+      onSelect: (sha) => void this.selectCommit(sha),
+      // Several commits selected (issue #32): the pane says so and offers
+      // what can be done to all of them.
+      onSelection: (shas) => this.showSelection(shas),
+      onOpen: (sha) => void this.selectCommit(sha),
+      onContext: (sha, x, y, shas) => void (shas ? this.openManyMenu(shas, x, y) : this.openCommitMenu(sha, x, y)),
+      // Ref labels are LINKS now: click a branch/tag chip in the graph and land
+      // on that ref in Branches, scrolled + flashed.
+      // `kind` too. The chip knows whether it is a branch, a remote or a tag,
+      // and dropping it left the Branches view guessing by name alone, locals
+      // first — so a tag sharing a name with a branch (git allows it, and
+      // `%(refname:short)` does NOT disambiguate across namespaces) landed on
+      // the branch and marked the wrong row without a word.
+      onRefClick: (name, kind) => this.routeView("branches", false, { ref: name, refKind: kind }),
+      // The chip menu's "Checkout <ref>" (issue #30): through the context
+      // menu's own door, so it asks what that menu's row of the same name asks.
+      onCheckoutRef: (sha, name, kind, fullName) =>
+        this.contextMenu.checkoutRef(sha, {
+          name,
+          kind: kind === "remoteHead" ? "remote" : kind === "tag" ? "tag" : "head",
+          current: kind === "currentHead",
+          fullName,
+        }),
+      // Show the pane again WITHOUT re-selecting: selectCommit() would call
+      // closeGraphDiff() and dispose a diff the user still has open.
+      onShowDetails: () => this.setGraphDetailsVisible(true),
+      onEmpty: (empty) => this.setDetailsEmptyForNoHistory(empty),
+    });
+    this.graph = graph;
+    void graph.reload();
+  }
+
+  /** A branded "coming next" panel for views still being built out. */
+  /** Fallback for an unknown view id. Every shipped view has a real builder in
+   *  routeView; this only guards against an unrecognized/restored id and never
+   *  advertises a finished feature as unbuilt. */
+  private showPlaceholderView(id: string): void {
+    this.viewHost.replaceChildren(
+      errorState(l10n.t("View unavailable"), l10n.t("“{0}” isn’t a known view.", id), () => this.routeView("changes", true)),
+    );
+  }
+
+  // ── Sync widget (fetch / pull / push — control remote changes) ──────────────
+
+  private buildSyncWidget(): HTMLElement {
+    const wrap = el("div", "topbar-sync");
+    const main = el("button", "sync-main");
+    const caret = el("button", "sync-caret");
+    caret.title = l10n.t("Sync options");
+    caret.setAttribute("aria-label", l10n.t("Sync options"));
+    caret.appendChild(glyph("chevron-down"));
+    caret.addEventListener("click", () => this.openSyncMenu(caret));
+    wrap.append(main, caret);
+
+    this.renderSyncWidget = (s: SyncStatus | undefined): void => {
+      main.replaceChildren();
+      (main as HTMLButtonElement).disabled = false; // clears doSync's in-flight state
+      if (!s || !s.branch) {
+        wrap.style.display = "none";
+        return;
+      }
+      wrap.style.display = "";
+      const set = (icon: string, label: string, title: string, fn: () => void): void => {
+        main.append(glyph(icon), span(label));
+        main.title = title;
+        main.onclick = fn;
+      };
+      // Every one of these acts on the repository OPEN on this machine — which,
+      // while you are reading someone else's repository on the browse page, is
+      // not the repository filling the screen. "Push 2 commits to origin/main"
+      // named neither, so the one live write control in the chrome was silently
+      // aimed at a repository nothing else on screen mentioned. Name it.
+      const where = this.currentRepo?.name ?? l10n.t("this repository");
+      if (s.noUpstream) {
+        set("cloud", l10n.t("Publish"), l10n.t("Publish this branch of {0} to its remote", where), () => void this.doSync("publish"));
+        wrap.classList.add("has-action");
+      } else if (s.behind > 0) {
+        set(
+          "arrow-down",
+          l10n.t("Pull {0}", s.behind),
+          l10n.t("Pull {0} into {1} from {2}", plural(s.behind, "commit"), where, String(s.upstream)),
+          () => void this.doSync("pull"),
+        );
+        wrap.classList.add("has-action");
+      } else if (s.ahead > 0) {
+        set(
+          "arrow-up",
+          l10n.t("Push {0}", s.ahead),
+          l10n.t("Push {0} from {1} to {2}", plural(s.ahead, "commit"), where, String(s.upstream)),
+          () => void this.doSync("push"),
+        );
+        wrap.classList.add("has-action");
+      } else {
+        set("sync", l10n.t("Fetch"), l10n.t("{0} is up to date with {1} — fetch for updates", where, String(s.upstream)), () => void this.doSync("fetch"));
+        wrap.classList.remove("has-action");
+      }
+    };
+    this.renderSyncWidget(this.syncStatus);
+    return wrap;
+  }
+
+  /** The top-bar chip for a stopped operation — hidden until one exists. */
+  private buildOpChip(): HTMLElement {
+    const chip = el("button", "topbar-opchip") as HTMLButtonElement;
+    chip.hidden = true;
+    chip.addEventListener("click", () => this.routeView("changes"));
+    this.opChipEl = chip;
+    return chip;
+  }
+
+  private async updateSync(): Promise<void> {
+    // The operation chip and badge ride along: every path that refreshes the
+    // branch's sync state is a path that can have started or ended one.
+    void host
+      .invoke("git:opState", undefined)
+      .then((op) => this.syncOpIndicators(op))
+      .catch(() => {});
+    // Paint instantly from the last-known sync state, then refresh.
+    const cached = peek("sync:status", undefined);
+    if (cached) {
+      this.syncStatus = cached;
+      this.renderSyncWidget?.(cached);
+    }
+    // The same rule as the pill's (topbarRead.ts): an older answer never
+    // paints over a newer one.
+    const ticket = this.syncRead.ask();
+    const status = await gget("sync:status", undefined, 4000);
+    if (!this.syncRead.land(ticket)) return;
+    this.syncStatus = status;
+    this.renderSyncWidget?.(this.syncStatus);
+  }
+
+  /**
+   * Pull the checked-out branch, asking how to reconcile if it diverged — the
+   * one pull behind both doors (the top bar's Pull and the Branches list's ↓
+   * pill), so the question and how it is held cannot differ between them.
+   */
+  private pullAsking(): Promise<PullOutcome> {
+    // pull-stop-reviewed: a forwarder. Both doors that call it hand its outcome
+    // to pullVerdict, which settles a stop and a block.
+    // in-the-way-reviewed: …and a Cancel at the Stash & Retry question, which
+    // pullVerdict reads as `cancelled`.
+    return pullWithChoice({
+      pull: (o) => host.invoke("sync:pull", o),
+      ask: (d) => askPullMode(d, this.whileThisRepo()),
+    });
+  }
+
+  /**
+   * "Is the repository that was open when this was asked still the open one?"
+   *
+   * The hold for a question asked after a git write (see promptChoice's
+   * `holdWhile`): it outlives the watcher's refresh of this repository, but not
+   * a switch to another, because its answer acts on whichever one is open.
+   */
+  private whileThisRepo(): () => boolean {
+    const root = this.currentRepo?.root;
+    return () => root !== undefined && this.currentRepo?.root === root;
+  }
+
+  /**
+   * Every pull outcome that is NOT "it pulled", settled the same way at both
+   * doors — the top bar's Pull and the Branches list's ↓ pill. The caller has
+   * nothing left to do afterwards.
+   */
+  private async settleUnpulled(v: Exclude<PullVerdict, { kind: "pulled" }>): Promise<void> {
+    switch (v.kind) {
+      case "failed":
+        toast(v.message, v.tone);
+        return;
+      case "cancelled":
+        // Nothing was merged, but the first pull already FETCHED: the remote-
+        // tracking ref moved, so the badge and the row counts describe a remote
+        // that is no longer there. Settle it the way Fetch does. Returning bare
+        // left "Pull 3" on screen over a branch that was now 5 behind.
+        bust();
+        await this.updateSync();
+        await this.refreshAll();
+        await this.refreshBranchesSoft();
+        return;
+      case "stopped":
+      case "blocked":
+        // A pull that stopped on conflicts has done its part; the rest is the
+        // user's, and it happens in Changes — the conflicts dashboard
+        // (Continue / Abort) and the merge editor are there. Neutral, not red:
+        // nothing failed. A pull BLOCKED by that same paused operation (Pull
+        // pressed again from it) goes to the same place, for the same reason.
+        toast(v.message, "info");
+        await this.landOnConflicts();
+        return;
+    }
+  }
+
+  /** Take the user to Changes after an operation stopped on conflicts, with
+   *  every other view marked stale (the repository is mid-merge now). */
+  private async landOnConflicts(): Promise<void> {
+    bust();
+    this.invalidateKeptViews();
+    await this.refreshRefs();
+    await this.updateSync();
+    this.routeView("changes", true);
+  }
+
+  private async doSync(action: "fetch" | "pull" | "push" | "publish"): Promise<void> {
+    if (this.syncing) return; // lock the trigger against double-invocation
+    this.syncing = true;
+    // This TAB's widget: a document query answers for whichever tab is in front.
+    const widget = (this.screenEl ?? document).querySelector(".topbar-sync");
+    widget?.classList.add("busy");
+    // Live in-flight state: the widget shows WHAT it's doing with a spinning
+    // icon ("Pulling… / Pushing…"), not just a dimmed button.
+    const main = widget?.querySelector<HTMLButtonElement>(".sync-main");
+    if (main) {
+      const verbing =
+        action === "fetch"
+          ? l10n.t("Fetching…")
+          : action === "pull"
+            ? l10n.t("Pulling…")
+            : action === "publish"
+              ? l10n.t("Publishing…")
+              : l10n.t("Pushing…");
+      main.replaceChildren(glyph("sync"), span(verbing));
+      main.querySelector(".glyph")?.classList.add("spin");
+      main.disabled = true;
+    }
+    try {
+      // Pull goes through the shared flow: a diverged branch comes back as a
+      // question (merge / rebase / cancel), never as git's config advice — and
+      // its answer is settled by the same verdict the Branches ↓ pill uses.
+      if (action === "pull") {
+        const out = await this.pullAsking();
+        const v = pullVerdict(out, l10n.t("Pull failed."));
+        if (v.kind !== "pulled") {
+          await this.settleUnpulled(v);
+          return;
+        }
+        toast(v.message, "success");
+      } else {
+        const r: CommitActionResult =
+          action === "fetch"
+            ? await host.invoke("sync:fetch", { prune: this.pruneOnFetchPref })
+            : action === "push"
+              ? await host.invoke("sync:push", undefined)
+              : await host.invoke("sync:push", { setUpstream: true });
+        if (!r.ok) {
+          const failMsg =
+            action === "fetch"
+              ? l10n.t("Fetch failed.")
+              : action === "publish"
+                ? l10n.t("Publish failed.")
+                : l10n.t("Push failed.");
+          toast(r.message ?? failMsg, r.expected ? "info" : "error");
+          return;
+        }
+        const successMsg =
+          action === "fetch"
+            ? l10n.t("Fetched successfully.")
+            : action === "publish"
+              ? l10n.t("Published branch successfully.")
+              : l10n.t("Pushed successfully.");
+        toast(successMsg, "success");
+      }
+      bust(); // a fetch/pull/push changes sync/refs/branches/graph
+      await this.updateSync();
+      // refreshAll() already re-routes — and it does so WITH the current
+      // history target, so you keep your place. This second, targetless
+      // re-route undid that: pressing Push while reading PR #106 refreshed
+      // correctly and was then immediately replaced by the PR list.
+      await this.refreshAll();
+    } catch (e) {
+      const failMsg =
+        action === "fetch"
+          ? l10n.t("Fetch failed.")
+          : action === "pull"
+            ? l10n.t("Pull failed.")
+            : action === "publish"
+              ? l10n.t("Publish failed.")
+              : l10n.t("Push failed.");
+      toast(cleanErr(e) || failMsg, "error");
+    } finally {
+      this.syncing = false;
+      (this.screenEl ?? document).querySelector(".topbar-sync")?.classList.remove("busy");
+      // Restore the widget from its in-flight face (success already repainted
+      // it via updateSync; this covers the failure path).
+      this.renderSyncWidget?.(this.syncStatus);
+    }
+  }
+
+  private openSyncMenu(anchor: HTMLElement): void {
+    const s = this.syncStatus;
+    const items: MenuItem[] = [
+      { label: l10n.t("Fetch"), icon: "sync", onClick: () => void this.doSync("fetch") },
+    ];
+    if (s?.noUpstream) {
+      items.push({ label: l10n.t("Publish branch"), icon: "cloud", onClick: () => void this.doSync("publish") });
+    } else {
+      items.push({ label: l10n.t("Pull"), icon: "arrow-down", onClick: () => void this.doSync("pull") });
+      items.push({ label: l10n.t("Push"), icon: "arrow-up", onClick: () => void this.doSync("push") });
+    }
+    openMenu(anchor, items);
+  }
+
+  /** ⌘K — one fuzzy search over sections, branches/tags, recent repos, open
+   *  PRs/issues, and the headline actions. Local groups are instant; the
+   *  GitHub groups stream in as they resolve. */
+  private openPalette(): void {
+    // No repo required. The palette's repo-scoped groups (branches, files,
+    // PRs) simply come back empty from their own providers; the commands,
+    // views and repository list are exactly what a repo-less user needs.
+    const go = (v: string, t?: SectionTarget): void => this.routeView(v, false, t);
+    openCommandPalette({
+      local: (): PaletteGroup[] => {
+        // These act on the repository open on this machine, which is not
+        // necessarily the one on screen — ⌘K is reachable from a browse page.
+        const here = this.currentRepo?.name ?? "";
+        const views: PaletteItem[] = App.TABS.map((t) => ({
+          icon: t.icon,
+          label: App.NAV_LABELS[t.id] ?? t.label,
+          keywords: t.id,
+          run: () => go(t.id),
+        }));
+        views.push({ icon: "gear", label: l10n.t("Settings"), run: () => go("settings") });
+        // The Assistant is a routed, keep-alive view like any other, but it
+        // lives only behind a sparkle icon in the top bar — absent from the
+        // rail, from ⌘1-8, and (until now) from here. Typing "assistant" into
+        // the palette found a GitHub search instead of the app's own view.
+        views.push({
+          icon: "sparkle",
+          label: l10n.t("Assistant"),
+          keywords: "ai chat assistant help",
+          run: () => go("assistant"),
+        });
+
+        const refs: PaletteItem[] = [
+          ...this.refs
+            .filter((r) => r.type === "head")
+            .map((r): PaletteItem => ({
+              icon: "git-branch",
+              label: r.name,
+              // Only the fact you can't see: which one you're on.
+              hint: r.isCurrent ? l10n.t("current") : "",
+              keywords: `branch ${r.name}`,
+              run: () => go("branches", { ref: r.name }),
+            })),
+          ...this.refs
+            .filter((r) => r.type === "tag")
+            .map((r): PaletteItem => ({
+              icon: "tag",
+              label: r.name,
+              keywords: `tag ${r.name}`,
+              run: () => go("branches", { ref: r.name }),
+            })),
+        ];
+
+        const actions: PaletteItem[] = [
+          { icon: "add", label: l10n.t("New branch…"), hint: here, run: () => void this.newBranch() },
+          {
+            icon: "git-pull-request",
+            label: l10n.t("New pull request…"),
+            run: () => void openCreatePr(() => this.routeView("prs", true)),
+          },
+          { icon: "issues", label: l10n.t("New issue…"), run: () => void openNewIssue(go) },
+          { icon: "sync", label: l10n.t("Fetch"), hint: here, run: () => void this.doSync("fetch") },
+          { icon: "arrow-down", label: l10n.t("Pull"), hint: here, run: () => void this.doSync("pull") },
+          { icon: "arrow-up", label: l10n.t("Push"), hint: here, run: () => void this.doSync("push") },
+          {
+            icon: "repo-clone",
+            label: l10n.t("Clone repository…"),
+            run: () => openCloneDialog((root) => this.openPath(root)),
+          },
+          { icon: "folder-opened", label: l10n.t("Open repository…"), run: () => void this.openRepo() },
+          // Search left the rail (it is a tool, not a destination) — this row
+          // is how "search" typed into ⌘K still lands on the full page.
+          {
+            icon: "telescope",
+            label: l10n.t("Search GitHub & this machine"),
+            keywords: "explore find repositories code people",
+            run: () => this.routeView("explore"),
+          },
+          { icon: "terminal", label: l10n.t("Toggle terminal"), keywords: "dock shell", run: () => this.toggleTerminal() },
+          { icon: "color-mode", label: l10n.t("Theme: System"), keywords: "theme auto", run: () => this.setThemeMode("system") },
+          { icon: "color-mode", label: l10n.t("Theme: Light"), keywords: "theme", run: () => this.setThemeMode("light") },
+          { icon: "color-mode", label: l10n.t("Theme: Dark"), keywords: "theme", run: () => this.setThemeMode("dark") },
+          {
+            icon: "cloud-download",
+            label: l10n.t("Check for updates"),
+            run: () => {
+              void host.invoke("update:check", undefined).then((r) => {
+                if (r.status === "uptodate") toast(r.message ?? l10n.t("You're on the latest version ({0}).", r.current), r.message ? "info" : "success");
+                else if (r.status === "available" && r.version)
+                  void this.promptUpdateAvailable({ version: r.version, current: r.current }, true);
+                else if (r.message) toast(r.message, "info");
+              });
+            },
+          },
+          // Last of the actions: the two ways to support GitStudio, the same
+          // pages Help and Settings ▸ About open (shared/support.ts).
+          ...SUPPORT_LINKS.map(
+            (link): PaletteItem => ({
+              icon: link.icon,
+              label: link.paletteLabel,
+              hint: link.blurb,
+              keywords: link.keywords,
+              run: () => void window.open(link.url, "_blank"),
+            }),
+          ),
+        ];
+
+        return [
+          { title: l10n.t("Go to"), items: views },
+          { title: l10n.t("Branches & tags in {0}", here || l10n.t("this repository")), items: refs },
+          { title: l10n.t("Actions"), items: actions },
+        ];
+      },
+      remote: () => {
+        // ONE status call shared by every GitHub group. This used to fire
+        // three times per palette open — same answer, three round trips.
+        const status = host.invoke("github:status", undefined).catch(() => undefined);
+        return [
+        // EVERY repository the app knows about, not only the ones opened here.
+        //
+        // This read `repo:recent`, so ⌘K — the fastest way to reach anything —
+        // could not find a repository the app had discovered in one of your
+        // tracked folders. "so you can easily open the repo from our ui even if
+        // you havent told us about it" was true of the Repositories page and of
+        // the first screen, and false at the keyboard, which is where it would
+        // have been worth the most.
+        host
+          .invoke("repos:local", undefined)
+          .then((rs): PaletteGroup | undefined => {
+            const others = rs.filter(
+              (r) => r.root !== this.currentRepo?.root && !r.missing,
+            );
+            return others.length
+              ? {
+                  title: l10n.t("Repositories"),
+                  items: others.map((r) => ({
+                    icon: "repo",
+                    label: r.name,
+                    // Middle-truncated: the right-hand ellipsis ate the repo
+                    // folder, which is the only part that tells two clones apart.
+                    hint: middleTruncate(r.root, 46),
+                    // The origin too, so "gitstudio" finds a clone in a folder
+                    // named something else entirely.
+                    keywords: `${r.root} ${r.origin ?? ""}`,
+                    run: () => void this.openPath(r.root),
+                  })),
+                }
+              : undefined;
+          }),
+        status.then(async (st): Promise<PaletteGroup | undefined> => {
+          if (!st?.connected || !st.repo) return undefined;
+          const prs = await host.invoke("pr:list", undefined).catch(() => []);
+          return prs.length
+            ? {
+                title: l10n.t("Pull requests"),
+                items: prs.slice(0, 30).map((pr) => ({
+                  icon: "git-pull-request",
+                  label: pr.title,
+                  hint: `#${pr.number}`,
+                  keywords: `#${pr.number} pr ${pr.user?.login ?? ""} ${pr.head.ref}`,
+                  run: () => go("prs", { number: pr.number }),
+                })),
+              }
+            : undefined;
+        }),
+        status.then(async (st): Promise<PaletteGroup | undefined> => {
+          if (!st?.connected || !st.repo) return undefined;
+          const issues = await host.invoke("issue:list", { state: "open" }).catch(() => []);
+          return issues.length
+            ? {
+                title: l10n.t("Issues"),
+                items: issues.slice(0, 30).map((it) => ({
+                  icon: "issues",
+                  label: it.title,
+                  hint: `#${it.number}`,
+                  keywords: `#${it.number} issue ${it.user?.login ?? ""}`,
+                  run: () => go("issues", { number: it.number }),
+                })),
+              }
+            : undefined;
+        }),
+        ];
+      },
+
+      // ── query-driven: global GitHub search, from ⌘K ──
+      //
+      // The pinned row is always first and always fires, so ⌘K → type →
+      // Enter reaches Explore even when nothing else matched. The two result
+      // groups share Explore's EXACT gget cache keys, so opening the full
+      // page after previewing here costs nothing — and code search is never
+      // called from the palette (10/min is too small to spend on typing).
+      search: (query: string) => [
+        Promise.resolve<PaletteGroup>({
+          title: l10n.t("Search GitHub"),
+          pinned: true,
+          items: [
+            {
+              icon: "telescope",
+              label: l10n.t("Search GitHub for “{0}”", query),
+              hint: "",
+              run: () => go("explore", { id: searchTargetId("repos", query) }),
+            },
+            // The free sibling: the same query against this machine. One
+            // search system, three mouths — the palette must reach both
+            // worlds or it is only most of a search.
+            {
+              icon: "vm",
+              label: l10n.t("Search local repositories for “{0}”", query),
+              hint: "",
+              run: () => go("explore", { id: `q/local/${query}` }),
+            },
+          ],
+        }),
+        // Never remember a rate-limit refusal. The palette shares the search
+        // cache with Explore, so a refusal cached here left Explore's own
+        // "Retry now" answering from cache — no request made — for the whole
+        // 60s window. Same guard Explore's fetchPage uses.
+        gget("search:repos", { query, sort: "best", page: 1 }, 60_000, App.SEARCH_KEEP)
+          .then((page): PaletteGroup | undefined =>
+            page.items.length
+              ? {
+                  title: l10n.t("Repositories on GitHub"),
+                  pinned: true,
+                  items: page.items.slice(0, 3).map((r) => ({
+                    icon: "repo",
+                    label: r.fullName,
+                    hint: r.language ?? "",
+                    run: () => go("explore", { id: repoRouteId({ fullName: r.fullName }) }),
+                  })),
+                }
+              : undefined,
+          )
+          .catch(() => undefined),
+        gget("search:users", { query, kind: "users", page: 1 }, 60_000, App.SEARCH_KEEP)
+          .then((page): PaletteGroup | undefined =>
+            page.items.length
+              ? {
+                  title: l10n.t("People on GitHub"),
+                  pinned: true,
+                  items: page.items.slice(0, 3).map((u) => ({
+                    icon: "person",
+                    label: u.login,
+                    hint: u.type === "Organization" ? l10n.t("org") : l10n.t("person"),
+                    run: () =>
+                      go("explore", {
+                        id: `${u.type === "Organization" ? "org" : "user"}/${u.login}`,
+                      }),
+                  })),
+                }
+              : undefined,
+          )
+          .catch(() => undefined),
+      ],
+    });
+  }
+
+  /** The top bar. `info` is optional: with no repository open the chip says so
+   *  and still opens the picker, rather than the whole bar being absent. */
+  private topbar(info?: RepoInfo): HTMLElement {
+    const bar = el("header", "topbar");
+
+    // Sidebar toggle — a flat icon at the far left (above the rail), the way
+    // VS Code / Linear do it. Seamless, no floating handle on the divider.
+    const sidebarToggle = el("button", "topbar-icon topbar-sidebar");
+    sidebarToggle.addEventListener("click", () => this.toggleRail());
+    this.railToggleEl = sidebarToggle;
+
+    // The brand mark goes HOME. It used to close the repository ("Back to main
+    // menu") — with repositories as tabs (#32) that is the tab's own × and
+    // ⌘W, and a logo that quietly closed a tab, with a push perhaps still
+    // running in it, would be the most surprising click in the app.
+    const home = el("button", "topbar-home");
+    home.title = l10n.t("Home");
+    home.setAttribute("aria-label", l10n.t("Home"));
+    home.appendChild(brandMark());
+    home.addEventListener("click", () => this.routeView("dashboard"));
+
+    // Back / forward chevrons — the in-app history walkers (⌘[ / ⌘], and the
+    // mouse's back/forward buttons). What makes section-hopping feel like a
+    // real app instead of a set of disconnected tabs.
+    const mod = navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl+";
+    const backBtn = el("button", "topbar-icon topbar-nav") as HTMLButtonElement;
+    backBtn.title = l10n.t("Back  ({0}[)", mod);
+    backBtn.setAttribute("aria-label", l10n.t("Back"));
+    backBtn.appendChild(glyph("arrow-left"));
+    backBtn.addEventListener("click", () => this.navBack());
+    this.navBackBtn = backBtn;
+    const fwdBtn = el("button", "topbar-icon topbar-nav") as HTMLButtonElement;
+    fwdBtn.title = l10n.t("Forward  ({0}])", mod);
+    fwdBtn.setAttribute("aria-label", l10n.t("Forward"));
+    fwdBtn.appendChild(glyph("arrow-right"));
+    fwdBtn.addEventListener("click", () => this.navForward());
+    this.navFwdBtn = fwdBtn;
+    this.updateNavButtons();
+
+    // No repository chip: the TAB names the repository you are working in, one
+    // row up (issue #32 — "tabs at the top row instead of a single one"), and
+    // the tab row's + is where another is opened.
+
+    const branchSwitch = el("button", "topbar-switch topbar-branch");
+    const branchName = el("span", "switch-name");
+    branchName.textContent = "…";
+    this.branchSwitchName = branchName;
+    branchSwitch.append(glyph("git-branch"), branchName, glyph("chevron-down"));
+    branchSwitch.addEventListener("click", () => this.openBranchMenu(branchSwitch));
+
+    // Left cluster: brand + repo + branch, with the sync (fetch/pull/push)
+    // widget sitting right next to the branch switcher.
+    const left = el("div", "topbar-left");
+    // The branch chip and the push/pull widget are ABOUT a repository. With
+    // none open they said "main" and offered "Push 2" — a branch and a count
+    // belonging to whatever was open last, which is worse than saying nothing.
+    // The repository you are READING, left of the one you are WORKING IN.
+    //
+    // The bar is built once per repo-open and no route ever touched it, so
+    // while you read libgit2/libgit2 it said `gitstudio · main · Push 2 · Open
+    // in Cursor`: four live controls about a different repository, with nothing
+    // separating them from the one filling the screen. Nothing is hidden and
+    // nothing is dimmed — these controls WORK, they were simply unlabelled.
+    // (`opacity: .42` already means *unavailable* in this app.)
+    const where = el("span", "topbar-where");
+    where.append(glyph("globe"), span("", "topbar-where-name"));
+    where.hidden = true;
+    // "working in <repo>" — the repository the controls to its right act on.
+    // It was a clause before the old repository chip; the chip is the tab row
+    // now (#32), so the clause carries the name itself, in words.
+    const working = el("span", "topbar-working");
+    working.append(span(l10n.t("working in"), "topbar-working-lead"), span(info?.name ?? "", "topbar-working-name"));
+    working.hidden = true;
+    left.append(home, sidebarToggle, backBtn, fwdBtn, where, working);
+    let primedStatus = false;
+    const syncWhere = (): void => {
+      const route =
+        this.currentView === "explore" ? parseRepoRoute(this.currentTarget?.id) : undefined;
+      where.hidden = !route;
+      if (route) {
+        const nameEl = where.querySelector(".topbar-where-name");
+        if (nameEl) nameEl.textContent = route.fullName;
+        // True whether or not a clone exists. "Do I have it?" is answered on
+        // the page's own rail, not up here.
+        where.title = l10n.t("Reading {0} on github.com", route.fullName);
+        where.setAttribute("aria-label", where.title);
+      }
+      // The clause only earns its words when the two names differ. Unknown is
+      // NOT the same as equal: with the slug uncached the clause shows, which
+      // is a redundancy, never a false claim.
+      const open = peek("github:status", undefined)?.repo;
+      const openName = open ? `${open.owner}/${open.repo}`.toLowerCase() : undefined;
+      if (!open && !primedStatus) {
+        primedStatus = true;
+        void gget("github:status", undefined, 30_000)
+          .then(() => syncWhere())
+          .catch(() => {});
+      }
+      working.hidden = !route || !info || openName === route.fullName.toLowerCase();
+      working.title = info ? l10n.t("The controls on this bar act on {0}", info.root) : "";
+      // `hidden` is an ATTRIBUTE, and wireTopbarFit's MutationObserver
+      // deliberately does not watch attributes — so ask for the re-measure.
+      this.fitTopbar?.();
+    };
+    syncWhere();
+    this.syncWhereChip = syncWhere;
+    if (info) {
+      left.append(branchSwitch, this.buildSyncWidget(), this.buildOpChip());
+      // Beside Push, not inside the Code page: opening the repository in your
+      // editor is something you do from wherever you happen to be.
+      const openIn = openInButton({
+        root: () => this.currentRepo?.root,
+        nav: (v) => this.routeView(v),
+      });
+      openIn.classList.add("topbar-openin");
+      left.append(openIn);
+    }
+    this.syncRailToggle();
+
+    // Right edge: the notifications center (bell + unread badge) sitting right
+    // next to the GitHub account chip — both pinned to the far right of the bar.
+    const right = el("div", "topbar-right");
+    const cmdk = el("button", "topbar-cmdk");
+    // The palette now searches GitHub itself, so the affordance says so —
+    // "Jump to…" undersold a box that reaches every repo on github.com.
+    cmdk.title = l10n.t("Jump anywhere, or search GitHub  (⌘K)");
+    cmdk.setAttribute("aria-label", l10n.t("Open the command palette"));
+    cmdk.append(
+      glyph("search"),
+      span(l10n.t("Search anything…"), "topbar-cmdk-label"),
+      span("⌘K", "topbar-cmdk-kbd"),
+    );
+    cmdk.addEventListener("click", () => this.openPalette());
+    right.append(cmdk, this.buildAssistantLauncher(), this.buildNotifBell(), this.buildAccountChip());
+
+    bar.append(left, right);
+    this.wireTopbarFit(bar);
+    return bar;
+  }
+
+  /** The Assistant launcher — a sparkle button in the top bar, reachable from any
+   *  view. Opens the full Assistant (its chats persist + stay warm). */
+  private buildAssistantLauncher(): HTMLElement {
+    const b = el("button", "topbar-icon topbar-assistant");
+    b.append(glyph("sparkle"), span(l10n.t("Assistant"), "topbar-assistant-label"));
+    // The Assistant is a full view like any other, but its only entry point is
+    // this button — and the button looked identical whether you were in the
+    // Assistant or not, so the one surface with no rail item and no tab was
+    // also the one surface that never said you were on it.
+    const sync = (): void => {
+      const here = this.currentView === "assistant";
+      b.classList.toggle("is-current", here);
+      b.setAttribute("aria-current", here ? "page" : "false");
+      b.title = here ? l10n.t("You are in the Assistant") : l10n.t("Assistant");
+      b.setAttribute("aria-label", here ? l10n.t("Assistant (current view)") : l10n.t("Open the AI Assistant"));
+    };
+    sync();
+    this.syncAssistantChip = sync;
+    b.addEventListener("click", () => this.routeView("assistant"));
+    return b;
+  }
+
+  /** Repaint the Assistant launcher's current-view state after a route change. */
+  private syncAssistantChip?: () => void;
+  private syncWhereChip?: () => void;
+
+  /** The notifications center: a bell in the top bar (next to the account chip)
+   *  with an unread-count badge, opening the inbox as a floating panel. Replaces
+   *  the old sidebar "Notifications" section — the bell IS the center now. */
+  private buildNotifBell(): HTMLElement {
+    const bell = el("button", "topbar-icon topbar-bell");
+    bell.title = l10n.t("Notifications");
+    bell.setAttribute("aria-label", l10n.t("Notifications"));
+    bell.appendChild(glyph("bell"));
+    const badge = el("span", "topbar-bell-badge");
+    badge.hidden = true;
+    bell.appendChild(badge);
+    this.notifBellBadge = badge;
+    bell.addEventListener("click", () => {
+      // A popover OF the page you are already reading has nothing to add, and
+      // it put a second copy of the Inbox on screen: two "Inbox 7" headers,
+      // two identical refresh buttons, two lists of the same threads. On the
+      // Inbox the bell just refreshes the page.
+      if (this.currentView === "notifications") {
+        this.routeView("notifications", true);
+        return;
+      }
+      openNotificationsPanel(
+        bell,
+        (v, target) => this.routeView(v, false, target),
+        () => void this.refreshNotifBadge(),
+      );
+    });
+    void this.refreshNotifBadge();
+    return bell;
+  }
+
+  /** Fill in the commit composer's branch once HEAD resolves. Without this the
+   *  placeholder stayed "…" forever, which is worse than the wrong answer it
+   *  replaced. */
+  private syncComposerBranch(): void {
+    const head = this.headInfo;
+    if (!head) return;
+    const name = head.detached ? l10n.t("detached HEAD") : (head.branch ?? "HEAD");
+    // This tab's composer — never whichever tab's is on screen (#32).
+    const nameEl = (this.screenEl ?? document).querySelector<HTMLElement>(".dc-branch-name");
+    if (nameEl) nameEl.textContent = name;
+    // The composer owns its own label — writing it from here made two writers
+    // for one string, and the other one holds the amend flag.
+    this.syncCommitLabel?.();
+  }
+
+  /** Pull the unread count and reflect it on the bell badge (hidden at zero). */
+  private async refreshNotifBadge(): Promise<void> {
+    const count = await fetchUnreadCount();
+    this.setNotifBadge(count);
+  }
+
+  /** Paint a known unread count onto the bell. The Inbox broadcasts what it
+   *  actually loaded (gs:unread), so the badge and the panel header can never
+   *  disagree — they used to differ by one, 200px apart. */
+  private setNotifBadge(count: number): void {
+    const badge = this.notifBellBadge;
+    if (!badge || !badge.isConnected) return;
+    const bell = badge.parentElement;
+    if (count > 0) {
+      badge.textContent = count > 99 ? "99+" : String(count);
+      badge.hidden = false;
+      bell?.classList.add("has-unread");
+      bell?.setAttribute("title", l10n.t("Notifications · {0} unread", count));
+    } else {
+      badge.hidden = true;
+      bell?.classList.remove("has-unread");
+      bell?.setAttribute("title", l10n.t("Notifications"));
+    }
+  }
+
+  /** The single GitHub-account affordance, pinned to the right edge of the top
+   *  bar. Shows the signed-in user (avatar + login, no "@"), or a Sign-in prompt
+   *  when not connected. Replaces the per-view account chips that used to clutter
+   *  every GitHub section header. */
+  private buildAccountChip(): HTMLElement {
+    const chip = el("button", "topbar-acct");
+    chip.append(glyph("github"), span("…", "topbar-acct-name"));
+    chip.addEventListener("click", () => this.routeView("settings"));
+    // Asked ONCE, at construction — and the top bar is built by showRepoScreen,
+    // which runs only on `repo:changed`. So the chip kept naming the account
+    // you had signed out of for the rest of the session, avatar and all, while
+    // Settings one click away said "Not connected". Stored as a hook so the
+    // three auth sites can re-ask, the way `syncCommitLabel` and
+    // `syncAssistantChip` already do for their own surfaces.
+    let gen = 0;
+    let nameRetry: number | undefined;
+    // What the last SUCCESSFUL answer said. A failed question is not an answer:
+    // it used to fall through to `{connected: false}`, so a dropped IPC or a
+    // moment offline turned a signed-in user's chip into a "Sign in" button —
+    // and the chip is the only place in the window that would have said it.
+    let lastKnown: GitHubStatus | undefined;
+    const sync = async (): Promise<void> => {
+      const mine = ++gen;
+      let status: GitHubStatus;
+      try {
+        // Cached: the top bar and the section headers both ask on every route,
+        // and this is the copy that was not sharing with the others.
+        status = await gget("github:status", undefined);
+        lastKnown = status;
+      } catch {
+        // Keep saying what we last knew to be true; only an actual answer of
+        // "not connected" may take the account off the top bar.
+        status = lastKnown ?? { connected: false };
+      }
+      // A switch immediately followed by a sign-in can resolve out of order;
+      // the later question owns the answer.
+      if (!chip.isConnected || mine !== gen) return;
+
+      // CONNECTED is the question. The login NAME is a separate, slower fact.
+      //
+      // `github:status` deliberately does not decrypt the token — doing so
+      // raises the OS keychain prompt on every launch — so a signed-in user
+      // gets `{connected: true, login: undefined}` until some real GitHub
+      // request unlocks it. Branching on `connected && login` put that state in
+      // the ELSE, so the chip said "Sign in" to someone who was signed in, and
+      // then flipped to their name once anything else made a request. Two
+      // strings one character apart that mean opposite things.
+      if (status.connected) {
+        chip.classList.add("is-connected");
+        if (status.login) {
+          window.clearTimeout(nameRetry);
+          chip.title = l10n.t("Signed in to GitHub as {0}", status.login);
+          chip.replaceChildren(
+            avatar(status.login, `https://github.com/${status.login}.png`, 22),
+            span(status.login, "topbar-acct-name"),
+          );
+        } else {
+          // Signed in, name not known yet. Say so honestly rather than
+          // guessing, and ask again shortly — the first real request fills it
+          // in, and this stops only when it does.
+          chip.title = l10n.t("Signed in to GitHub");
+          chip.replaceChildren(glyph("github"), span(l10n.t("Signed in"), "topbar-acct-name"));
+          window.clearTimeout(nameRetry);
+          nameRetry = window.setTimeout(() => void sync(), 2000);
+        }
+      } else {
+        window.clearTimeout(nameRetry);
+        chip.classList.remove("is-connected");
+        chip.title = l10n.t("Sign in to GitHub");
+        chip.replaceChildren(glyph("github"), span(l10n.t("Sign in"), "topbar-acct-name"));
+      }
+    };
+    this.syncAccountChip = sync;
+    // Exposed to the harness ONLY when the harness is there, so a check can
+    // re-ask the question under a broken channel — "a failed question is not an
+    // answer" is not observable any other way.
+    if ((window as { __GS_ROUTES?: unknown }).__GS_ROUTES) {
+      (window as { __gsSyncAccountChip?: () => Promise<void> }).__gsSyncAccountChip = sync;
+    }
+    void sync();
+    return chip;
+  }
+
+  /**
+   * Everything that stops being true when the signed-in account changes.
+   *
+   * ONE helper, called from all three auth sites, because they had drifted:
+   * Sign out dropped the caches, Switch account dropped neither, and neither
+   * touched the top-bar chip. Three sites each remembering four things is how
+   * that happened, and splitting the fix across them again would only reset the
+   * clock. The toast stays at the call site — only Sign out has one to say.
+   */
+  private async authChanged(): Promise<void> {
+    // Every cached GitHub answer was computed for a session that is over — in
+    // EVERY tab (issue #32): the account is the window's, not the tab's.
+    bustEverywhere();
+    // …and the kept-alive DOM those answers were rendered into, which a bust
+    // does not touch: a stashed view is re-attached verbatim on return, so
+    // Issues and PRs came back showing the previous account's pages — names,
+    // avatars, private titles — on a window that was signed out. Every tab's
+    // parked views go, or a background tab would come back signed in as
+    // someone who just signed out.
+    this.shell.dropEveryTabsKeptViews();
+    await this.syncAccountChip?.();
+    void this.refreshNotifBadge();
+  }
+
+  // ── Host events ──────────────────────────────────────────────────────────────
+
+  // The shell (TabShell) owns the ONE subscription to each host event and
+  // window event, and hands it to the tab in front through these. A background
+  // tab hears nothing: its screen is not on show, and whatever it would do
+  // with the news it does when it comes back (refreshIfDiskMoved, the held
+  // answers the bridge delivers).
+
+  /** The Inbox tells the shell what it actually loaded, so the bell badge and
+   *  the panel header can't drift apart. */
+  onUnread(n: number): void {
+    this.setNotifBadge(n);
+  }
+
+  /** A tab opened or closed (#32): which worktree another tab has open is
+   *  main's to say again, in the Branches view that lists them (whichever
+   *  segment is up — the list is read once for all five) — now, or when this
+   *  tab is next in front (Open on a worktree row puts its new tab in front;
+   *  coming back, the row it was opened from says so). */
+  onTabsChanged(inFront: boolean): void {
+    this.tabsEpoch++;
+    this.tabsMoved = !inFront;
+    if (inFront && this.currentView === "branches") void this.reloadBranchRows?.();
+  }
+  private tabsMoved = false;
+  /** Bumped whenever the set of open tabs changes, so a Branches view the
+   *  keep-alive cache parked can tell, when it is restored, that the list it
+   *  shows was read for other tabs than these. */
+  private tabsEpoch = 0;
+
+  /** Forgetting or trashing a clone changes Home's "other repositories" card
+   *  and the Repositories list — repaint whichever is showing. */
+  onRecentChanged(): void {
+    if (this.currentView === "dashboard" || this.currentView === "repositories") {
+      this.routeView(this.currentView, true);
+    }
+  }
+
+  /** Something changed on disk (issue #17). Already debounced in main. */
+  onFilesChanged(gitDir: boolean): void {
+    void this.refreshFromDisk(gitDir);
+  }
+
+  /**
+   * The window came back to the front. This is the reported flow — edit in
+   * another app, switch to GitStudio — and it is also the safety net for when
+   * the watcher could not start at all (a huge tree on Linux can exhaust
+   * inotify), so it deliberately does not check whether one is running.
+   *
+   * Coming back to the front does NOT mean anything changed. This used to call
+   * refreshFromDisk(true) unconditionally, which drops the entire cache, throws
+   * away every kept-alive view and force-rebuilds the current one — so a plain
+   * alt-tab away and back cost a full reload of the app and ejected you from
+   * whatever detail page you were reading. Ask what changed first; if the
+   * answer is nothing, do nothing.
+   */
+  onWindowFocus(): void {
+    void this.refreshIfDiskMoved();
+  }
+
+  /** Home's Push/Fetch buttons ride the topbar's own sync flow — same busy
+   *  state, same toasts, same refresh — rather than forking a second one out
+   *  of raw IPC calls. The event is the only coupling the view needs. */
+  onSyncRequest(action: string | undefined): void {
+    if (action === "push" || action === "fetch" || action === "pull") void this.doSync(action);
+  }
+
+  /** A route asked from outside the App — "take me to the repository that
+   *  just became the open one" (gs:go), or the landing after an open. */
+  route(view: string, force = false, target?: SectionTarget): void {
+    this.routeView(view, force, target);
+  }
+
+  /** The menu commands that belong to the tab in front. */
+  onMenuCommand(command: string): void {
+    if (command === "refresh") void this.refreshAll();
+    else if (command === "toggleTerminal") this.toggleTerminal();
+    else if (command === "toggleSidebar") this.toggleRail();
+    else if (command === "palette") this.openPalette();
+    else if (command === "undo") void undoOrText();
+    else if (command === "redo") redoOrText();
+  }
+
+  /** App updates: the main process polls; the USER decides. Nothing
+   *  downloads or installs without a confirm here. */
+  onUpdateAvailable(u: { version: string; current: string }): void {
+    void this.promptUpdateAvailable(u);
+  }
+  onUpdateReady(r: { version: string; kind: "restart" | "installer" }): void {
+    void this.promptUpdateReady(r);
+  }
+  onUpdateProgress(percent: number): void {
+    if (this.updateProgressEl) this.updateProgressEl.textContent = l10n.t("Downloading… {0}%", percent);
+  }
+
+  // ── App updates (confirm → pull → apply) ────────────────────────────────────
+
+  /** Live label updated by update:progress while a download runs (the About
+   *  card's status line when Settings is open; harmlessly detached otherwise). */
+  private updateProgressEl?: HTMLElement;
+  /** Versions the user already saw a prompt for this session. */
+  private static readonly updatePrompted = new Set<string>();
+  /** Versions whose question is on screen now — asked twice at once, it is shown once. */
+  private static readonly updateAsking = new Set<string>();
+
+  private async promptUpdateAvailable(
+    u: { version: string; current: string },
+    force = false,
+  ): Promise<void> {
+    // A manual check both answers (forced) and announces the same version as
+    // an event: two identical dialogs stacked, and the second Download said
+    // "No update is waiting to download." They held until answered, so both
+    // stayed.
+    if (App.updateAsking.has(u.version)) return;
+    if (!force && App.updatePrompted.has(u.version)) return;
+    App.updatePrompted.add(u.version);
+    App.updateAsking.add(u.version);
+    const mac = navigator.platform.toLowerCase().includes("mac");
+    const ok = await confirmDialog({
+      title: l10n.t("GitStudio {0} is available", u.version),
+      message: mac
+        ? l10n.t(
+            "You're on {0}. Download the update now? The installer lands in your Downloads folder — one drag to Applications finishes it.",
+            u.current,
+          )
+        : l10n.t("You're on {0}. Download the update now? You'll confirm again before it restarts.", u.current),
+      confirmLabel: l10n.t("Download update"),
+      // The window's question, not the view's: a refresh re-routing below it,
+      // or a tab switch, answered it "Cancel" for you — and the version was
+      // already marked asked, so it never came back that session.
+      holdWhile: () => true,
+    }).finally(() => App.updateAsking.delete(u.version));
+    if (!ok) return;
+    const r = await host.invoke("update:download", undefined);
+    if (!r.ok) {
+      toast(r.message || l10n.t("Couldn't download the update."), "error");
+      return;
+    }
+    toast(l10n.t("Downloading GitStudio {0}…", u.version), "info");
+  }
+
+  private async promptUpdateReady(r: {
+    version: string;
+    kind: "restart" | "installer";
+  }): Promise<void> {
+    if (this.updateProgressEl) this.updateProgressEl.textContent = "";
+    if (r.kind === "restart") {
+      const ok = await confirmDialog({
+        title: l10n.t("GitStudio {0} is ready", r.version),
+        message: l10n.t("Restart now to finish updating? If not, it's applied the next time you quit."),
+        confirmLabel: l10n.t("Restart now"),
+        holdWhile: () => true,
+      });
+      if (!ok) {
+        toast(l10n.t("The update will be applied when you quit GitStudio."), "info");
+        return;
+      }
+    } else {
+      const ok = await confirmDialog({
+        title: l10n.t("GitStudio {0} downloaded", r.version),
+        message: l10n.t("The installer is in your Downloads folder. Open it now? Drag GitStudio to Applications to finish."),
+        confirmLabel: l10n.t("Open installer"),
+        holdWhile: () => true,
+      });
+      if (!ok) return;
+    }
+    const res = await host.invoke("update:install", undefined);
+    if (!res.ok) toast(res.message || l10n.t("Couldn't apply the update."), "error");
+  }
+
+  // ── Repo lifecycle (tab changes are the shell's, driven by repo:tabs) ───────
+
+  private async openRepo(): Promise<void> {
+    await this.shell.openRepo();
+  }
+  private async openPath(root: string): Promise<void> {
+    await this.shell.openPath(root);
+  }
+
+  /**
+   * Repaint after something changed on disk outside the app (issue #17).
+   *
+   * `gitDir` splits the cost. A file edit can only change the working tree, so
+   * there is no point re-reading refs or reloading the graph for it — during a
+   * build that would mean a graph reload every quarter second. A change under
+   * `.git` (a commit, a checkout, staging from the terminal) really can move
+   * history, and gets the full refresh.
+   *
+   * Never runs while a mutation of our own is in flight: our own commands already
+   * refresh when they finish, and refreshing underneath them makes the list flicker
+   * between two truths.
+   */
+  /**
+   * The refs sitting on one commit, for the graph's context menu (issues #12/#19).
+   *
+   * `origin/HEAD` is dropped: it is a symbolic pointer at the remote's default
+   * branch, so "Checkout origin/HEAD" would put you on a detached HEAD at
+   * whatever it happens to point to — never what someone means. The sidebar's
+   * ref sections filter it out for the same reason.
+   */
+  private refsOn(sha: string): RowRef[] {
+    return this.refs
+      .filter((r) => r.sha === sha && r.type !== "stash" && !(r.type === "remote" && isRemoteHead(r)))
+      .map((r) => ({
+        name: r.name,
+        kind: r.type === "remote" ? "remote" : r.type === "tag" ? "tag" : "head",
+        current: r.isCurrent,
+        // The checkout is planned from this, never from the short name.
+        fullName: r.fullName,
+      }));
+  }
+
+  /** What the repo looked like on disk the last time we synced with it. */
+  private diskFingerprint?: string;
+  /** One warning per run of failures, not one per revalidation. */
+  private staleTreeWarned = false;
+
+  /**
+   * Refresh only if the repository actually moved while we were away.
+   *
+   * The window-focus refresh is the safety net for edits made in another app —
+   * a real need, and the reason it deliberately does not check whether a file
+   * watcher is running. But it fired on EVERY focus, and its full refresh drops
+   * the whole cache, clears every kept-alive view and force-rebuilds. So alt-tab
+   * to a browser and back and the app rebuilt itself from nothing, which is both
+   * slow and destructive: the Settings sign-in card had to be special-cased out
+   * of it by hand, and any detail page you were reading was replaced by its list.
+   *
+   * Two cheap reads answer "did anything change?" — the working tree and HEAD.
+   * They cost a few milliseconds against the seconds a full refresh costs, and
+   * in the common case (nothing changed) the answer is: do nothing at all.
+   */
+  private async refreshIfDiskMoved(): Promise<void> {
+    if (!this.currentRepo || this.refreshingFromDisk) return;
+    let print: string;
+    try {
+      const [status, head] = await Promise.all([
+        host.invoke("status", undefined),
+        host.invoke("head:get", undefined),
+      ]);
+      print = JSON.stringify({ status, head });
+    } catch {
+      // Could not tell — leave the screen alone rather than rebuild on a guess.
+      return;
+    }
+    if (this.diskFingerprint === print) return; // nothing moved while we were away
+    this.diskFingerprint = print;
+    await this.refreshFromDisk(true);
+  }
+
+  private async refreshFromDisk(gitDir: boolean): Promise<void> {
+    if (!this.currentRepo || this.refreshingFromDisk) {
+      return;
+    }
+    this.refreshingFromDisk = true;
+    try {
+      if (gitDir) {
+        await this.refreshAll();
+        // Our OWN refresh has just re-read the tree; record it, or the next
+        // window focus sees a fingerprint from before this change and rebuilds
+        // the app a second time for something it has already applied.
+        void this.recordDiskFingerprint();
+        return;
+      }
+      if (this.currentView === "changes") {
+        // Re-read into the cache rather than deleting it. `bust("status")`
+        // removes the very entry showChangesView paints from, so every save in
+        // your editor blanked the file list to a 6-row skeleton and closed the
+        // diff you were reading — the same defect as staging, which this fix
+        // wave already corrected for the buttons but not for the watcher.
+        await this.repaintChanges();
+        return;
+      }
+      bust("status");
+      bust("diff");
+      if (this.currentView === "graph" && this.graph) {
+        // The graph carries an uncommitted-changes row, so it still cares — but
+        // only about that row. Reload IN PLACE: rebuilding the whole view here
+        // (the old behavior) threw away the live mount on every disk change.
+        await this.graph.reload();
+      } else if (this.graph) {
+        // Parked graph: its WIP row is stale now — re-sync on return.
+        this.graphDirty = true;
+      }
+    } finally {
+      this.refreshingFromDisk = false;
+    }
+  }
+
+  /**
+   * Snapshot the on-disk state so the next focus can tell "changed" from "same".
+   *
+   * Read through the cache. These run alongside the view's own status and HEAD
+   * reads — at boot inside the same tick, and after an external git operation
+   * right behind the refresh that just repopulated them — so raw invokes meant
+   * the app ran `git status` over the whole worktree twice to learn one thing
+   * once. `gget` shares the in-flight promise rather than starting a second.
+   *
+   * Both reads here must stay value-comparable with the ones in
+   * `refreshIfDiskMoved`, which are deliberately RAW: that side is the
+   * forced-fresh half of the comparison, and caching it would compare a value
+   * against itself.
+   */
+  private async recordDiskFingerprint(): Promise<void> {
+    try {
+      const [status, head] = await Promise.all([
+        gget("status", undefined),
+        gget("head:get", undefined),
+      ]);
+      this.diskFingerprint = JSON.stringify({ status, head });
+    } catch {
+      this.diskFingerprint = undefined;
+    }
+  }
+
+  /** Drop every kept-alive view but a parked Assistant, and mark a parked graph
+   *  dirty — see refreshAll for why each half is what it is. */
+  private invalidateKeptViews(): void {
+    const parkedChat = this.viewCache.get("assistant");
+    this.viewCache.clear();
+    if (parkedChat) this.viewCache.set("assistant", parkedChat);
+    // A parked (kept-alive) graph is now stale too — mark it before ANY early
+    // return in refreshAll, so returning to Commits always re-syncs in place.
+    if (this.graph && this.currentView !== "graph") this.graphDirty = true;
+  }
+
+  private async refreshAll(): Promise<void> {
+    if (!this.currentRepo) {
+      return;
+    }
+    bust(); // drop the SWR cache so the re-render pulls fresh data
+    // …and the kept-alive view DOM with it. routeView(force) only drops the view
+    // being rebuilt, so a commit or a branch op made from Changes left the cached
+    // Branches DOM untouched — and returning to it re-attached that DOM verbatim
+    // without refetching, showing a branch list from before the change.
+    //
+    // EXCEPT a parked Assistant. Every other kept-alive view holds a rendering
+    // of repo state that this refresh has just invalidated; the Assistant holds
+    // a conversation, and possibly a turn still streaming into it. Dropping it
+    // here is the same defect the `currentView === "assistant"` guard below
+    // fixes, reached by the other door: leave the Assistant to answer something,
+    // go and read an issue, and the agent's own commit — or any file the build
+    // touched — deleted the transcript and the Stop button out from under a run
+    // that kept going. Held by identity, so nothing is refetched or rebuilt.
+    this.invalidateKeptViews();
+    await this.refreshRefs();
+    // Settings shows NOTHING derived from the repo's disk state — and this runs
+    // on every window FOCUS. Rebuilding it here destroyed the GitHub device-flow
+    // card the instant the user came back from authorizing in the browser: the
+    // code vanished and the token poll died, so sign-in could never complete.
+    if (this.currentView === "settings") {
+      return;
+    }
+    // The Assistant, for the same reason and a sharper one. Nothing on it is
+    // derived from the repository's disk state — it is a transcript — and the
+    // agent's own work is what fires this: approve a commit and the file
+    // watcher calls refreshAll, which re-routed the view the agent was
+    // streaming into. The answer, the tool steps and the Stop button were all
+    // destroyed mid-run, while the run itself carried on in the main process
+    // with nothing left on screen to stop it or show it.
+    if (this.currentView === "assistant") {
+      return;
+    }
+    // The Assistant, for the same reason and a sharper one. Nothing on it is
+    // derived from the repository's disk state — it is a transcript — and the
+    // agent's own work is what fires this: approve a commit and the file
+    // watcher calls refreshAll, which re-routed the view the agent was
+    // streaming into. The answer, the tool steps and the Stop button were all
+    // destroyed mid-run, while the run itself carried on in the main process
+    // with nothing left on screen to stop it or show it.
+
+    // The graph reloads in place when showing; when it's PARKED (kept alive
+    // behind another view) it's only marked dirty, so returning to Commits
+    // re-syncs the data without ever tearing the mount down.
+    if (this.currentView === "graph" && this.graph) {
+      await this.graph.reload();
+    } else if (this.currentView === "compare" && this.reloadCompare) {
+      // Compare too: re-read, and repaint only if the comparison changed. A
+      // rebuild here reset the open file to the first one on every save, ⌘R
+      // and focus — see reloadCompare.
+      await this.reloadCompare();
+    } else {
+      // Re-route to WHERE YOU ARE, not just to which section you are in. This
+      // passed no target, so a refresh while reading PR #106 rebuilt the PR
+      // LIST — you were ejected from the page you were on by a background
+      // event you never asked for. The history stack already knows the target;
+      // it is the same value Back would return you to.
+      const here = this.navHistory[this.navPos];
+      this.routeView(this.currentView, true, here?.view === this.currentView ? here.target : undefined);
+    }
+  }
+
+  // ── Top-bar dropdowns (branch switcher; the repository menu is the tab row's +) ──
+
+  /** Jump to a commit in the graph, switching to the graph view first if the
+   *  graph isn't currently mounted (the branch switcher is available on every
+   *  screen, so `this.graph` may not exist yet). Routing with a sha TARGET puts
+   *  the jump in the navigation history, so back/forward reproduces it. */
+  private revealInGraph(sha: string): void {
+    if (this.currentView === "graph" && this.graph) {
+      const found = this.graph.reveal(sha);
+      void this.selectCommit(sha);
+      if (!found) this.revealMissed(sha);
+      return;
+    }
+    this.routeView("graph", false, { sha });
+  }
+
+  /**
+   * A reveal found no row. Say why — out loud, because the details pane below
+   * has loaded the commit either way and silence made the list look like it
+   * had ignored the click.
+   *
+   * Under a branch filter (issue #30) the likely reason is the filter itself:
+   * a Branches-view click, a tag in the switcher, a parent chip all land on
+   * commits the ticked refs need not reach, and "further back than the loaded
+   * history" was simply false for those. The host is asked (one rev-list, no
+   * walk); a commit the filter hides is said so, with the way out — which
+   * rebuilds the graph around every branch and replays the reveal.
+   */
+  private revealMissed(sha: string): void {
+    const graph = this.graph;
+    const short = sha.slice(0, 7);
+    const deeper = (): void => {
+      toast(`${short} is further back than the loaded history — its details are below.`, "info");
+    };
+    if (!graph?.refFilter) {
+      deeper();
+      return;
+    }
+    void host.invoke("graph:reaches", { sha }).then(
+      (r) => {
+        // Answered later than asked: the view may have moved on.
+        if (this.currentView !== "graph" || this.graph !== graph) return;
+        // An unshaped answer (a channel that failed to register) reads as
+        // "reached", so the message is the one that was always true.
+        if (r?.reached !== false) {
+          deeper();
+          return;
+        }
+        void this.offerHiddenCommit(graph, sha, short);
+      },
+      deeper,
+    );
+  }
+
+  /**
+   * The branch filter hides `sha`: say so, and offer the way in — FIRST, to
+   * add a branch that contains it, keeping the rest of the selection. "Show
+   * all branches" (second) throws the whole selection away to see one commit.
+   *
+   * The branch comes from `refs:contains` by FULL name, mapped through the
+   * graph's own ref list (revealCandidate), and is added to the filter as it
+   * is STORED — a preset stays its symbol, so "Current branch" + the added
+   * branch still follows a checkout (storedFilterOf / withRef; resolveRefFilter
+   * reads the mix). Either way the reveal replays once the new rows land.
+   */
+  private async offerHiddenCommit(graph: GraphMount, sha: string, short: string): Promise<void> {
+    const contains = await host.invoke("refs:contains", { sha }).catch(() => undefined);
+    // Answered later than asked: the view may have moved on.
+    if (this.currentView !== "graph" || this.graph !== graph) return;
+    const add = revealCandidate(contains?.refs ?? [], graph.refList);
+    const actions: ToastAction[] = [];
+    if (add) {
+      actions.push({
+        label: l10n.t("Add {0} to the filter", refLabel(add.fullName)),
+        onClick: () =>
+          void graph
+            .setRefFilter(withRef(storedFilterOf(graph.refFilter, graph.refPreset), add.fullName))
+            .then(() => this.revealWhenReady(sha)),
+      });
+    }
+    actions.push({
+      label: l10n.t("Show all branches"),
+      onClick: () => void graph.setRefFilter(null).then(() => this.revealWhenReady(sha)),
+    });
+    toast(l10n.t("{0} is hidden by the branch filter — its details are below.", short), "info", undefined, actions);
+  }
+
+  /** Scroll to + select a commit once the freshly-mounted graph has rows. The
+   *  graph loads its first page asynchronously, so retry briefly — reveal is a
+   *  no-op until the row exists. The details pane loads immediately (it's
+   *  IPC-driven, not row-driven). */
+  private revealWhenReady(sha: string): void {
+    void this.selectCommit(sha);
+    let tries = 0;
+    const tryReveal = (): void => {
+      if (this.graph?.reveal(sha)) return;
+      if (++tries < 6 && this.currentView === "graph") {
+        window.setTimeout(tryReveal, 120);
+        return;
+      }
+      // GIVE UP OUT LOUD. The graph holds only the pages it has loaded, so a
+      // commit further back than that — which is most of the history in any
+      // real repository — can never be revealed however long we retry. The
+      // details pane below has loaded it either way, so the work is not lost;
+      // saying nothing just made the list look like it had ignored the click.
+      if (this.currentView === "graph") this.revealMissed(sha);
+    };
+    // A TIMER, not requestAnimationFrame (see focusReturn.ts): a frame is not
+    // guaranteed while the window is occluded or minimised, and never comes
+    // under the headless harness — where the reveal "Show all branches"
+    // replays (issue #30) sat unfired behind a frame that was never served.
+    window.setTimeout(tryReveal, 0);
+  }
+
+  /**
+   * The branch switcher.
+   *
+   * It used to switch nothing. Every row — branches, remotes and tags alike —
+   * called `revealInGraph`, so clicking "fix/log-stream" under a chip whose own
+   * tooltip reads "On branch main — switch branch" left you on main and dropped
+   * you in the Commits view instead. The app's most load-bearing control did
+   * something other than its name, silently, every time.
+   *
+   * Now a branch row CHECKS OUT. Revealing a ref in the graph is still one
+   * gesture away — it moved to a trailing button on the row, where it reads as
+   * the secondary thing it is.
+   *
+   * Remotes and tags keep reveal as their primary: checking either out detaches
+   * HEAD, which is not what someone picking from a branch chip is asking for.
+   * The remote rows offer "check out as a local branch", which is what they
+   * actually mean, through the same path the Branches list uses.
+   */
+  private openBranchMenu(anchor: HTMLElement): void {
+    const locals = this.refs.filter((r) => r.type === "head");
+    // Not the remote's own HEAD: its row offered "Check out as a local
+    // branch", "Compare with HEAD" (with origin's default branch) and "Copy
+    // name" (copying "origin"), for a ref every other list leaves out.
+    const remotes = this.refs.filter((r) => r.type === "remote" && !isRemoteHead(r));
+    const tags = this.refs.filter((r) => r.type === "tag");
+    const items: MenuItem[] = [];
+    // Every entry is NAMED by its full name under the namespace — "release",
+    // "origin/x", "v1" — never git's short form, which is "heads/release" /
+    // "tags/release" beside a tag and a branch of that name, and
+    // "remotes/origin/x" beside a local branch "origin/x". Each still checks
+    // out by its full name.
+    if (locals.length) {
+      items.push({ separator: true, label: l10n.t("Branches") });
+      for (const b of locals) {
+        items.push({
+          label: branchName(b),
+          icon: "git-branch",
+          current: b.isCurrent,
+          sub: b.isCurrent ? l10n.t("current") : undefined,
+          title: b.isCurrent ? l10n.t("Already on {0}", branchName(b)) : l10n.t("Check out {0}", branchName(b)),
+          onClick: () => {
+            if (b.isCurrent) {
+              this.revealInGraph(b.sha);
+              return;
+            }
+            void this.checkoutRef(b.fullName);
+          },
+          // Its actions (#32) — Right or Enter from the keyboard, the arrow
+          // at the row's end from the pointer: the Branches list's own menu
+          // for it, Checkout first.
+          submenuLabel: l10n.t("Actions for {0}", branchName(b)),
+          submenu: () => this.switcherBranchActions(b, anchor),
+        });
+      }
+    }
+    if (remotes.length) {
+      items.push({ separator: true, label: l10n.t("Remotes") });
+      // No cap. This menu used to slice to 16 with NO indication, and its
+      // type-to-filter only hides rows that were already built — so anything
+      // past the 16th was unreachable by any means, including search.
+      for (const b of remotes) {
+        items.push({
+          label: refDisplay(b.fullName),
+          icon: "cloud",
+          title: `Check out ${refDisplay(b.fullName)} as a local branch`,
+          onClick: () => void this.checkoutRef(b.fullName),
+          submenuLabel: l10n.t("Actions for {0}", refDisplay(b.fullName)),
+          submenu: () => [
+            {
+              label: l10n.t("Check out as a local branch"),
+              icon: "check",
+              onClick: () => void this.checkoutRef(b.fullName),
+            },
+            { separator: true },
+            ...this.remoteActionItems(b),
+          ],
+        });
+      }
+    }
+    if (tags.length) {
+      items.push({ separator: true, label: l10n.t("Tags") });
+      // for-each-ref returns refname (byte) order, which puts v1.10 BELOW v1.9
+      // and meant the old 16-item cap kept the oldest tags. Numeric-aware
+      // descending, matching the extension's branch dialog.
+      const tagsSorted = [...tags].sort((a, b) =>
+        tagName(b).localeCompare(tagName(a), undefined, { numeric: true }),
+      );
+      for (const t of tagsSorted) {
+        items.push({
+          label: tagName(t),
+          icon: "tag",
+          title: l10n.t("Show {0} in Commits", tagName(t)),
+          onClick: () => this.revealInGraph(t.sha),
+          submenuLabel: l10n.t("Actions for {0}", tagName(t)),
+          submenu: () => this.tagActionItems(t),
+        });
+      }
+    }
+    if (items.length === 0) {
+      items.push({ label: l10n.t("No branches yet"), disabled: true });
+    } else {
+      items.push({ separator: true });
+      items.push({
+        label: l10n.t("New branch…"),
+        icon: "add",
+        onClick: () => void this.newBranch(),
+      });
+      items.push({
+        label: l10n.t("Manage branches…"),
+        icon: "git-branch",
+        onClick: () => this.routeView("branches"),
+      });
+    }
+    // The filter always: type-to-filter is how the switcher is driven (#32),
+    // as the extension's branch menu always has its search field. openMenu
+    // turns it on by itself only above nine rows, so a small repository's
+    // switcher had no filter and the letters typed into it did nothing.
+    openMenu(anchor, items, { searchable: true });
+  }
+
+  /**
+   * A branch's submenu in the switcher: the Branches list's menu for it, read
+   * from the branch list (which knows its upstream and counts), Checkout
+   * first. A branch the list no longer has — deleted from a terminal a moment
+   * ago — offers what its ref alone allows.
+   */
+  private async switcherBranchActions(ref: RefInfo, anchor: HTMLElement): Promise<MenuItem[]> {
+    let list: BranchInfo[] = [];
+    try {
+      list = await gget("branches:list", undefined);
+    } catch {
+      /* the fallback below */
+    }
+    const b = list.find((x) => x.fullName === ref.fullName);
+    if (b) return this.branchActionItems(b, anchor, { checkoutFirst: true });
+    const name = branchName(ref);
+    return ref.isCurrent
+      ? [{ label: l10n.t("Show {0} in Commits", name), icon: "git-commit", onClick: () => this.revealInGraph(ref.sha) }]
+      : [{ label: l10n.t("Checkout {0}", name), icon: "check", onClick: () => void this.checkoutRef(ref.fullName) }];
+  }
+
+  // ── Refs / HEAD (drives the branch switcher) ────────────────────────────────
+
+  private async refreshRefs(): Promise<void> {
+    // Which answer paints? Twelve call sites reach this, and two of them can be
+    // in flight at once — so an answer asked BEFORE a checkout that lands after
+    // the one asked after it must not put the old branch back (topbarRead.ts).
+    //
+    // NOT the route generation. This tab is one repository for its whole life
+    // (issue #32), so no route can make its HEAD wrong — and every route bumps
+    // that generation: an open's landing (Repositories' Open and Clone land on
+    // Code) or the first click while git was still answering threw the answer
+    // away, and the pill said "…" for the rest of the tab's life.
+    const ticket = this.refsRead.ask();
+    // Cached: refs/head change rarely between view switches, so reuse a recent
+    // result instead of re-running git on every navigation.
+    const [refs, head] = await Promise.all([
+      gget("refs:list", undefined),
+      gget("head:get", undefined),
+    ]);
+    if (!this.refsRead.land(ticket)) return; // a newer answer is on screen
+    this.refs = refs;
+    this.headInfo = head;
+    this.syncComposerBranch();
+    if (this.branchSwitchName) {
+      const label = !head
+        ? "HEAD"
+        : head.detached
+          ? `detached @ ${head.sha.slice(0, 7)}`
+          : (head.branch ?? "HEAD");
+      this.branchSwitchName.textContent = label;
+      // The name truncates in the slim bar — expose the full ref as a tooltip.
+      const sw = this.branchSwitchName.closest(".topbar-switch") as HTMLElement | null;
+      if (sw) sw.title = head?.detached ? `Detached HEAD at ${head.sha.slice(0, 12)}` : `On branch ${label} — switch branch`;
+      // A longer branch name needs more room than the last one did.
+      this.fitTopbar?.();
+    }
+  }
+
+  // ── Commit selection & details ───────────────────────────────────────────────
+
+  private async selectCommit(sha: string): Promise<void> {
+    this.selectedSha = sha;
+    this.selectionSummary.cancel(); // a pending "N commits selected" answer is for a selection that is gone
+    // Loading a commit's details is a round trip, and this pane used to sit
+    // showing the PREVIOUS commit's files the whole time — so a slow load was
+    // indistinguishable from a fast one, and a FAILED load was invisible: the
+    // old commit stayed on screen as though it were the one you just clicked.
+    // The open diff belongs to the PREVIOUS commit, so it goes with it — the
+    // dock's Diff tab must never sit there showing a file from a commit that is
+    // no longer selected.
+    this.closeGraphDiff();
+    // And the pane has to be OPEN for anything this load is about to say. It
+    // could be closed (the panel's own X), in which case both the loading state
+    // and a failure card were written into a `display: none` column: clicking a
+    // commit after closing the panel looked like nothing happened at all.
+    this.setGraphDetailsVisible(true);
+    this.detailsEl?.replaceChildren(loadingState(l10n.t("Loading {0}…", sha.slice(0, 7))));
+    let details;
+    try {
+      details = await host.invoke("commit:details", sha);
+    } catch (e) {
+      if (this.selectedSha !== sha) return;
+      this.detailsEl?.replaceChildren(
+        errorState(l10n.t("Couldn't load this commit"), cleanErr(e) || l10n.t("The commit details request failed.")),
+      );
+      return;
+    }
+    if (this.selectedSha !== sha) return;
+    if (!details) {
+      this.detailsEl?.replaceChildren(
+        errorState(l10n.t("Couldn't load this commit"), l10n.t("Git returned nothing for {0}.", sha.slice(0, 7))),
+      );
+      return;
+    }
+    this.renderDetails(details);
+  }
+
+  /**
+   * Mount the shared <gitstudio-commit-details> inspect panel (identical to the
+   * extension) above a diff surface. Clicking a file in the panel reveals the
+   * inline Monaco diff below it.
+   */
+  private renderDetails(d: CommitDetailsPayload): void {
+    // Tear down the previous commit's diff editor — it's lazily re-created only
+    // when a file is opened (creating Monaco on every commit click is what made
+    // this panel lag).
+    this.diffPanel?.dispose();
+    this.diffPanel = undefined;
+    this.activeMonacoView = undefined;
+
+    const wrap = el("div", "details-split");
+
+    const panel = document.createElement(
+      "gitstudio-commit-details",
+    ) as CommitDetailsEl;
+    panel.className = "details-panel";
+    panel.details = d;
+    panel.addEventListener("gs-file-open", (e) => {
+      const detail = (e as CustomEvent).detail as { path: string };
+      const f = d.files.find((x) => x.path === detail.path);
+      if (f) {
+        void this.openFile(
+          { path: f.path, status: f.status, oldPath: f.oldPath },
+          d.kind === "wip" ? undefined : d.sha,
+        );
+      }
+    });
+    panel.addEventListener("gs-copy", (e) => {
+      const detail = (e as CustomEvent).detail as { text: string };
+      void copyText(detail.text, "Copied.");
+    });
+    panel.addEventListener("gs-action", (e) => {
+      const detail = (e as CustomEvent).detail as { id: string; sha: string };
+      void this.runDetailsAction(detail.id, detail.sha);
+    });
+    // Parent-sha chips: jump the graph to the parent and inspect it. Through
+    // revealInGraph, so a parent the graph does not have — further back, or
+    // hidden by the branch filter — is said so like every other reveal.
+    panel.addEventListener("gs-reveal", (e) => {
+      const detail = (e as CustomEvent).detail as { sha: string };
+      if (this.currentView === "graph" && this.graph) {
+        this.revealInGraph(detail.sha);
+        return;
+      }
+      this.graph?.reveal(detail.sha);
+      void this.selectCommit(detail.sha);
+    });
+    // A ref chip in the pane is the same shortcut it is in the graph's rows
+    // (issue #30): its menu is the graph's own — the graph owns the filter and
+    // the ref list the chip is resolved through. Only while there IS a graph
+    // to answer; otherwise the chips stay labels.
+    panel.refMenu = !!this.graph;
+    panel.addEventListener("gs-ref-menu", (e) => {
+      const d = (e as CustomEvent<RefMenuRequest>).detail;
+      this.graph?.openRefMenu({ name: d.name, fullName: d.fullName, kind: d.kind }, d.x, d.y, d.sha, {
+        opener: d.opener,
+        keyboard: d.keyboard,
+      });
+    });
+    // "in N branches" — the same lazy containment query the extension runs.
+    // Without this the control would spin forever on desktop.
+    panel.addEventListener("gs-contains", (e) => {
+      const detail = (e as CustomEvent).detail as { sha: string };
+      void (async () => {
+        try {
+          const r = await host.invoke("refs:contains", { sha: detail.sha });
+          panel.setContains(detail.sha, r.branches, r.truncated);
+        } catch {
+          panel.setContains(detail.sha, [], false);
+        }
+      })();
+    });
+    // The panel's Close (X) button + its Esc affordance emit gs-close; collapse
+    // the details dock (mirrors the extension webview, which handles gs-close in
+    // graph/main.ts). Without this the visible Close control is dead on desktop.
+    panel.addEventListener("gs-close", () => {
+      this.setGraphDetailsVisible(false);
+    });
+
+    // The file diff mounts INTO this split (`.details-diff`, see openFile),
+    // so the whole commit — metadata, files, editor — lives in ONE place.
+    wrap.append(panel);
+
+    if (!this.detailsEl) return;
+    this.detailsEl.replaceChildren(wrap);
+    // Selecting another commit makes any open diff stale — it belonged to the
+    // previous commit's file. Drop the tab rather than leaving the wrong diff up.
+    this.closeGraphDiff();
+    // Make sure the details column beside the graph is showing.
+    this.setGraphDetailsVisible(true);
+  }
+
+
+  /** Tear down the in-view commit diff: dispose the editor, drop the pane,
+   *  give the graph its width back. */
+  private closeGraphDiff(): void {
+    this.diffPanel?.dispose();
+    this.diffPanel = undefined;
+    if (this.activeMonacoView) {
+      this.activeMonacoView = undefined;
+    }
+    this.diffSurfaceEl = undefined;
+    // Drops the Diff tab from the dock's tab strip and, if it was the tab on
+    // screen, hands the dock back to Terminal. The dock itself stays where the
+    // user put it — closing a diff is not a reason to close their terminal.
+    this.terminalDock?.setDetailsVisible(false);
+  }
+
+  /** Show/hide the commit-details column beside the graph. */
+  private setGraphDetailsVisible(visible: boolean): void {
+    const wrap = this.graphDetailsPane?.parentElement;
+    if (!wrap) return;
+    wrap.classList.toggle("details-hidden", !visible);
+  }
+
+  /**
+   * The drag divider between the graph and the commit-details column. Mirrors
+   * detailsPaneResizer (which splits details|diff INSIDE the pane); this one
+   * splits graph|details. Width persists across sessions.
+   */
+  private graphSplitResizer(wrap: HTMLElement): HTMLElement {
+    // Free dragging, with a floor on the GRAPH rather than a ceiling on the
+    // details column.
+    //
+    // It used to be the other way round: `max = min(900, wrapWidth - 900)`,
+    // where 900 came from the graph's own column-drop breakpoint plus headroom.
+    // On a 1280px window that arithmetic collapses — min, max and current all
+    // land on 320 and the divider has ZERO travel; at 1440 it has four pixels.
+    // So a guard meant to protect the graph's columns instead froze the control
+    // on exactly the laptop widths most people use, while the widths it was
+    // protecting were already violated. The graph degrades honestly on its own
+    // (it ellipsises, and its own container queries drop columns in order), so
+    // the only real floor is the width below which its toolbar stops working —
+    // measured at ~312px. Below MIN the details column is not a column.
+    const MIN = 160;
+    const GRAPH_MIN = 320;
+    const KEY = "gitstudio.graphDetailsW";
+    // The graph drops its Date and SHA columns below a breakpoint of its own (a
+    // container query in commit-graph), so the details column must never
+    // squeeze it past that — otherwise columns silently vanish and their resize
+    // handles go with them.
+    //
+    // TAKEN FROM THE GRAPH, not restated here. This was a literal 800 beside a
+    // comment saying the drop happened at 760; the graph package has since
+    // raised it to 860, and nothing connected the two — so the resizer let you
+    // drag the details pane 60px past the point where the graph starts losing
+    // columns, which is exactly what the guard exists to prevent. Plus the
+    // headroom the comment always intended.
+    const maxFor = (): number =>
+      Math.max(MIN, Math.round(wrap.getBoundingClientRect().width) - GRAPH_MIN);
+    const saved = Number(localStorage.getItem(KEY));
+    /**
+     * What the user ASKED for, kept apart from what currently fits.
+     *
+     * These used to be one variable, and clamping wrote back into it. The first
+     * clamp runs while `wrap` is still detached — `graphSplitResizer(wrap)` is
+     * called inside `wrap.append(...)` — so its width is 0, maxFor() collapses
+     * to the 320px floor, and the 420px default was destroyed on the way in.
+     * The resize handler then re-clamped 320 against every later width, so the
+     * column could only ever shrink: the pane opened at its hard minimum every
+     * time, and a width you dragged to 600px came back as 320. The comment
+     * promising "width persists across sessions" could not have been true.
+     */
+    let desired = Number.isFinite(saved) && saved > 0 ? saved : 420;
+    let applied = desired;
+    const apply = (): void => {
+      applied = Math.min(maxFor(), Math.max(MIN, Math.round(desired)));
+      wrap.style.setProperty("--graph-details-w", `${applied}px`);
+    };
+    const setW = (n: number): void => {
+      desired = Math.max(MIN, Math.round(n));
+      apply();
+    };
+    apply();
+
+    // Re-apply whenever the pane's own box changes — which covers both the
+    // window resize (narrowing starves the details column rather than the
+    // graph) and the first real layout after `wrap` is attached. Clamping from
+    // `desired` every time means widening the window grows the column back
+    // toward what was asked for instead of leaving it stuck at the floor.
+    this.graphSplitRO?.disconnect();
+    if (typeof ResizeObserver !== "undefined") {
+      this.graphSplitRO = new ResizeObserver(() => apply());
+      this.graphSplitRO.observe(wrap);
+    } else {
+      window.addEventListener("resize", () => apply());
+    }
+
+    const split = el("div", "cmp-vsplit graph-vsplit");
+    split.append(el("div", "cmp-vsplit-grip"));
+    wireResizerKeys(split, {
+      orientation: "vertical",
+      label: l10n.t("Resize the commit details column"),
+      min: MIN,
+      max: maxFor,
+      get: () => applied,
+      set: setW,
+      inverted: true,
+      onCommit: () => localStorage.setItem(KEY, String(desired)),
+    });
+    split.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = applied;
+      document.body.classList.add("resizing-h");
+      // Dragging LEFT widens the details column (it is the right-hand pane).
+      const move = (ev: PointerEvent): void => setW(startW - (ev.clientX - startX));
+      const up = (): void => {
+        document.body.classList.remove("resizing-h");
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        localStorage.setItem(KEY, String(desired));
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    });
+    return split;
+  }
+
+  /** Route a details-panel toolbar action to the existing git context menu. */
+  private async runDetailsAction(id: string, sha: string): Promise<void> {
+    if (id === "interactive-rebase") {
+      // The desktop DOES have the visual rebase workspace — it is the Rebase
+      // section in the sidebar. This used to toast "isn't available in the
+      // desktop app yet", which was stale the moment that view shipped and
+      // contradicted a working tab two rows away.
+      this.routeView("rebase", true);
+      return;
+    }
+    if (id === "open-remote") {
+      // The details header emitted this and NOTHING listened: the button was
+      // drawn whenever the repo has a remote, and clicking it did nothing at
+      // all. It only ever meant one thing — this commit, on github.com.
+      const repo = peek("github:status", undefined)?.repo;
+      if (!repo) {
+        toast(l10n.t("This repository has no GitHub remote the app can open."), "info");
+        return;
+      }
+      window.open(`https://github.com/${repo.owner}/${repo.repo}/commit/${sha}`, "_blank", "noopener");
+      return;
+    }
+    const map: Record<string, string> = {
+      checkout: "checkout",
+      branch: "branch",
+      tag: "tag",
+      "cherry-pick": "cherry-pick",
+      revert: "revert",
+      reset: "reset-mixed",
+      "copy-sha": "copy-sha",
+    };
+    const action = map[id];
+    if (!action) return;
+    // THE SAME QUESTIONS the right-click menu asks. This toolbar offers the
+    // identical seven actions and used to dispatch every one of them raw:
+    // Checkout detached HEAD with no warning, Revert and Reset changed history
+    // in silence, and Branch and Tag went out with no name at all — which came
+    // back as an error blaming the user for a request the app had failed to
+    // build. One table, asked from both doors.
+    const item = commitActionItem(action);
+    if (item) {
+      const asked = await askForCommitAction(item);
+      if (!asked.ok) return;
+      await this.runAction({ action, sha, name: asked.name } as Parameters<App["runAction"]>[0]);
+      return;
+    }
+    await this.runAction({ action, sha } as Parameters<App["runAction"]>[0]);
+  }
+
+  private async openFile(file: ChangedFile, sha?: string): Promise<void> {
+    // The diff opens in the BOTTOM DOCK, beside Terminal and Output.
+    //
+    // It used to open inside the commit-details column, and that was measurably
+    // the wrong home: code needs WIDTH. In the column the editor got 571px of a
+    // 1600px window — below Monaco's 1000px threshold, so every diff silently
+    // downgraded itself to Inline — while `.diff-open` pinned the graph to 34%
+    // (471px, under its own 620px breakpoint, so the column header and four
+    // columns vanished) and left the graph|details divider on screen as a dead
+    // control that moved nothing. In the dock the same diff gets the full
+    // window width, and the dock's height is already draggable, which is the
+    // axis you actually trade when you are reading code.
+    //
+    // ORDER MATTERS: make the tab, activate it, THEN read the surface. The
+    // dock body is `display: none` while collapsed or while another tab is up,
+    // so a DiffPanel built before the tab is active mounts into a 0x0 box.
+    const dock = this.mountTerminalDock();
+    if (!dock) return;
+    dock.setDetailsVisible(true);
+    dock.openDetails();
+    const surface = dock.detailsSurface();
+    if (!surface) return;
+    // NO header of our own. DiffPanel already draws one carrying the path and
+    // the Inline/Split toggle, so adding a second printed the filename twice,
+    // one line above itself. The file's identity goes on the TAB instead, which
+    // is where you look to see what is open, and the ✕ goes with it.
+    let body = surface.querySelector(".dock-diff-surface") as HTMLElement | null;
+    if (!body) {
+      body = el("div", "dock-diff-surface");
+      surface.replaceChildren(body);
+      this.diffSurfaceEl = body;
+    }
+    dock.setDetailsLabel(file.path);
+    if (!this.diffPanel && this.diffSurfaceEl) {
+      this.diffPanel = new DiffPanel(this.diffSurfaceEl);
+      this.activeMonacoView = this.diffPanel;
+      // Follow the dock's own drag rather than the ResizeObserver, which lands
+      // a frame late and leaves the editor trailing the pointer.
+      dock.onDetailsLayout = () => this.diffPanel?.layout();
+    }
+    // Capture the panel — re-reading `this.diffPanel` after an await threw
+    // "cannot read showDiff of undefined" when the user picked another commit
+    // mid-load and the panel was disposed. `gen` discards a stale result rather
+    // than painting it over the newer selection.
+    const panel = this.diffPanel;
+    if (!panel) return;
+    const gen = ++this.diffGen;
+    const diff = await host.invoke("file:diff", {
+      path: file.path,
+      sha,
+      ...(sha && file.oldPath ? { oldPath: file.oldPath } : {}),
+    });
+    if (gen !== this.diffGen || panel !== this.diffPanel) return;
+    if (!diff) {
+      // The FOURTH caller of this shape, and the last one still laundering a
+      // failure into good news. `fileDiff` returns undefined when there is no
+      // repository open or the path failed its containment check — never
+      // because the two sides matched. Saying "no textual changes" with a green
+      // tick asserts something the app has no basis for, about a file that is
+      // in this list precisely because it differs. Changes, Compare and the
+      // commit page each got this treatment; this one was missed.
+      panel.showEmpty(
+        l10n.t("{0} is listed as changed, so this is a failure to read it — not a file with nothing in it.", file.path),
+        { title: l10n.t("Couldn't read this file"), kind: "error" },
+      );
+      return;
+    }
+    if (diff.conflicted) {
+      const model = await host.invoke("conflict:model", file.path);
+      if (gen !== this.diffGen || panel !== this.diffPanel) return;
+      if (model) {
+        // The same shell as the Changes view; the dock has no dashboard to go
+        // back to, so resolving or exiting just repaints what is around it.
+        panel.showConflict(model, {
+          onResolved: () => void this.refreshAll(),
+          onExit: () => panel.showEmpty(l10n.t("Select a file to view its diff.")),
+          onOperationChanged: (outcome) => void this.afterOperationVerb(outcome),
+        });
+        return;
+      }
+    }
+    panel.showDiff(diff);
+  }
+
+  private showDetailsPlaceholder(): void {
+    if (!this.detailsEl) return;
+    const wrap = el("div", "details details-empty");
+    wrap.appendChild(
+      this.currentRepo
+        ? emptyState(l10n.t("Commit details"), l10n.t("Select a commit to inspect its message, author, and changed files."), {
+            icon: "git-commit",
+          })
+        : emptyState(l10n.t("No repository open"), l10n.t("Open a repository to start exploring its history."), {
+            icon: "repo",
+          }),
+    );
+    this.detailsEl.replaceChildren(wrap);
+  }
+
+  /** With no commits there is nothing to select, so the details pane must not
+   *  sit beside "No commits yet" telling you to select one — two competing
+   *  empty states, the second contradicting the first. */
+  private setDetailsEmptyForNoHistory(noHistory: boolean): void {
+    this.graphViewWrap?.classList.toggle("graph-no-history", noHistory);
+  }
+
+  // ── Commit actions (context menu) ────────────────────────────────────────────
+
+  /**
+   * Open the graph's commit menu. "Drop commit…" is offered only where it can
+   * work (issue #32), which only main can say — so it is asked first. A second
+   * right-click while the first is being answered wins: the late answer never
+   * opens a menu over the newer one.
+   */
+  private async openCommitMenu(sha: string, x: number, y: number): Promise<void> {
+    const seq = ++this.commitMenuSeq;
+    const [plan, reword] = await Promise.all([
+      host.invoke("commit:dropPlan", { sha }).catch(() => undefined),
+      host.invoke("commits:plan", { verb: "reword", shas: [sha] }).catch(() => undefined),
+    ]);
+    if (seq !== this.commitMenuSeq) return;
+    this.contextMenu.open(sha, x, y, this.refsOn(sha), { drop: plan?.ok === true, reword: reword?.ok === true });
+  }
+
+  /**
+   * The graph's menu for a selection of several commits (issue #32). What
+   * applies is main's answer (commits:menu); a later right-click wins, as it
+   * does for one commit's menu.
+   */
+  private async openManyMenu(shas: string[], x: number, y: number): Promise<void> {
+    const seq = ++this.commitMenuSeq;
+    const can = await host
+      .invoke("commits:menu", { shas })
+      .catch(() => ({ apply: false, drop: false, squash: false }));
+    if (seq !== this.commitMenuSeq) return;
+    this.contextMenu.openMany(shas, x, y, can);
+  }
+
+  /**
+   * The details pane with several commits selected (issue #32): a summary —
+   * how many, who, when, each commit, and the menu's actions as buttons —
+   * never the first commit's details standing in for the rest. None selected
+   * (a Cmd-click took the last one off) is the pane's empty state.
+   */
+  private showSelection(shas: string[]): void {
+    this.selectedSha = undefined;
+    this.closeGraphDiff();
+    if (shas.length < 2) {
+      this.selectionSummary.cancel();
+      this.showDetailsPlaceholder();
+      return;
+    }
+    const panel = document.createElement("gitstudio-commit-details") as CommitDetailsEl;
+    panel.className = "details-panel";
+    panel.selection = { commits: this.graph?.summaryCommits(shas) ?? [] };
+    panel.addEventListener("gs-selection-action", (e) => {
+      const d = (e as CustomEvent<{ id: string; shas: string[] }>).detail;
+      void this.runMany(d.id as ManyAction, d.shas);
+    });
+    // A row keeps just that commit: the graph selects it and says so.
+    panel.addEventListener("gs-reveal", (e) => {
+      const d = (e as CustomEvent<{ sha: string }>).detail;
+      this.revealInGraph(d.sha);
+    });
+    panel.addEventListener("gs-close", () => this.setGraphDetailsVisible(false));
+    const wrap = el("div", "details-split");
+    wrap.append(panel);
+    this.detailsEl?.replaceChildren(wrap);
+    this.setGraphDetailsVisible(true);
+    // Settle first: Shift+Down held over twenty rows is twenty selections, and
+    // each would walk the branch three ways. Only the one it stops on is asked
+    // — through the SettleLatest the extension's summary uses too.
+    //
+    // The settle is a timer, and a timer runs in the back too: a question it
+    // asked from there would be stamped with the tab in FRONT (bridge.ts
+    // stamps a call when it is made) and asked of that repository. So it
+    // waits for this tab to be in front again.
+    void this.selectionSummary
+      .run(async () => {
+        await this.whenInFront();
+        return host.invoke("commits:menu", { shas }).catch(() => ({ apply: false, drop: false, squash: false }));
+      })
+      .then((can) => {
+        if (!can || !panel.selection) return;
+        panel.selection = {
+          ...panel.selection,
+          actions: manyMenuRows(shas.length, can).map((r) => ({ id: r.action, label: r.label, icon: r.icon, danger: r.danger })),
+        };
+      });
+  }
+
+  /**
+   * Resolves once this tab is in front — at once when it is. For work a TIMER
+   * starts (a settle, a debounce): a call made while the tab is in the back
+   * would be stamped with the tab in front and go to its repository. An answer
+   * already asked for is held by the bridge instead; this is for the asking.
+   */
+  private whenInFront(): Promise<void> {
+    if (currentSession()?.id === this.session.id) return Promise.resolve();
+    return new Promise((resolve) => this.frontWaiters.push(resolve));
+  }
+
+  /** An item of the several-commit menu or summary — see renderer/multiCommit.ts. */
+  private async runMany(action: ManyAction, shas: string[]): Promise<void> {
+    try {
+      await runManyAction(action, shas, {
+        plan: (req) => host.invoke("commits:plan", req),
+        // in-the-way-reviewed: a forwarder — multiCommit.ts's applyManyFlow
+        // reads `.cancelled` and says nothing on Cancel.
+        apply: (req) => host.invoke("commit:action", req),
+        rewrite: (req) => host.invoke("commits:rewrite", req),
+        undo: (req) => host.invoke("commits:undo", req),
+        confirm: (opts) => confirmDialog(opts),
+        choose: (opts) => promptChoice(opts),
+        message: (opts) => promptMessage({ ...opts, label: l10n.t("Commit message"), holdWhile: whileSameRepo() }),
+        toast: (message, kind) => toast(message, kind),
+        undoable: (message, act) => didUndoable(message, act),
+        refresh: async () => {
+          bust();
+          await this.refreshAll();
+        },
+        landOnConflicts: () => this.landOnConflicts(),
+        copy: (text, said) => copyText(text, said),
+        compare: (base, head) => {
+          this.compareCommits = new Set([base, head]);
+          this.compareBase = base;
+          this.compareHead = head;
+          this.routeView("compare", true);
+        },
+      });
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("That didn't work."), "error");
+    }
+  }
+
+  /** "Drop commit…" — see renderer/dropCommit.ts for the flow. */
+  private async dropCommit(sha: string): Promise<void> {
+    try {
+      await dropCommitFlow(sha, {
+        plan: (req) => host.invoke("commit:dropPlan", req),
+        drop: (req) => host.invoke("commit:drop", req),
+        undo: (req) => host.invoke("commit:undoDrop", req),
+        confirm: (opts) => confirmDialog(opts),
+        choose: (opts) => promptChoice(opts),
+        toast: (message, kind) => toast(message, kind),
+        undoable: (message, action) => didUndoable(message, action),
+        refresh: async () => {
+          bust();
+          await this.refreshAll();
+        },
+        landOnConflicts: () => this.landOnConflicts(),
+      });
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("Couldn't drop the commit."), "error");
+    }
+  }
+
+  private async runAction(req: Parameters<CommitContextMenu["resolve"]>[0]): Promise<void> {
+    if (req.action === "copy-sha") {
+      await copyText(req.sha, l10n.t("Commit SHA copied."));
+      return;
+    }
+    try {
+      const result = await host.invoke("commit:action", req);
+      // Asked "Stash & Retry or Cancel?" over the user's changes in the way
+      // (bridge.ts), and cancelled: nothing ran, nothing failed.
+      if (result.cancelled) return;
+      if (!result.ok) {
+        // The graph's menus (the row's and the chip's): a branch named like an
+        // option says why, and offers the rename — the same words as Branches.
+        if (explainRefusedCheckout(result, async () => {
+          bust();
+          await this.refreshAll();
+        })) return;
+        const failVerbs: Record<string, string> = {
+          checkout: l10n.t("check out"),
+          branch: l10n.t("create a branch"),
+          tag: l10n.t("create a tag"),
+          "cherry-pick": l10n.t("cherry-pick"),
+          revert: l10n.t("revert"),
+          "reset-soft": l10n.t("reset (soft)"),
+          "reset-mixed": l10n.t("reset (mixed)"),
+          "reset-hard": l10n.t("reset (hard)"),
+        };
+        toast(
+          result.message ?? l10n.t("Couldn't {0}.", failVerbs[req.action] ?? req.action.replace(/-/g, " ")),
+          result.expected ? "info" : "error",
+        );
+        return;
+      }
+      const verbs: Record<string, string> = {
+        checkout: l10n.t("Checked out commit"),
+        branch: l10n.t("Branch created"),
+        tag: l10n.t("Tag created"),
+        "cherry-pick": l10n.t("Cherry-picked"),
+        revert: l10n.t("Revert commit created"),
+        "reset-soft": l10n.t("Reset (soft) to commit"),
+        "reset-mixed": l10n.t("Reset (mixed) to commit"),
+        "reset-hard": l10n.t("Reset (hard) to commit"),
+      };
+      toast(l10n.t("{0}.", verbs[req.action] ?? l10n.t("Done")), "success");
+      if (result.changed) {
+        bust();
+        await this.refreshAll();
+      }
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("The action failed."), "error");
+    }
+  }
+
+  /** The repository this tab is for, or undefined for the no-repository screen. */
+  get repo(): RepoInfo | undefined {
+    return this.info;
+  }
+
+  /** Push the dock icon variant this tab's preferences resolve to. */
+  syncDock(): void {
+    this.syncDockIcon();
+  }
+}
+
+// ── The tab shell (issue #32) ───────────────────────────────────────────────
+
+/**
+ * Owns the repository tab row and the stage the tab in front is shown on, one
+ * App per open repository, and the ONE subscription to every window-level
+ * event (keys, focus, host events), which it hands to the tab in front.
+ *
+ * main (RepoStore) is the source of truth for which tabs are open and which
+ * is active; every change arrives as `repo:tabs` and is applied here. A switch
+ * is shown at once and told to main; `activations` keeps the answers to a
+ * burst of Ctrl+Tabs from dragging the screen back through each step.
+ * docs/desktop-repo-tabs.md is the design and the state table.
+ */
+class TabShell {
+  private readonly apps = new Map<string, App>();
+  private noRepo?: App;
+  private active?: App;
+  private state: RepoTabsState = { tabs: [] };
+  private readonly strip: RepoTabStrip;
+  private readonly stage: HTMLElement;
+  private readonly dirty = new Map<string, number>();
+  /** Tabs from the launch state whose App is not built yet (see appFor). */
+  private readonly launchRoots = new Set<string>();
+  /**
+   * The window's first read of its tabs has been answered. Until then main's
+   * `repo:tabs` events are not news: main answers that read once the launch
+   * restore is done, and the restore announces the same tabs a moment BEFORE
+   * the answer arrives — applied, that event built the restored tabs as new
+   * ones (a window left on Search came back on Code).
+   */
+  private tabsRead = false;
+  /** Tabs whose folder is gone (row 14): moved, deleted, no longer a repository. */
+  private readonly gone = new Set<string>();
+  /**
+   * The tab in front has no folder: the stage shows the gone screen, and the
+   * tab's own screen stays parked (or unbuilt) — so nothing of it runs git in
+   * the folder that is not there, not a view, not a refresh, not a key.
+   */
+  private goneScreenEl?: HTMLElement;
+  private sessionSeq = 0;
+  /** Switches told to main and not yet answered. */
+  private activations = 0;
+  /** A switch main asked for while a dialog was open — shown when it closes. */
+  private deferredTo: string | undefined | null = null;
+  private marksTimer = 0;
+  private marksSeq = 0;
+  /** When the marks were last asked for. */
+  private marksAt = 0;
+  private readonly isMac = navigator.platform.toLowerCase().includes("mac");
+  private readonly inElectron = /Electron\//.test(navigator.userAgent);
+
+  constructor() {
+    this.strip = new RepoTabStrip({
+      activate: (root) => this.requestActivate(root),
+      close: (root) => void this.requestClose(root),
+      add: (anchor) => void this.openAddMenu(anchor),
+      move: (root, index) => void shellHost.invoke("repo:moveTab", { root, index }).catch(() => undefined),
+      menu: (root, anchor) => this.openTabMenu(root, anchor),
+      list: (anchor) => this.openTabList(anchor),
+    });
+    this.stage = el("div", "tab-stage");
+    // The panel the tab row controls: whatever tab is in front is shown here.
+    this.stage.id = RepoTabStrip.PANEL_ID;
+    this.stage.setAttribute("role", "tabpanel");
+  }
+
+  async start(): Promise<void> {
+    document.getElementById("root")!.replaceChildren(this.strip.el, this.stage);
+    // Before anything can invoke a commit-applying command: the one place that
+    // asks Stash & Retry or Cancel for all of them (bridge.ts). It holds its
+    // question while the tab it was asked in stays in front.
+    installInTheWayAsker(() => currentSession()?.root);
+    // Catch-all error boundary: a rejected promise or thrown render should never
+    // leave the app silently broken — surface it as a toast. BUT skip the benign
+    // Monaco worker noise (it asks the base worker for TS language-service methods
+    // we don't bundle, and ResizeObserver loop warnings) — those are harmless.
+    window.addEventListener("unhandledrejection", (e) => {
+      const msg = cleanErr(e.reason);
+      if (isBenignError(msg)) return;
+      toast(msg || l10n.t("Something went wrong."), "error");
+    });
+    window.addEventListener("error", (e) => {
+      const msg = e.error ? cleanErr(e.error) : e.message || "";
+      if (isBenignError(msg, e.filename)) return;
+      if (e.error || e.message) toast(msg || l10n.t("Something went wrong."), "error");
+    });
+    // The theme is the window's: applied once here, and on an OS flip.
+    const prefs = loadPrefs();
+    const mode: ThemeMode =
+      prefs.themeMode === "light" || prefs.themeMode === "dark" || prefs.themeMode === "system"
+        ? prefs.themeMode
+        : "system";
+    applyTheme(resolveTheme(mode));
+    // theme-boot.js already put the style's class on <body> for the first
+    // frame; this is the renderer agreeing with it.
+    applyDarkStyle(parseDarkStyle(prefs.darkStyle));
+    followSystemTheme((osTheme) => {
+      if ((this.active?.themeModePref ?? "system") !== "system") return;
+      applyTheme(osTheme);
+      // Monaco's token classes are global — without this, every highlighted
+      // code block keeps the OLD theme's colors after an OS light/dark flip.
+      refreshHighlightTheme();
+      // Every tab, not just the one in front: a background tab's terminal and
+      // Appearance card would come back in the old theme.
+      for (const app of this.allApps()) app.onSystemThemeFlip();
+      // An "auto" dock icon must follow the OS flip too.
+      this.active?.syncDock();
+    });
+    // No Git, no app: before anything that needs it is built, a machine
+    // without a working Git is told so, and how to get it (noGit.ts) — then,
+    // once Check again finds it, the window carries on from here.
+    const root = document.getElementById("root")!;
+    await waitForGit(root, dismissLaunchScreen);
+    if (root.firstElementChild !== this.strip.el) root.replaceChildren(this.strip.el, this.stage);
+    window.addEventListener("keydown", (e) => this.onKey(e));
+    window.addEventListener("keydown", (e) => this.live()?.handleHelpKey(e));
+    window.addEventListener("mouseup", (e) => this.live()?.handleMouseUp(e));
+    installUndoKey();
+    this.wireHostEvents();
+    // A tab's spinner follows the operations running in it.
+    onRunningChange(() => {
+      this.renderStrip();
+      // An operation that just ENDED may have changed what the marks say.
+      this.scheduleMarks(600);
+    });
+    let st: RepoTabsState = { tabs: [] };
+    try {
+      st = await shellHost.invoke("repo:tabs", undefined);
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("Couldn't open the repository."), "error");
+    }
+    // The tabs the last session left open: main answers this read only once
+    // its launch restore is done (RepoStore.settledState), so every tab in it
+    // is one this window is bringing back.
+    for (const t of st?.tabs ?? []) this.launchRoots.add(t.root);
+    this.tabsRead = true;
+    this.apply(st ?? { tabs: [] });
+    this.active?.syncDock();
+  }
+
+  // ── What the Apps ask of the shell ──
+
+  /** Put a tab's freshly built screen on the stage (only the tab in front builds). */
+  present(app: App, screen: HTMLElement): void {
+    if (app !== this.active) return;
+    for (const child of [...this.stage.children]) {
+      if (child === screen) continue;
+      parkScreen(child as HTMLElement);
+      child.remove();
+    }
+    if (screen.parentElement !== this.stage) this.stage.appendChild(screen);
+  }
+
+  isActive(app: App): boolean {
+    return app === this.active;
+  }
+
+  /** A route asked of a background tab by the landing after an open. */
+  routeActive(id: string, force: boolean, target?: SectionTarget): void {
+    this.live()?.route(id, force, target);
+  }
+
+  openRoots(): string[] {
+    return this.state.tabs.map((t) => t.root);
+  }
+
+  /** Every tab's kept-alive views — the signed-in account changed. */
+  dropEveryTabsKeptViews(): void {
+    for (const app of this.allApps()) app.dropKeptViews();
+  }
+
+  async openRepo(): Promise<void> {
+    await host.invoke("repo:open", undefined);
+  }
+
+  async openPath(root: string): Promise<void> {
+    await host.invoke("repo:openPath", root);
+  }
+
+  // ── Tabs ──
+
+  private allApps(): App[] {
+    return [...this.apps.values(), ...(this.noRepo ? [this.noRepo] : [])];
+  }
+
+  private activeRoot(): string | undefined {
+    return this.active?.repo?.root;
+  }
+
+  /** main says which tabs are open and which is in front. */
+  private apply(next: RepoTabsState): void {
+    const roots = (st: RepoTabsState): string => st.tabs.map((t) => t.root).sort().join("\n");
+    const before = roots(this.state);
+    this.state = { tabs: next.tabs ?? [], active: next.active };
+    const open = new Set(this.state.tabs.map((t) => t.root));
+    const want = this.state.active && open.has(this.state.active) ? this.state.active : this.state.tabs[0]?.root;
+    // A switch we asked for is still being answered: its echo — and the
+    // echoes of the Ctrl+Tabs before it — must not drag the screen back.
+    if (this.activations === 0 && (want !== this.activeRoot() || !this.active)) {
+      if (isModalOpen()) this.deferUntilNoModal(want);
+      else this.show(want);
+    }
+    // Tabs that closed go AFTER the switch away from them.
+    for (const [root, app] of [...this.apps]) {
+      if (!open.has(root) && app !== this.active) this.disposeApp(root, app);
+    }
+    // …and what the row knew about them, built or not.
+    for (const root of [...this.dirty.keys()]) if (!open.has(root)) this.dirty.delete(root);
+    for (const root of [...this.gone]) if (!open.has(root)) this.gone.delete(root);
+    this.renderStrip();
+    this.scheduleMarks(0);
+    // Which tabs are open, not their order or which is in front.
+    if (roots(this.state) !== before) for (const app of this.allApps()) app.onTabsChanged(app === this.active);
+  }
+
+  /** Window-level work for the tab in front, or for the first one shown. */
+  private toActive(fn: (app: App) => void): void {
+    if (this.active) fn(this.active);
+    else this.waitingForActive.push(fn);
+  }
+  private readonly waitingForActive: ((app: App) => void)[] = [];
+
+  /** Show `root`'s tab (undefined = the no-repository screen). */
+  private show(root: string | undefined): void {
+    const prev = this.active;
+    const next = root ? this.appFor(root) : this.noRepoApp();
+    if (prev === next) return;
+    // Floating layers and toasts belong to the tab being left.
+    closePeek();
+    closeMenu();
+    dismissLayers();
+    clearToasts();
+    if (prev) this.putAway(prev);
+    this.active = next;
+    this.bringIn(next);
+    for (const fn of this.waitingForActive.splice(0)) fn(next);
+    // The no-repository screen is rebuilt when it is needed again.
+    if (prev && prev === this.noRepo && next !== prev) {
+      this.noRepo = undefined;
+      prev.dispose();
+      endSession(prev.session.id);
+      dropUndoScope(prev.session.id);
+      dropFocusTab(prev.session.id);
+    }
+    this.renderStrip();
+  }
+
+  /** The tab in front goes to the back: its screen is detached, whole. */
+  private putAway(app: App): void {
+    if (this.goneScreenEl) {
+      // Its own screen was never up (row 14): nothing to put away.
+      this.goneScreenEl.remove();
+      this.goneScreenEl = undefined;
+      return;
+    }
+    app.deactivate();
+    // In the back, whole: the pages on it are kept, not left — their Monaco
+    // diffs and log panes must not dispose themselves on the detach.
+    if (app.screenEl) parkScreen(app.screenEl);
+    app.screenEl?.remove();
+  }
+
+  /** The tab in front shows its screen — or, when its folder is gone, says so. */
+  private bringIn(app: App): void {
+    const root = app.repo?.root;
+    if (root && this.gone.has(root)) {
+      this.showGone(root);
+      return;
+    }
+    // BEFORE the screen is built: every call it makes is stamped with it. The
+    // answers it was owed while in the back are delivered as microtasks, after
+    // this switch has finished attaching and activating it.
+    setActiveSession(app.session);
+    if (!app.screenEl) {
+      app.activate(true);
+      app.mount();
+    } else {
+      this.stage.replaceChildren(app.screenEl);
+      app.activate(false);
+    }
+  }
+
+  /**
+   * Row 14: the tab in front has no folder any more. ONE screen says so, in
+   * place of the tab's own — where it was, and the two things to do about it.
+   * Its tab stays until it is closed, because the folder may be on a drive
+   * that is coming back. The tab's own session is not made active: answers
+   * still owed to it stay held, and it makes no new calls.
+   */
+  private showGone(root: string): void {
+    setActiveSession(undefined);
+    // ⌘Z here has nothing to undo: an entry of this tab's would run git in
+    // the folder that is not there.
+    setUndoScope(0);
+    const name = this.state.tabs.find((t) => t.root === root)?.name ?? root;
+    const screen = el("div", "tab-gone");
+    screen.setAttribute("role", "region");
+    screen.setAttribute("aria-label", l10n.t("{0}: folder not found", name));
+    screen.appendChild(
+      emptyState(
+        l10n.t("{0}'s folder is not there", name),
+        l10n.t("{0} was moved or deleted. Put it back and this tab carries on where you left it — or close the tab.", root),
+        {
+          icon: "warning",
+          action: { label: l10n.t("Look again"), icon: "refresh", onClick: () => void this.lookAgain(root) },
+          secondary: { label: l10n.t("Close Tab"), onClick: () => void this.requestClose(root) },
+        },
+      ),
+    );
+    this.goneScreenEl = screen;
+    this.stage.replaceChildren(screen);
+  }
+
+  /** "Look again": ask the disk now, rather than at the row's next look. */
+  private async lookAgain(root: string): Promise<void> {
+    await this.refreshMarks();
+    if (this.activeRoot() === root && this.gone.has(root)) toast(l10n.t("{0} is still not there.", root), "info");
+  }
+
+  /** The App in front, when its own screen is up — not the gone screen. */
+  private live(): App | undefined {
+    return this.goneScreenEl ? undefined : this.active;
+  }
+
+  private newSession(root: string | undefined): TabSession {
+    return { id: ++this.sessionSeq, root };
+  }
+
+  private appFor(root: string): App {
+    let app = this.apps.get(root);
+    if (!app) {
+      const info = this.state.tabs.find((t) => t.root === root) ?? { root, name: root.split(/[\\/]/).pop() || root };
+      // Where it starts is the App's to decide (mount): where this
+      // repository was left, else the view the window was last on. A tab
+      // from the launch state is a restore — once: closed and opened again,
+      // it is a new tab like any other.
+      const restored = this.launchRoots.delete(root);
+      app = new App(this, this.newSession(root), info, restored);
+      this.apps.set(root, app);
+    }
+    return app;
+  }
+
+  private noRepoApp(): App {
+    if (!this.noRepo) this.noRepo = new App(this, this.newSession(undefined), undefined);
+    return this.noRepo;
+  }
+
+  private disposeApp(root: string, app: App): void {
+    this.apps.delete(root);
+    this.dirty.delete(root);
+    app.dispose();
+    endSession(app.session.id);
+    dropCacheScope(root);
+    // What its section views remembered (a search, a sort, a sub-tab) goes
+    // too: the repository opened again is a new tab, and starts clean.
+    dropTabState(root);
+    dropUndoScope(app.session.id);
+    dropFocusTab(app.session.id);
+  }
+
+  /** A dialog is open: the switch main asked for waits for it to be answered. */
+  private deferUntilNoModal(root: string | undefined): void {
+    const first = this.deferredTo === null;
+    this.deferredTo = root;
+    if (!first) return;
+    const wait = (): void => {
+      // Already made — by the landing of the open that asked for it (gs:go).
+      if (this.deferredTo === null) return;
+      if (isModalOpen()) {
+        window.setTimeout(wait, 120);
+        return;
+      }
+      this.makeDeferredSwitch();
+    };
+    window.setTimeout(wait, 120);
+  }
+
+  /**
+   * Make the switch that waited for a dialog, now that none is open. The
+   * poll above gets there within 120 ms — too late for an open whose own
+   * dialog (the clone's progress card) is what it waited for: that open's
+   * answer closes the card and lands at once (gs:go), and must land in the
+   * tab it opened, not in the one it was started from.
+   */
+  private makeDeferredSwitch(): void {
+    if (this.deferredTo === null || isModalOpen()) return;
+    const to = this.deferredTo;
+    this.deferredTo = null;
+    if (to !== this.activeRoot()) this.show(to ?? undefined);
+    // Tabs closed while waiting go now that nothing shows them.
+    const open = new Set(this.state.tabs.map((t) => t.root));
+    for (const [r, app] of [...this.apps]) if (!open.has(r) && app !== this.active) this.disposeApp(r, app);
+  }
+
+  /** The user asked for a tab. Shown now; main is told. */
+  requestActivate(root: string | undefined): void {
+    if (!root || root === this.activeRoot()) return;
+    if (!this.state.tabs.some((t) => t.root === root)) return;
+    // A dialog is answered before anything else happens — its verb would run
+    // in whichever tab is in front when it is answered.
+    if (isModalOpen()) return;
+    dismissLayers();
+    // A layer that declined to close (a form with unsaved work) keeps you here.
+    if (openLayerCount() > 0) return;
+    this.show(root);
+    this.activations++;
+    void shellHost
+      .invoke("repo:activate", root)
+      .catch(() => false)
+      .finally(() => {
+        this.activations--;
+        // The last answer is in: main's word is final again.
+        if (this.activations === 0) this.apply(this.state);
+      });
+  }
+
+  /** Close a tab — asking first when an operation is still running in it. */
+  async requestClose(root: string | undefined): Promise<void> {
+    if (!root) return;
+    if (isModalOpen()) return;
+    const tab = this.state.tabs.find((t) => t.root === root);
+    if (!tab) return;
+    const running = this.apps.get(root)?.runningOperation();
+    if (running) {
+      const ok = await confirmDialog({
+        title: l10n.t("Close {0}?", tab.name),
+        message: l10n.t(
+          "{0} is still running in {1}. Git will finish it, but this tab will not be here to say how it ended.",
+          `${running.charAt(0).toUpperCase()}${running.slice(1)}`,
+          tab.name,
+        ),
+        confirmLabel: l10n.t("Close tab"),
+      });
+      if (!ok) return;
+    }
+    await shellHost.invoke("repo:closeTab", root).catch(() => false);
+  }
+
+  private renderStrip(): void {
+    const items: TabStripItem[] = this.state.tabs.map((t) => {
+      const app = this.apps.get(t.root);
+      return {
+        root: t.root,
+        name: t.name,
+        dirty: this.dirty.get(t.root),
+        running: app ? runningOperation(app.session.id) : undefined,
+        gone: this.gone.has(t.root),
+      };
+    });
+    this.strip.render(items, this.activeRoot());
+    // The panel is named by the tab in front.
+    const front = this.activeRoot() ? this.strip.tabFor(this.activeRoot()!) : undefined;
+    if (front) this.stage.setAttribute("aria-labelledby", front.id);
+    else this.stage.removeAttribute("aria-labelledby");
+  }
+
+  /** Ask which tabs have uncommitted changes — soon, and once for a burst. */
+  private scheduleMarks(ms: number): void {
+    window.clearTimeout(this.marksTimer);
+    this.marksTimer = window.setTimeout(() => void this.refreshMarks(), ms);
+  }
+
+  private async refreshMarks(): Promise<void> {
+    const roots = this.state.tabs.map((t) => t.root);
+    if (!roots.length) return;
+    const seq = ++this.marksSeq;
+    this.marksAt = Date.now();
+    try {
+      const st = await shellHost.invoke("repo:tabStatus", roots);
+      if (seq !== this.marksSeq || !st) return;
+      const front = this.activeRoot();
+      let cameBack = false;
+      for (const r of roots) {
+        if (st[r]?.gone) {
+          this.gone.add(r);
+          this.dirty.delete(r);
+          continue;
+        }
+        // Put back where it was: the tab is whole again.
+        if (this.gone.delete(r) && r === front) cameBack = true;
+        const d = st[r]?.dirty;
+        if (typeof d === "number") this.dirty.set(r, d);
+        else this.dirty.delete(r);
+      }
+      this.renderStrip();
+      const app = this.active;
+      if (front && app && this.gone.has(front) && !this.goneScreenEl && !isModalOpen()) {
+        // Found gone while in front: its screen goes to the back, and the gone
+        // screen takes its place.
+        closePeek();
+        closeMenu();
+        dismissLayers();
+        this.putAway(app);
+        this.showGone(front);
+      } else if (cameBack && app && this.goneScreenEl) {
+        // The folder in front came back: its own screen returns — and, if it
+        // had one, re-reads the disk, since what it last showed was read
+        // before the folder went. (One never built reads it as it builds.)
+        const built = !!app.screenEl;
+        this.putAway(app);
+        this.bringIn(app);
+        if (built) app.onFilesChanged(true);
+      }
+    } catch {
+      /* the marks are a courtesy: a failed read leaves the last known */
+    }
+  }
+
+  // ── Keys and host events: one subscription each, for the tab in front ──
+
+  private onKey(e: KeyboardEvent): void {
+    const act = tabKeyAction(e, this.isMac);
+    if (act) {
+      // ⌘W is the menu's in Electron (Repo ▸ Close Tab) — answering it here
+      // too would close two tabs per press.
+      if (act.kind === "close" && this.inElectron) return;
+      if (isModalOpen()) return;
+      const order = this.openRoots();
+      if (!order.length) return;
+      e.preventDefault();
+      if (act.kind === "next") this.requestActivate(stepTab(order, this.activeRoot(), 1));
+      else if (act.kind === "prev") this.requestActivate(stepTab(order, this.activeRoot(), -1));
+      else if (act.kind === "digit") this.requestActivate(tabAtDigit(order, act.n));
+      else void this.requestClose(this.activeRoot());
+      return;
+    }
+    this.live()?.handleAppKey(e);
+  }
+
+  private wireHostEvents(): void {
+    // Before the first read is answered, an event is the restore announcing
+    // the tabs that answer is about to bring (see tabsRead).
+    host.on("repo:tabs", (st) => {
+      if (this.tabsRead) this.apply(st);
+    });
+    window.addEventListener("gs:unread", (e) => {
+      const n = (e as CustomEvent<number>).detail;
+      if (typeof n === "number") this.live()?.onUnread(n);
+    });
+    host.on("repo:recentChanged", () => this.live()?.onRecentChanged());
+    host.on("app:notice", (n) => {
+      // A warning is a state the user is in — a folder that is not a
+      // repository, a repository this account cannot read — not a failure of
+      // the app, so it is not painted as one. Only `error` is red.
+      toast(n.message, n.kind === "error" ? "error" : "info");
+    });
+    host.on("repo:filesChanged", (info) => {
+      // About the tab you LEFT, if it landed after a switch: that tab re-asks
+      // the disk when it comes back, and this one did not change.
+      const about = info?.root;
+      if (!about || about === this.activeRoot()) this.live()?.onFilesChanged(info?.gitDir ?? true);
+      this.scheduleMarks(800);
+    });
+    window.addEventListener("focus", () => {
+      this.live()?.onWindowFocus();
+      // Your editor may have changed a background tab's files — but a focus
+      // is not news, and the marks cost one `git status` per open tab. At
+      // most once a minute from focus; everything else that changes a count
+      // (a switch, a watcher tick, an operation ending) asks on its own.
+      if (Date.now() - this.marksAt > 60_000) this.scheduleMarks(0);
+    });
+    window.addEventListener("gs:sync", (e) => {
+      this.live()?.onSyncRequest((e as CustomEvent<{ action?: string }>).detail?.action);
+    });
+    // "Take me to the repository that just became the open one." Used by the
+    // clone flow, which otherwise leaves you on whatever view was current when
+    // you started — a browse page that no longer has a target.
+    window.addEventListener("gs:go", (e) => {
+      const { view, root } = (e as CustomEvent<{ view?: string; root?: string }>).detail ?? {};
+      if (!view) return;
+      // The open this lands was announced while its progress card was up, so
+      // its switch may still be waiting for that card — which is closed by now.
+      this.makeDeferredSwitch();
+      // Only the repository it opened: never the tab it was started from.
+      if (root && root !== this.activeRoot()) return;
+      this.live()?.route(view);
+    });
+    host.on("menu:command", (msg) => {
+      // The tab-row commands are the shell's; the rest belong to the tab in front.
+      if (msg.command === "openRepo") {
+        if (!isModalOpen()) void this.openRepo();
+      } else if (msg.command === "cloneRepo") {
+        if (!isModalOpen()) openCloneDialog((root) => this.openPath(root));
+      } else if (msg.command === "openPath") {
+        if (msg.root && !isModalOpen()) void this.openPath(msg.root);
+      } else if (msg.command === "closeTab" || msg.command === "closeRepo") {
+        void this.requestClose(this.activeRoot());
+      } else {
+        this.live()?.onMenuCommand(msg.command);
+      }
+    });
+    // The update prompts are the window's dialogs, not the tab's screen — a
+    // tab whose folder is gone still hears them.
+    // One that arrives before the window has a screen waits for the first.
+    host.on("update:available", (u) => this.toActive((a) => a.onUpdateAvailable(u)));
+    host.on("update:ready", (r) => this.toActive((a) => a.onUpdateReady(r)));
+    host.on("update:progress", (p) => this.active?.onUpdateProgress(p.percent));
+  }
+
+  // ── Menus ──
+
+  /** The +: open a repository in a new tab, or switch to one you have. */
+  private async openAddMenu(anchor: HTMLElement): Promise<void> {
+    const recent = await host.invoke("repo:recent", undefined).catch(() => []);
+    const open = new Set(this.openRoots());
+    const mod = this.isMac ? "⌘" : "Ctrl+";
+    const items: MenuItem[] = [
+      {
+        label: l10n.t("Open repository…"),
+        icon: "folder-opened",
+        title: l10n.t("Open a folder as a new tab  ({0}O)", mod),
+        onClick: () => void this.openRepo(),
+      },
+      {
+        label: l10n.t("Clone repository…"),
+        icon: "cloud-download",
+        title: l10n.t("Clone into a new tab  ({0})", this.isMac ? "⌘⇧O" : "Ctrl+Shift+O"),
+        onClick: () => openCloneDialog((root) => this.openPath(root)),
+      },
+    ];
+    // Recent repositories that do not already have a tab: the ones that do
+    // are one row above, and "opening" one only switches to it.
+    const others = recent.filter((r) => !open.has(r.root)).slice(0, 8);
+    if (others.length) {
+      items.push({ separator: true, label: l10n.t("Recent") });
+      for (const r of others) {
+        items.push({
+          label: r.name,
+          sub: middleTruncate(r.root, 40),
+          icon: "folder",
+          title: l10n.t("Open {0} in a new tab", r.root),
+          onClick: () => void this.openPath(r.root),
+        });
+      }
+    }
+    items.push({ separator: true });
+    items.push({
+      // The DESTINATION, not a modal listing the same clones a third time.
+      label: l10n.t("All repositories"),
+      icon: "repo",
+      title: l10n.t("Every repository on this machine and on GitHub"),
+      onClick: () => this.live()?.route("repositories"),
+    });
+    openMenu(anchor, items);
+  }
+
+  /** Every open tab — the row's overflow button, for the ones scrolled away. */
+  private openTabList(anchor: HTMLElement): void {
+    const front = this.activeRoot();
+    const items: MenuItem[] = this.state.tabs.map((t) => {
+      const dirty = this.dirty.get(t.root);
+      return {
+        label: t.name,
+        sub: middleTruncate(t.root, 40),
+        icon: "repo",
+        current: t.root === front,
+        title: dirty
+          ? `${t.root}\n${dirty === 1 ? l10n.t("1 changed file") : l10n.t("{0} changed files", dirty)}`
+          : t.root,
+        onClick: () => this.requestActivate(t.root),
+      };
+    });
+    openMenu(anchor, items);
+  }
+
+  /** Right-click on a tab: the close family, and where the folder is. */
+  private openTabMenu(root: string, anchor: HTMLElement): void {
+    const order = this.openRoots();
+    const i = order.indexOf(root);
+    const others = order.filter((r) => r !== root);
+    const right = order.slice(i + 1);
+    const closeAll = async (roots: string[]): Promise<void> => {
+      for (const r of roots) await this.requestClose(r);
+    };
+    const items: MenuItem[] = [
+      { label: l10n.t("Close"), title: l10n.t("Close this tab"), onClick: () => void this.requestClose(root) },
+      {
+        label: l10n.t("Close Other Tabs"),
+        disabled: !others.length,
+        title: l10n.t("Close every tab but this one"),
+        onClick: () => void closeAll(others),
+      },
+      {
+        label: l10n.t("Close Tabs to the Right"),
+        disabled: !right.length,
+        title: l10n.t("Close the tabs after this one"),
+        onClick: () => void closeAll(right),
+      },
+      { separator: true },
+      {
+        label: l10n.t("Copy Path"),
+        title: root,
+        onClick: () => void copyText(root).then(() => toast(l10n.t("Copied the repository's path."), "success")),
+      },
+      {
+        // No icons in this menu: VS Code's tab menu has none, and half a menu
+        // with icons leaves the other half's words out of line.
+        label: REVEAL_LABEL,
+        title: root,
+        onClick: () => void host.invoke("repos:reveal", root).catch(() => undefined),
+      },
+    ];
+    openMenu(anchor, items);
+  }
+}
+
+const PREFS_KEY = "gitstudio.ui.prefs";
+
+/** The "?" keyboard cheat sheet — every shortcut the app answers to, grouped
+ *  the way the muscle memory works: global chrome, lists, detail pages. */
+function openShortcutsHelp(): void {
+  const mac = navigator.platform.toLowerCase().includes("mac");
+  const mod = mac ? "⌘" : "Ctrl+";
+  const groups: Array<{ title: string; rows: Array<[string, string]> }> = [
+    {
+      title: l10n.t("Everywhere"),
+      rows: [
+        [`${mod}K`, l10n.t("Jump anywhere — sections, branches, PRs, actions")],
+        [`${mod}1–8`, l10n.t("Switch between the first eight sections")],
+        [`${mod}[  ${mod}]`, l10n.t("Back / forward through your navigation")],
+        // Repositories are tabs (#32), and their keys work everywhere. The
+        // number keys are VS Code's "open editor at index" chord, because
+        // ⌘1–8 above already means the rail. Here rather than in a group of
+        // their own: a seventh group sat alone on a row of the sheet (the
+        // rebase keys' check holds it to rows of two or more).
+        ["Ctrl+Tab  Ctrl+Shift+Tab", l10n.t("Next / previous repository tab")],
+        [mac ? "⌃1–8  ⌃9" : "Alt+1–8  Alt+9", l10n.t("Go to a tab by position / the last tab")],
+        // One row for the pair: with a row each, this group ran the sheet
+        // off the top of a 1280×800 window.
+        [`${mod}O  ${mod}W`, l10n.t("Open a repository in a new tab / close the one in front")],
+        [`${mod}\``, l10n.t("Toggle the terminal dock")],
+        [`${mod},`, l10n.t("Settings")],
+        ["?", l10n.t("This cheat sheet")],
+      ],
+    },
+    {
+      title: l10n.t("Lists"),
+      rows: [
+        ["↑ ↓  or  j k", l10n.t("Move between rows")],
+        ["Enter", l10n.t("Open the focused row")],
+        ["Home / End", l10n.t("Jump to the first / last row")],
+        ["e", l10n.t("Inbox: mark the focused thread read")],
+      ],
+    },
+    {
+      // Branches answered to three keys this sheet had never heard of, and one
+      // of them CONTRADICTED what the sheet said ⌘Enter does — pressing the
+      // documented "submit" on a branch row checks it out. A sheet that is
+      // wrong about a key is worse than a sheet that omits it.
+      title: l10n.t("Branches"),
+      rows: [
+        ["/", l10n.t("Filter the list")],
+        [`${mod}Enter`, l10n.t("Run the focused row's main action — checkout, pull, publish")],
+        ["Shift+F", l10n.t("Fetch from every remote")],
+        // #32: the top bar's switcher — IntelliJ's branch popup, and the
+        // extension's branch menu.
+        ["→  or  Enter", l10n.t("Switcher: a branch's actions")],
+        ["←  or  Esc", l10n.t("Switcher: back to the branch")],
+        // The first ACTION, which is Checkout for every branch but the one
+        // you're on — whose actions start with Fetch. It said "check out the
+        // first match", and with no filter typed the first match IS yours.
+        ["Enter  Enter", l10n.t("Switcher: a branch's first action — Checkout, unless it's yours")],
+      ],
+    },
+    {
+      title: l10n.t("Detail pages"),
+      rows: [
+        ["Esc  or  ←", l10n.t("Back to the list")],
+        [`${mod}Enter`, l10n.t("Submit the open form")],
+        ["/", l10n.t("Commit page: filter the changed files")],
+      ],
+    },
+    {
+      // The log grew a page of its own and a keyboard to go with it, and a
+      // shortcut nothing advertises is a shortcut nobody has.
+      title: l10n.t("Reading a log"),
+      rows: [
+        ["↑ ↓  PgUp PgDn", l10n.t("Move through the output")],
+        ["Home / End", l10n.t("Start / newest line")],
+        ["n", l10n.t("Jump to the next failure")],
+        ["j / k", l10n.t("Next / previous job in this run")],
+        ["Enter  Shift+Enter", l10n.t("Step through search matches")],
+      ],
+    },
+    {
+      // #32: several commits at once. The letters are git's own todo letters,
+      // the same ones the Rebase view's toolbar names in its tooltips.
+      title: l10n.t("Interactive rebase"),
+      rows: [
+        ["Shift+↑ ↓", l10n.t("Select several (or Shift-click)")],
+        [`${mod}A`, l10n.t("Select every commit")],
+        ["P R S F E D", l10n.t("Set Pick, Reword, Squash, Fixup, Edit or Drop")],
+        ["Alt+↑ ↓", l10n.t("Move the selected commits")],
+        ["Esc", l10n.t("Back to one commit")],
+      ],
+    },
+  ];
+  openModal((close) => {
+    const card = el("div", "modal-card shortcuts-card");
+    const h = el("div", "modal-title");
+    h.textContent = l10n.t("Keyboard shortcuts");
+    card.appendChild(h);
+    const cols = el("div", "shortcuts-cols");
+    for (const g of groups) {
+      const col = el("div", "shortcuts-group");
+      const t = el("div", "shortcuts-group-title");
+      t.textContent = g.title;
+      col.appendChild(t);
+      for (const [keys, what] of g.rows) {
+        const row = el("div", "shortcuts-row");
+        const k = el("kbd", "shortcuts-keys");
+        k.textContent = keys;
+        const w = el("span", "shortcuts-what");
+        w.textContent = what;
+        row.append(k, w);
+        col.appendChild(row);
+      }
+      cols.appendChild(col);
+    }
+    card.appendChild(cols);
+    const actions = el("div", "modal-actions");
+    const ok = el("button", "btn btn-primary modal-ok");
+    ok.appendChild(span(l10n.t("Done")));
+    ok.addEventListener("click", close);
+    actions.appendChild(ok);
+    card.appendChild(actions);
+    return { card, focusEl: ok, label: l10n.t("Keyboard shortcuts"), onClose: () => {} };
+  });
+}
+
+/** Load persisted UI preferences (best-effort; never throws). */
+function loadPrefs(): Record<string, unknown> {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    const v = raw ? JSON.parse(raw) : {};
+    return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Persist UI preferences (best-effort; never throws). */
+function savePrefs(p: Record<string, unknown>): void {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(p));
+  } catch {
+    /* storage may be unavailable; prefs are non-essential */
+  }
+}
+
+new TabShell()
+  .start()
+  .catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error("Renderer failed:", err);
+  })
+  // The shell is up (or has said why not): the launch screen hands off.
+  .finally(dismissLaunchScreen);

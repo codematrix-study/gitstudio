@@ -1,0 +1,918 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { findChrome, runInChrome } from "./headless";
+
+/**
+ * The merge shell — the toolbar, operation strip, confirms and bottom bar every
+ * host mounts around the merge view — driven in headless Chrome over a FAKE
+ * MergeViewApi (test/fixtures/shellEntry.ts). The fake records what the shell
+ * asked of the view; the page records what the shell posted to the host.
+ *
+ * Everything is asserted synchronously after the action that causes it, or
+ * after a plain timer: nothing here waits on a frame (headless Chrome under a
+ * virtual-time budget may never paint one).
+ */
+const ENTRY = fileURLToPath(new URL("./fixtures/shellEntry.ts", import.meta.url));
+const CHROME = findChrome();
+const STYLES = ["tokens.css", "diff.css", "shell.css"]
+  .map((f) => readFileSync(fileURLToPath(new URL(`../src/styles/${f}`, import.meta.url)), "utf8"))
+  .join("\n")
+  // Inline <style> cannot follow a relative @import; the files are all here.
+  .replace(/@import[^;]+;/g, "");
+const CSS = `${STYLES}\n#root{height:640px;width:1280px;display:flex;flex-direction:column}`;
+
+/** A rebase stopped on commit 1 of 3 — Yours is stage 3, drawn on the left (D1). */
+const PROLOGUE = `
+  const { MergeShell, FakeMergeView } = window.__shell;
+  const posted = [];
+  let fake;
+  let views = 0;
+  const side = (role, stage, name, paneTitle, description) => ({ role, stage, name, paneTitle, description });
+  const OP = {
+    kind: "rebase", backend: "merge",
+    title: "Rebasing test onto master · commit 1 of 3: 1a2b3c4 test change",
+    direction: { from: "yours", verb: "onto", to: "theirs" },
+    step: { n: 1, m: 3, unit: "commit" },
+    commit: { sha: "1a2b3c4d5e6f708192a3b4c5d6e7f80912a3b4c5", subject: "test change", author: "Ann" },
+    yours: side("yours", 3, "test", "Rebasing 1a2b3c4 from test", "Your commit 1a2b3c4 “test change” from test"),
+    theirs: side("theirs", 2, "master", "Already rebased commits and commits from master", "master, plus the commits already rebased onto it"),
+    verbs: { continue: "Continue Rebase", abort: "Abort Rebase" },
+    canContinue: false, canSkip: false,
+    episode: "rebase:1a2b3c4",
+  };
+  const payload = (over = {}) => ({
+    fileName: "src/app.ts", conflictType: "content", source: "git-stages", hasBase: true,
+    oursLabel: OP.yours.paneTitle, theirsLabel: OP.theirs.paneTitle,
+    base: "b\\n", ours: "o\\n", theirs: "t\\n", result: "r\\n", op: OP, ...over,
+  });
+  const mount = (p) => new MergeShell(document.getElementById("root"), p, {
+    adapter: { post: (m) => posted.push(m) },
+    createView: (c) => { views++; fake = new FakeMergeView(c); return fake; },
+    isMac: true,
+    armMs: 60000,
+  });
+  const $ = (s) => document.querySelector(s);
+  const $$ = (s) => [...document.querySelectorAll(s)];
+  const text = (s) => ($(s) ? $(s).textContent.replace(/\\s+/g, " ").trim() : null);
+  const shown = (s) => { const n = $(s); return !!n && !n.hidden && !n.closest("[hidden]"); };
+  const click = (s) => { const n = typeof s === "string" ? $(s) : s; if (!n) throw new Error("no " + s); n.click(); };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const last = () => posted[posted.length - 1];
+`;
+
+const run = (script: string, opts: { frame?: { width: number; height: number } } = {}) =>
+  runInChrome(CHROME!, ENTRY, PROLOGUE + script, { css: CSS, width: 1280, height: 700, frame: opts.frame });
+// VS Code's Light Modern: errorForeground #F85149 is 3.35:1 on its white
+// editor — under AA for the danger buttons' text (the verifier's finding).
+const LIGHT_MODERN = `
+  document.body.className = "vscode-light";
+  document.documentElement.style.cssText +=
+    ";--vscode-errorForeground:#F85149;--vscode-foreground:#3B3B3B;--vscode-editor-background:#FFFFFF";
+  const rgbOf = (c) => {
+    let m = /rgba?\\(([\\d.]+),\\s*([\\d.]+),\\s*([\\d.]+)/.exec(c);
+    if (m) return [+m[1], +m[2], +m[3]];
+    m = /color\\(srgb ([\\d.]+) ([\\d.]+) ([\\d.]+)/.exec(c);
+    return m ? [m[1] * 255, m[2] * 255, m[3] * 255] : null;
+  };
+  const lum = (rgb) => {
+    const f = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+    return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2]);
+  };
+  const contrastOnWhite = (el) => {
+    const rgb = rgbOf(getComputedStyle(el).color);
+    return rgb ? 1.05 / (lum(rgb) + 0.05) : 0;
+  };
+`;
+
+const skip = !CHROME && "no Chrome on this machine";
+
+test("the strip, the pills and the buttons are named from the operation", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    expect(shown(".ms-opstrip"), "an operation gets a strip");
+    expect(text(".ms-pill-yours .ms-pill-name") === "test", "YOURS names the branch being rebased (" + text(".ms-pill-yours .ms-pill-name") + ")");
+    expect(text(".ms-pill-theirs .ms-pill-name") === "master", "THEIRS names the branch it is rebased onto (" + text(".ms-pill-theirs .ms-pill-name") + ")");
+    const pills = $$(".ms-opstrip .ms-pill");
+    expect(pills[0] && pills[0].classList.contains("ms-pill-yours"), "the direction reads from yours: test → onto → master");
+    expect(/onto/.test(text(".ms-op-verb") || ""), "the verb between them is the operation's (" + text(".ms-op-verb") + ")");
+    expect(text(".ms-op-title") === OP.title, "the header is the operation's title (" + text(".ms-op-title") + ")");
+    const strip = text(".ms-opstrip");
+    expect(strip.includes("commit 1 of 3"), "the step is on screen (" + strip + ")");
+    expect(strip.includes("1a2b3c4"), "the commit being replayed is on screen");
+    expect((strip.match(/commit 1 of 3/g) || []).length === 1, "and said once, not twice (" + strip + ")");
+    // POLISH A5.6 (I-4, P-18): the branch names are on the buttons themselves.
+    expect(text(".ms-accept-yours") === "Accept Yours · test" && text(".ms-accept-theirs") === "Accept Theirs · master", "the bottom bar says Accept Yours · test / Accept Theirs · master (" + text(".ms-accept-yours") + " / " + text(".ms-accept-theirs") + ")");
+    expect($(".ms-accept-yours").title.includes(OP.yours.description), "Accept Yours' tooltip names the side (" + $(".ms-accept-yours").title + ")");
+    expect(text(".ms-apply-yours") === "Yours" && text(".ms-apply-all") === "All" && text(".ms-apply-theirs") === "Theirs", "Apply non-conflicting reads Yours · All · Theirs");
+    expect($(".ms-apply-yours").title.includes("yours (test)"), "and names the branch behind Yours (" + $(".ms-apply-yours").title + ")");
+    expect(/don't overlap/.test($(".ms-wand").title), "the wand says what it does (" + $(".ms-wand").title + ")");
+    expect(fake.renders.length === 1 && fake.renders[0].payload.op === OP, "the view got the payload");
+    shell.dispose();
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("with no operation there is no strip, no Continue and no link to a conflicts list", { skip }, async () => {
+  const v = await run(`
+    mount(payload({ op: undefined, oursLabel: "Current change", theirsLabel: "Incoming change" }));
+    expect(!shown(".ms-opstrip"), "no strip without an operation");
+    expect(!shown(".ms-continue"), "no Continue");
+    expect(!$(".ms-op-list"), "nothing to link to");
+    click(".ms-close");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "cancel", mode: "exit" }), "Close closes the editor (" + JSON.stringify(last()) + ")");
+    expect($(".ms-accept-yours").title.includes("Current change"), "tooltips fall back to the pane labels");
+    expect(text(".ms-accept-yours") === "Accept Yours" && text(".ms-accept-theirs") === "Accept Theirs", "no names to add: plain labels (" + text(".ms-accept-yours") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the Accept buttons carry each side's name, cut to 18 characters, and plain labels for a stash (A5.6)", { skip }, async () => {
+  const v = await run(`
+    const long = { ...OP,
+      yours: side("yours", 3, "feature/session-hardening", "Rebasing 1a2b3c4 from feature/session-hardening", "Your commit"),
+      theirs: side("theirs", 2, "main", "Already rebased commits and commits from main", "main") };
+    const shell = mount(payload({ op: long }));
+    expect(text(".ms-accept-yours") === "Accept Yours · feature/…hardening", "a long name keeps its start and its end (" + text(".ms-accept-yours") + ")");
+    expect(text(".ms-accept-theirs") === "Accept Theirs · main", "(" + text(".ms-accept-theirs") + ")");
+    shell.handle({ type: "opChanged", op: { ...long, theirs: side("theirs", 2, "trunk", "t", "t") }, remainingConflicts: 1 });
+    expect(text(".ms-accept-theirs") === "Accept Theirs · trunk", "a new stop renames them (" + text(".ms-accept-theirs") + ")");
+    shell.dispose();
+    const stash = { ...OP, kind: "stash", direction: undefined, step: undefined, commit: undefined,
+      title: "Applying stashed changes on main",
+      yours: side("yours", 3, "stash", "Your stashed changes", "Your stashed changes"),
+      theirs: side("theirs", 2, "main", "Changes from main", "main"), verbs: { abort: "Cancel" } };
+    mount(payload({ op: stash }));
+    expect(text(".ms-accept-yours") === "Accept Yours" && text(".ms-accept-theirs") === "Accept Theirs", "a stash apply: plain (" + text(".ms-accept-yours") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("Accept Yours takes the left side, Accept Theirs the right", { skip }, async () => {
+  const v = await run(`
+    mount(payload());
+    fake.setCounts({ total: 3, pending: 3, conflictsPending: 1 });
+    click(".ms-accept-yours");
+    expect(fake.count("acceptAllLeft") === 1 && fake.count("acceptAllRight") === 0, "Accept Yours → acceptAllLeft");
+    click(".ms-accept-theirs");
+    expect(fake.count("acceptAllRight") === 1, "Accept Theirs → acceptAllRight");
+    click(".ms-apply-yours");
+    click(".ms-apply-theirs");
+    const sides = fake.calls.filter((c) => c.name === "applyNonConflictingSide").map((c) => c.args[0]);
+    expect(sides.join() === "left,right", "Apply non-conflicting Yours/Theirs → left/right (" + sides.join() + ")");
+    expect(posted.length === 0, "none of this reaches the host");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("Close ONLY closes the merge editor: beside Apply, nothing to abort in the bar, and with work in it it asks first", { skip }, async () => {
+  // The owner, after using it: an explicit Close that leaves the operation
+  // paused and the file as it is — aborting is not reachable from this bar
+  // at all (it lives in the conflicts list, which the strip links to).
+  const v = await run(`
+    const shell = mount(payload());
+    const bar = [...$(".jb-bottom-bar").children].filter((b) => !b.hidden && b.tagName === "BUTTON").map((b) => b.className.match(/ms-[a-z-]+/)?.[0]);
+    expect(text(".ms-close") === "Close", "the button says Close (" + text(".ms-close") + ")");
+    expect(bar.indexOf("ms-close") === bar.indexOf("ms-apply") - 1, "beside Apply (" + bar.join(",") + ")");
+    expect(!$(".ms-cancel") && !$(".ms-abort") && !$(".ms-pop"), "no Cancel, no Abort, no popover anywhere in the bar");
+    expect(/Nothing is written: the rebase stays paused and src\\/app\\.ts keeps its conflict markers/.test($(".ms-close").title), "its tooltip says what it leaves alone (" + $(".ms-close").title + ")");
+    // No work in the editor: it just closes.
+    click(".ms-close");
+    expect(JSON.stringify(posted) === JSON.stringify([{ type: "cancel", mode: "exit" }]), "Close posts cancel{exit}, once (" + JSON.stringify(posted) + ")");
+    // Work in the editor, not applied: it is not kept, so Close asks.
+    fake.setCounts({ total: 2, pending: 1, conflictsPending: 1, hasProgress: true });
+    $(".ms-close").focus();
+    click(".ms-close");
+    expect(posted.length === 1, "the first press with work in it posts nothing");
+    expect(shown(".ms-close-confirm") && /not kept/.test(text(".ms-close-confirm")) && /The rebase stays paused/.test(text(".ms-close-confirm")), "it asks, saying what is lost and what is not (" + text(".ms-close-confirm") + ")");
+    expect(document.activeElement === $(".ms-close-keep"), "the safe answer has the keyboard");
+    click(".ms-close-keep");
+    expect(!shown(".ms-close-confirm") && posted.length === 1 && document.activeElement === $(".ms-close"), "Keep editing posts nothing and hands the keyboard back to Close");
+    click(".ms-close");
+    click(".ms-close-go");
+    expect(posted.length === 2 && JSON.stringify(last()) === JSON.stringify({ type: "cancel", mode: "exit" }), "Close without applying closes (" + JSON.stringify(last()) + ")");
+    // Once Apply has saved the work, there is nothing to lose.
+    shell.handle({ type: "init", ...payload() });
+    fake.setCounts({ total: 1, pending: 0, conflictsPending: 0, hasProgress: true });
+    click(".ms-apply");
+    shell.handle({ type: "applied", staged: true });
+    click(".ms-close");
+    expect(!shown(".ms-close-confirm") && JSON.stringify(last()) === JSON.stringify({ type: "cancel", mode: "exit" }), "after Apply, Close just closes");
+    expect(!posted.some((m) => m.type === "cancel" && m.mode === "abort"), "and nothing here ever posts an abort");
+    // Where the operation is ended: the strip links to the conflicts list.
+    expect(shown(".ms-op-list") && text(".ms-op-list") === "All conflicts", "the strip links to the conflicts list (" + text(".ms-op-list") + ")");
+    expect(/Continue Rebase or Abort Rebase/.test($(".ms-op-list").title), "and says what is there (" + $(".ms-op-list").title + ")");
+    click(".ms-op-list");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "showConflicts" }), "it opens the list (" + JSON.stringify(last()) + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("an upgrader's one-time tip shows in the notices until Got it (A5.9)", { skip }, async () => {
+  const v = await run(`
+    const text1 = "New in Merge Studio 1.0: during a rebase, Yours is your commit (test), on the left. Before this version the two sides were swapped.";
+    const shell = mount(payload({ tip: { id: "ms.sidesTip", text: text1 } }));
+    expect(shown(".ms-note-tip") && text(".ms-note-tip").startsWith(text1), "the tip is in the editor (" + text(".ms-note-tip") + ")");
+    click(".ms-tip-dismiss");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "dismissTip", id: "ms.sidesTip" }), "Got it tells the host (" + JSON.stringify(last()) + ")");
+    expect(!$(".ms-note-tip"), "and the tip goes");
+    shell.handle({ type: "init", ...payload({ tip: { id: "ms.sidesTip", text: text1 } }) });
+    expect(!$(".ms-note-tip"), "a re-init before the host has caught up does not bring it back");
+    mount(payload());
+    expect(!$(".ms-note-tip"), "no tip, no notice");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("at 1000px the Close confirm keeps its two answers together, and an armed Apply is disarmed while it asks", { skip }, async () => {
+  const v = await run(`
+    document.getElementById("root").style.width = "1000px";
+    mount(payload());
+    fake.setCounts({ total: 3, pending: 2, conflictsPending: 2, hasProgress: true });
+    click(".ms-apply");
+    expect(/unresolved/.test(text(".ms-bottom-note") || ""), "Apply armed (" + text(".ms-bottom-note") + ")");
+    click(".ms-close");
+    expect(shown(".ms-close-confirm"), "Close asks");
+    expect(text(".ms-apply") === "Apply" && !$(".ms-apply").classList.contains("jb-warn"), "the armed Apply is put back while Close asks (" + text(".ms-apply") + ")");
+    const keep = $(".ms-close-keep").getBoundingClientRect();
+    const go = $(".ms-close-go").getBoundingClientRect();
+    expect(Math.abs(keep.top - go.top) < 2, "Keep editing and Close without applying share a row (" + Math.round(keep.top) + " / " + Math.round(go.top) + ")");
+    expect(go.left >= keep.right && go.left - keep.right < 24, "side by side (" + Math.round(keep.right) + " → " + Math.round(go.left) + ")");
+    expect(/anything settled here and not saved is not kept/.test(text(".ms-close-confirm")), "and it does not claim a saved resolution is lost (" + text(".ms-close-confirm") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("Escape is Close — unless a question is open (Escape answers it the safe way) or something inside took the key", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    const esc = (el) => (el || document.activeElement).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    $(".fake-view").focus();
+    esc();
+    expect(JSON.stringify(posted) === JSON.stringify([{ type: "cancel", mode: "exit" }]), "Escape in the editor closes it (" + JSON.stringify(posted) + ")");
+    fake.setCounts({ total: 2, pending: 1, conflictsPending: 1, hasProgress: true });
+    $(".fake-view").focus();
+    esc();
+    expect(posted.length === 1 && shown(".ms-close-confirm"), "with work in it, Escape asks first");
+    esc();
+    expect(!shown(".ms-close-confirm") && posted.length === 1, "and Escape again keeps editing");
+    // A key the editor already handled (its find widget, a selection) is not Close.
+    const claimed = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    $(".fake-view").addEventListener("keydown", (e) => e.preventDefault(), { once: true });
+    $(".fake-view").dispatchEvent(claimed);
+    expect(!shown(".ms-close-confirm") && posted.length === 1, "an Escape something inside claimed does nothing here");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("Apply with unresolved changes asks once, with the count, then applies", { skip }, async () => {
+  const v = await run(`
+    mount(payload());
+    fake.setCounts({ total: 5, pending: 3, conflictsPending: 1 });
+    click(".ms-apply");
+    expect(posted.length === 0, "the first click does not apply");
+    expect(text(".ms-apply") === "Apply with 3 unresolved", "it says how many are unresolved (" + text(".ms-apply") + ")");
+    expect(/3 unresolved changes will keep the original text/.test(text(".ms-bottom-note") || ""), "and what they will contain (" + text(".ms-bottom-note") + ")");
+    click(".ms-apply");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "apply", text: "RESULT TEXT" }), "the second click applies the view's result (" + JSON.stringify(last()) + ")");
+    expect($(".ms-apply").disabled, "Apply locks while the host writes");
+    window.__shellHandle = null;
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+
+  // A conflict with one side already taken is still unresolved, but its
+  // Result holds that side, not the original text — the warning must not say
+  // the choice will be thrown away (the reporter's own flow: accept Yours'
+  // arrow, then Apply).
+  const half = await run(`
+    mount(payload());
+    fake.setCounts({ total: 1, pending: 1, conflictsPending: 1, pendingChanged: 1 });
+    click(".ms-apply");
+    const note = text(".ms-bottom-note") || "";
+    expect(!/original text/.test(note), "a half-taken conflict does not keep the original text (" + note + ")");
+    expect(/1 unresolved change will be saved as the Result shows it/.test(note), "it is saved as shown (" + note + ")");
+    window.__shellHandle = null;
+  `);
+  assert.deepEqual(half.fails, [], half.fails.join("\n"));
+  const mix = await run(`
+    mount(payload());
+    fake.setCounts({ total: 5, pending: 3, conflictsPending: 2, pendingChanged: 1 });
+    click(".ms-apply");
+    const note = text(".ms-bottom-note") || "";
+    expect(/3 unresolved changes: 2 will keep the original text, 1 will be saved as the Result shows it/.test(note), "a mix says both (" + note + ")");
+    window.__shellHandle = null;
+  `);
+  assert.deepEqual(mix.fails, [], mix.fails.join("\n"));
+
+  const w = await run(`
+    const shell = mount(payload());
+    fake.setCounts({ total: 2, pending: 0, conflictsPending: 0 });
+    click(".ms-apply");
+    expect(last() && last().type === "apply", "with nothing unresolved one click applies");
+    shell.handle({ type: "applied", staged: true });
+    expect(text(".jb-counter") === "Merge applied and staged", "the counter says it was staged (" + text(".jb-counter") + ")");
+    expect($(".ms-apply").disabled, "and Apply is spent");
+    fake.setCounts({ total: 2, pending: 1, conflictsPending: 0 });
+    expect(!$(".ms-apply").disabled, "a new change re-arms it");
+    shell.handle({ type: "applied", staged: false, message: "git add failed: index.lock exists" });
+    expect(/index\\.lock/.test(text(".ms-bottom-note") || ""), "a failed stage is said, not hidden (" + text(".ms-bottom-note") + ")");
+  `);
+  assert.deepEqual(w.fails, [], w.fails.join("\n"));
+});
+
+test("Continue appears only once the host reports no conflicts left and git would accept it", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    expect(!shown(".ms-continue"), "not before the host has said anything");
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: false }, remainingConflicts: 1 });
+    expect(!shown(".ms-continue"), "not while a file is still conflicted");
+    shell.handle({ type: "applied", staged: true });
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: false }, remainingConflicts: 2 });
+    expect(/2 files still have conflicts/.test(text(".ms-bottom-note") || ""), "it says how many are left (" + text(".ms-bottom-note") + ")");
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: false, continueBlocked: "app.ts still has conflict markers staged" }, remainingConflicts: 0 });
+    expect(!shown(".ms-continue"), "not while git would refuse");
+    expect(/conflict markers staged/.test(text(".ms-bottom-note") || ""), "and says why (" + text(".ms-bottom-note") + ")");
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: true }, remainingConflicts: 0 });
+    expect(shown(".ms-continue"), "Continue appears at 0 remaining with canContinue");
+    expect(text(".ms-continue") === "Continue Rebase", "named for the operation (" + text(".ms-continue") + ")");
+    expect($(".ms-continue").classList.contains("jb-primary") && !$(".ms-apply").classList.contains("jb-primary"), "and it is now THE primary action");
+    click(".ms-continue");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "continueOperation" }), "it posts continueOperation with no drop confirm (" + JSON.stringify(last()) + ")");
+    click(".ms-continue");
+    expect(posted.filter((m) => m.type === "continueOperation").length === 1, "a second press while it runs posts nothing");
+    shell.handle({ type: "outcome", kind: "done", text: "Rebase complete" });
+    expect(text(".ms-outcome") === "Rebase complete" && $(".ms-outcome").classList.contains("is-done"), "the outcome is said (" + text(".ms-outcome") + ")");
+    expect(!shown(".ms-continue"), "and a finished operation offers no Continue");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+
+  const w = await run(`
+    const STASH = { ...OP, kind: "stash", direction: undefined, verbs: { abort: "Cancel" }, canContinue: false, episode: "stash" };
+    const shell = mount(payload({ op: STASH }));
+    shell.handle({ type: "opChanged", op: STASH, remainingConflicts: 0 });
+    expect(!shown(".ms-continue"), "a kind with no Continue verb never shows one");
+    expect(/stash apply/.test($(".ms-op-list").title) && !/Continue/.test($(".ms-op-list").title), "its link says what the list holds for it (" + $(".ms-op-list").title + ")");
+  `);
+  assert.deepEqual(w.fails, [], w.fails.join("\n"));
+});
+
+test("an emptied commit is not dropped without a confirm", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    const DROP = { ...OP, canContinue: true, willDrop: { sha: OP.commit.sha, subject: "test change", branch: "test" } };
+    shell.handle({ type: "applied", staged: true });
+    shell.handle({ type: "opChanged", op: DROP, remainingConflicts: 0 });
+    click(".ms-continue");
+    expect(!posted.some((m) => m.type === "continueOperation"), "the first press does not continue");
+    expect(shown(".ms-drop-confirm"), "it asks");
+    expect(/1a2b3c4/.test(text(".ms-drop-confirm") || "") && /drops it/.test(text(".ms-drop-confirm") || ""), "naming the commit it would drop (" + text(".ms-drop-confirm") + ")");
+    click(".ms-drop-keep");
+    expect(!shown(".ms-drop-confirm") && !posted.some((m) => m.type === "continueOperation"), "Keep editing posts nothing");
+    click(".ms-continue");
+    click(".ms-drop-go");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "continueOperation", confirmDrop: true }), "confirmed, it continues WITH confirmDrop (" + JSON.stringify(last()) + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("a whitespace change asks first when it would throw away resolutions; granularity never does", { skip }, async () => {
+  const v = await run(`
+    mount(payload());
+    const ws = $(".ms-ws");
+    const wsCalls = () => fake.calls.filter((c) => c.name === "setRenderOptions" && "whitespace" in c.args[0]).map((c) => c.args[0].whitespace);
+    fake.setCounts({ total: 2, pending: 2, conflictsPending: 1, hasProgress: false });
+    ws.value = "trailing"; ws.dispatchEvent(new Event("change"));
+    expect(wsCalls().join() === "trailing", "with no progress it just changes (" + wsCalls().join() + ")");
+    fake.setCounts({ total: 2, pending: 1, conflictsPending: 1, hasProgress: true });
+    ws.value = "all"; ws.dispatchEvent(new Event("change"));
+    expect(wsCalls().join() === "trailing", "with progress it does NOT rebuild yet");
+    expect(ws.value === "trailing", "the select goes back until the answer is yes (" + ws.value + ")");
+    expect(shown(".ms-ws-confirm"), "and asks");
+    click(".ms-ws-keep");
+    expect(!shown(".ms-ws-confirm") && wsCalls().join() === "trailing", "Keep my changes changes nothing");
+    ws.value = "all"; ws.dispatchEvent(new Event("change"));
+    click(".ms-ws-go");
+    expect(wsCalls().join() === "trailing,all" && ws.value === "all", "Change anyway rebuilds (" + wsCalls().join() + ")");
+    const gran = $$(".jb-toolbar-select")[1];
+    gran.value = "lines"; gran.dispatchEvent(new Event("change"));
+    const granCalls = fake.calls.filter((c) => c.name === "setRenderOptions" && "showInner" in c.args[0]);
+    expect(granCalls.length === 1 && granCalls[0].args[0].showInner === false, "granularity only re-decorates, no question asked");
+    expect(!shown(".ms-ws-confirm"), "and raises no confirm");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("on a light theme the no-text panel's Delete the file clears AA (Light Modern's red does not)", { skip }, async () => {
+  const v = await run(LIGHT_MODERN + `
+    mount(payload({ shape: "modify-delete", missingRole: "theirs" }));
+    const del = [...document.querySelectorAll(".ms-notext .ms-danger")];
+    expect(del.length === 1, "one danger button (" + del.length + ")");
+    for (const b of del) {
+      const c = contrastOnWhite(b);
+      expect(c >= 4.5, b.textContent.trim() + ": " + c.toFixed(2) + ":1 on white");
+    }
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("a conflict with no text gets the panel, not the editor, and resolves by role", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload({ shape: "binary" }));
+    expect(views === 0, "no merge view is created for a binary (" + views + ")");
+    expect(shown(".ms-notext") && /binary/i.test(text(".ms-notext-title") || ""), "the panel says what it is (" + text(".ms-notext-title") + ")");
+    expect(!shown(".jb-toolbar") && !shown(".ms-apply") && !shown(".ms-accept-yours"), "no toolbar, no Apply, no bulk accept over nothing to merge");
+    const btns = $$(".ms-notext-btn").map((b) => b.textContent.trim());
+    expect(btns.join("|") === "Accept Yours|Accept Theirs", "both sides are offered (" + btns.join("|") + ")");
+    click($$(".ms-notext-btn")[1]);
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "takeRole", role: "theirs" }), "Accept Theirs posts takeRole{theirs}");
+    expect($$(".ms-notext-btn").every((b) => b.disabled), "and locks while it runs");
+    shell.handle({ type: "applied", staged: true });
+    expect(/Kept theirs \\(master\\)/.test(text(".ms-notext-done") || ""), "then says what it did (" + text(".ms-notext-done") + ")");
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: true }, remainingConflicts: 0 });
+    expect(shown(".ms-continue"), "and Continue follows, as after an Apply");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+
+  const w = await run(`
+    const shell = mount(payload({ shape: "modify-delete", missingRole: "theirs" }));
+    const btns = $$(".ms-notext-btn").map((b) => b.textContent.trim());
+    expect(btns.join("|") === "Accept Yours|Delete the file", "the side with no file reads Delete the file (" + btns.join("|") + ")");
+    expect(/deleted in theirs \\(master\\)/.test(text(".ms-notext-desc") || ""), "the note names who deleted it (" + text(".ms-notext-desc") + ")");
+    click($$(".ms-notext-btn")[1]);
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "takeRole", role: "theirs" }), "and it takes that role (" + JSON.stringify(last()) + ")");
+    shell.handle({ type: "init", ...payload({ shape: "both-deleted" }) });
+    const dd = $$(".ms-notext-btn").map((b) => b.textContent.trim());
+    expect(dd.join("|") === "Delete the file", "a file deleted on both sides offers only the deletion (" + dd.join("|") + ")");
+    click(".ms-notext-btn");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "deleteFile" }), "which posts deleteFile");
+    shell.handle({ type: "init", ...payload() });
+    expect(views === 1 && !shown(".ms-notext") && shown(".jb-toolbar"), "a re-init with text brings the editor back");
+    shell.handle({ type: "init", ...payload({ shape: "too-large" }) });
+    expect(fake.disposed, "and one without text disposes it");
+  `);
+  assert.deepEqual(w.fails, [], w.fails.join("\n"));
+});
+
+test("render gets the host's auto-apply setting, the legend its slot, and a line-ending mismatch its notice", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    expect(fake.renders[0].init && fake.renders[0].init.autoApplyNonConflicting === false, "auto-apply is OFF unless the host turns it on");
+    shell.handle({ type: "init", ...payload({ autoApplyNonConflicting: true }) });
+    expect(fake.renders[1].init.autoApplyNonConflicting === true, "and ON when it does");
+    expect(views === 1, "a re-init reuses the view");
+    expect(fake.legendSlot === $(".ms-legend-slot"), "the legend is handed the shell's slot");
+    fake.emitEol({ yours: "CRLF", theirs: "LF", result: "CRLF" });
+    expect(text(".ms-note-eol") === "Yours uses CRLF, theirs LF: the result keeps CRLF.", "the EOL notice says it (" + text(".ms-note-eol") + ")");
+    fake.emitEol(undefined);
+    expect(!$(".ms-note-eol"), "and clears when the sides agree");
+    shell.handle({ type: "init", ...payload({ hasBase: false, conflictType: "add-add" }) });
+    expect(/Added on both sides/.test(text(".ms-op-note") || ""), "a conflict with no ancestor says so (" + text(".ms-op-note") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("⌘Z inside the shell drives the merge history once, whichever way it arrives", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    let appUndo = 0;
+    // The host's own app-wide undo, listening the way the desktop's does.
+    window.addEventListener("keydown", (e) => { if ((e.key === "z" || e.key === "Z") && e.metaKey) appUndo++; });
+    const target = $(".fake-view");
+    target.focus();
+    expect(document.activeElement === target, "focus is inside the merge surface");
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "z", metaKey: true, bubbles: true, cancelable: true }));
+    expect(fake.count("undo") === 1, "⌘Z undid one merge action (" + fake.count("undo") + ")");
+    expect(appUndo === 0, "and never reached the app's own undo");
+    shell.undo();
+    expect(fake.count("undo") === 1, "the menu's copy of the SAME keypress does not undo a second time");
+    await sleep(500);
+    shell.undo();
+    expect(fake.count("undo") === 2, "a later menu undo is its own (" + fake.count("undo") + ")");
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "z", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    expect(fake.count("redo") === 0, "a key right after a menu undo is the same press");
+    await sleep(500);
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "z", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    expect(fake.count("redo") === 1, "⇧⌘Z redoes (" + fake.count("redo") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("in a narrow pane the bottom bar wraps: Apply, its warning, Continue, Close and its question stay on screen", { skip }, async () => {
+  // The desktop gives the shell ONE pane of its window: 443px at a 1000px
+  // window, beside the file list. The bar did not wrap, so Apply, the note
+  // saying what Apply would save, and Continue were pushed past the pane's
+  // edge — clipped, with no scrollbar to reach them.
+  const v = await run(`
+    const root = document.getElementById("root");
+    root.style.width = "440px";
+    const shell = mount(payload());
+    fake.setCounts({ total: 5, pending: 3, conflictsPending: 1 });
+    const inside = (sel) => {
+      const r = root.getBoundingClientRect();
+      const n = $(sel);
+      if (!n) return sel + " missing";
+      const b = n.getBoundingClientRect();
+      return b.width > 0 && b.left >= r.left - 1 && b.right <= r.right + 1 ? "" : sel + " at " + Math.round(b.left) + "–" + Math.round(b.right) + " outside " + Math.round(r.left) + "–" + Math.round(r.right);
+    };
+    for (const sel of [".ms-accept-yours", ".ms-accept-theirs", ".ms-close", ".ms-apply"]) {
+      const why = inside(sel);
+      expect(!why, "on screen: " + why);
+    }
+    click(".ms-apply");
+    expect(!inside(".ms-apply"), "the armed Apply is on screen: " + inside(".ms-apply"));
+    const note = $(".ms-bottom-note");
+    expect(!inside(".ms-bottom-note") && note.getBoundingClientRect().width > 120, "and so is what it will save (" + Math.round(note.getBoundingClientRect().width) + "px) " + inside(".ms-bottom-note"));
+    fake.setCounts({ total: 5, pending: 3, conflictsPending: 1, hasProgress: true });
+    click(".ms-close");
+    for (const sel of [".ms-close-confirm", ".ms-close-keep", ".ms-close-go"]) {
+      expect(shown(sel) && !inside(sel), "Close's question is on screen: " + sel + " " + inside(sel));
+    }
+    click(".ms-close-keep");
+    fake.setCounts({ total: 5, pending: 0, conflictsPending: 0 });
+    click(".ms-apply");
+    shell.handle({ type: "applied", staged: true });
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: true }, remainingConflicts: 0 });
+    expect(shown(".ms-continue") && !inside(".ms-continue"), "Continue is on screen: " + inside(".ms-continue"));
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the no-text panel names the file, not the host's absolute path to it", { skip }, async () => {
+  // The extensions pass an ABSOLUTE fileName (Monaco's language detection
+  // reads it); the sentence printed all of it.
+  const v = await run(`
+    mount(payload({ shape: "binary", fileName: "/Users/me/src/repo/assets/logo.png" }));
+    const desc = text(".ms-notext-desc") || "";
+    expect(/^logo\\.png is binary/.test(desc), "the sentence starts with the file's name (" + desc + ")");
+    expect(!desc.includes("/Users/"), "and never prints the absolute path");
+    mount(payload({ shape: "modify-delete", missingRole: "yours", fileName: "C:\\\\work\\\\repo\\\\docs\\\\notes.md" }));
+    expect(/^notes\\.md was edited/.test(text(".ms-notext-desc") || ""), "a Windows path too (" + text(".ms-notext-desc") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("answering a question hands the keyboard back to what asked it", { skip }, async () => {
+  // Keep resolving / Keep my changes / Keep editing removed the button that
+  // had focus and left it on <body>: a keyboard user had to start over from
+  // the top of the page. Escape already did the right thing for one of them.
+  const v = await run(`
+    const shell = mount(payload());
+    const focused = () => document.activeElement === document.body ? "BODY" : (document.activeElement.className || document.activeElement.tagName);
+    fake.setCounts({ total: 2, pending: 1, conflictsPending: 1, hasProgress: true });
+    $(".ms-close").focus();
+    click(".ms-close");
+    expect(document.activeElement === $(".ms-close-keep"), "the safe answer has the keyboard");
+    click(".ms-close-keep");
+    expect(document.activeElement === $(".ms-close"), "Keep editing hands it back to Close (" + focused() + ")");
+
+    const ws = $(".ms-ws");
+    ws.focus();
+    ws.value = "all"; ws.dispatchEvent(new Event("change"));
+    expect(document.activeElement === $(".ms-ws-keep"), "the whitespace question has the keyboard");
+    click(".ms-ws-keep");
+    expect(document.activeElement === ws, "Keep my changes hands it back to the select (" + focused() + ")");
+    ws.value = "all"; ws.dispatchEvent(new Event("change"));
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(!shown(".ms-ws-confirm") && document.activeElement === ws, "and so does Escape (" + focused() + ")");
+
+    const DROP = { ...OP, canContinue: true, willDrop: { sha: OP.commit.sha, subject: "test change", branch: "test" } };
+    fake.setCounts({ total: 2, pending: 0, conflictsPending: 0 });
+    $(".ms-apply").focus();
+    click(".ms-apply");
+    shell.handle({ type: "applied", staged: true });
+    shell.handle({ type: "opChanged", op: DROP, remainingConflicts: 0 });
+    expect(document.activeElement === $(".ms-continue"), "Apply, now spent, hands the keyboard to Continue (" + focused() + ")");
+    click(".ms-continue");
+    expect(document.activeElement === $(".ms-drop-keep"), "the drop question has the keyboard");
+    click(".ms-drop-keep");
+    expect(document.activeElement === $(".ms-continue"), "Keep editing hands it back to Continue (" + focused() + ")");
+    click(".ms-continue");
+    document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(!shown(".ms-drop-confirm") && document.activeElement === $(".ms-continue"), "and so does Escape (" + focused() + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the no-text panel's answer, like Apply, hands the keyboard on once the host has answered", { skip }, async () => {
+  // Taking a side locks the panel's buttons under the keyboard and then hides
+  // them: the sibling of Apply disabling itself, which left it on <body>.
+  const v = await run(`
+    const shell = mount(payload({ shape: "binary" }));
+    const first = $(".ms-notext-btn");
+    first.focus();
+    click(first);
+    shell.handle({ type: "applied", staged: true });
+    shell.handle({ type: "opChanged", op: { ...OP, canContinue: true }, remainingConflicts: 0 });
+    expect(document.activeElement === $(".ms-continue"), "the keyboard moves on to Continue (" + (document.activeElement === document.body ? "BODY" : document.activeElement.className) + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("focus() puts the keyboard in the merge editor: on Next change, or on the panel's first answer", { skip }, async () => {
+  // For a host that opens the editor from a button the editor then covers
+  // (the desktop dashboard's Merge…): without it the keyboard was left on
+  // <body>, and F7 went nowhere.
+  const v = await run(`
+    const shell = mount(payload());
+    fake.setCounts({ total: 2, pending: 2, conflictsPending: 1 });
+    shell.focus();
+    expect(document.activeElement === $$(".jb-toolbar button").find((b) => b.title === "Next change (F7)"), "text: the keyboard is on Next change (" + (document.activeElement && document.activeElement.title) + ")");
+    shell.handle({ type: "init", ...payload({ shape: "binary" }) });
+    shell.focus();
+    expect(document.activeElement === $(".ms-notext-btn"), "no text: on the panel's first answer (" + (document.activeElement && document.activeElement.textContent) + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("once the operation is over, the strip has no conflicts list to point to", { skip }, async () => {
+  // A Continue that finished leaves the editor open on a view of kind "none"
+  // — the extensions keep it on screen to show the outcome. There is nothing
+  // left there to continue or end.
+  const v = await run(`
+    const shell = mount(payload());
+    const NONE = { kind: "none", title: "Conflicts", yours: OP.yours, theirs: OP.theirs, verbs: { abort: "Cancel" }, canContinue: false, canSkip: false, episode: "none" };
+    expect(shown(".ms-op-list"), "a rebase in progress links to its list");
+    shell.handle({ type: "outcome", kind: "done", text: "Rebase complete." });
+    shell.handle({ type: "opChanged", op: NONE, remainingConflicts: 0 });
+    expect(!$(".ms-op-list"), "none once it is over");
+    click(".ms-close");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "cancel", mode: "exit" }), "Close just closes the viewer (" + JSON.stringify(last()) + ")");
+    // Unmerged files with no operation around them are still to settle there.
+    const bare = mount(payload({ op: NONE }));
+    bare.handle({ type: "opChanged", op: NONE, remainingConflicts: 2 });
+    expect(shown(".ms-op-list"), "unmerged files with no operation still link to the list");
+    bare.handle({ type: "opChanged", op: NONE, remainingConflicts: 0 });
+    expect(!$(".ms-op-list"), "…while any are left");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the toolbar reflows instead of hiding anything: every control and the counter stay on screen, from the desktop's default pane to 380px", { skip }, async () => {
+  // The desktop at its default 1600px window gives the shell ~1044px beside
+  // the file list; the extension's webview is whatever the editor group is —
+  // 1000px, 653px — and the desktop at a 1000px window gives 443px. The
+  // toolbar scrolled sideways with its scrollbar hidden, so what did not fit
+  // was simply gone: the big file's "1201 changes. 601 conflicts.", "All
+  // changes have been processed" cut mid-word, the Large file note clipped,
+  // Reset past the edge (POLISH A3.1, the critic's toolbar regression).
+  const v = await run(`
+    const root = document.getElementById("root");
+    const NOTE = "Large file: word-level highlights disabled";
+    for (const width of [1044, 1000, 653, 443, 380]) {
+      root.style.width = width + "px";
+      const shell = mount(payload());
+      fake.onLargeFile(true);
+      fake.setCounts({ total: 1201, pending: 1201, conflictsPending: 601, resolvableConflictsPending: 3 });
+      await sleep(20);
+      const box = root.getBoundingClientRect();
+      const tb = $(".jb-toolbar");
+      const tr = tb.getBoundingClientRect();
+      const off = [];
+      for (const el of tb.querySelectorAll("button, select, .jb-counter")) {
+        if (el.closest("[hidden]") || el.closest(".jb-history-pop")) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0) continue;
+        if (r.left < box.left - 1 || r.right > box.right + 1 || r.bottom > tr.bottom + 1 || r.top < tr.top - 1)
+          off.push((el.title || el.className) + " at " + Math.round(r.left) + "–" + Math.round(r.right));
+      }
+      expect(off.length === 0, width + "px: every control is on screen (" + off.join("; ") + ")");
+      expect(tb.scrollWidth <= tb.clientWidth + 1, width + "px: nothing scrolls out of the toolbar (" + tb.scrollWidth + " in " + tb.clientWidth + ")");
+      const counter = $(".jb-counter");
+      expect(counter.textContent === "1201 changes. 601 conflicts." && counter.scrollWidth <= counter.clientWidth + 1,
+        width + "px: the counter is whole (" + counter.textContent + ", " + counter.scrollWidth + " in " + counter.clientWidth + ")");
+      const note = $(".jb-note");
+      const noteBox = note.getBoundingClientRect();
+      expect(!note.hidden && noteBox.width > 0 && noteBox.left >= box.left - 1 && noteBox.right <= box.right + 1, width + "px: the large-file note is on screen");
+      expect(note.scrollWidth <= note.clientWidth + 1 || (getComputedStyle(note).textOverflow === "ellipsis" && note.title === NOTE),
+        width + "px: the note is whole, or ends in an ellipsis with the whole of it in its tooltip (" + note.title + ")");
+      // The wand keeps its name whatever it shows.
+      const wand = $(".ms-wand");
+      expect(wand.getAttribute("aria-label") === "Resolve simple conflicts", width + "px: the wand is named (" + wand.getAttribute("aria-label") + ")");
+      shell.dispose();
+    }
+    // Wide enough, one row, the wand in words.
+    root.style.width = "1600px";
+    mount(payload());
+    await sleep(20);
+    expect($(".jb-toolbar").getBoundingClientRect().height < 40, "at 1600px the toolbar is one row (" + $(".jb-toolbar").getBoundingClientRect().height + ")");
+    const label = $(".ms-wand .ms-wand-label");
+    expect(/Resolve simple/.test($(".ms-wand").textContent) && !!label && label.getBoundingClientRect().width > 0, "and the wand says Resolve simple");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("A1.2: a Result seeded from the file says so, in a plain strip, and a re-init clears it", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    expect(!$(".ms-note-seed"), "no strip for a Result that starts from base");
+    fake.emitSeed({ kind: "working", changes: 4 });
+    expect(shown(".ms-note-seed") && /already resolved outside the merge editor/.test(text(".ms-note-seed")), "a file resolved by hand: " + text(".ms-note-seed"));
+    fake.emitSeed({ kind: "markers", changes: 2 });
+    expect(/^2 changes in this file were already merged, outside the conflict markers\\. They're in the Result, marked so you can check them\\./.test(text(".ms-note-seed")), "partly, in plain words: " + text(".ms-note-seed"));
+    fake.emitSeed({ kind: "markers", changes: 1 });
+    expect(/^1 change in this file was already merged/.test(text(".ms-note-seed")), "one: " + text(".ms-note-seed"));
+    // The critic's 1000px shots: the icon stood alone on a row above the sentence.
+    document.getElementById("root").style.width = "620px";
+    const icon = $(".ms-note-seed > .jb-svg").getBoundingClientRect();
+    const words = $(".ms-note-seed > .ms-notice-text").getBoundingClientRect();
+    expect(Math.abs(icon.top - words.top) < 6, "the icon sits beside the words, not above them (" + Math.round(icon.top) + " / " + Math.round(words.top) + ")");
+    const show = $(".ms-note-seed .ms-seed-show");
+    expect(!!show && show.textContent === "Show it", "a link to the change it means");
+    show.click();
+    expect(fake.count("revealSeeded") === 1, "which scrolls the Result to it");
+    document.getElementById("root").style.width = "1280px";
+    fake.emitSeed(undefined);
+    expect(!$(".ms-note-seed"), "gone when the view starts from base again");
+    fake.emitSeed({ kind: "working", changes: 1 });
+    shell.handle({ type: "init", ...payload({ shape: "binary" }) });
+    expect(!$(".ms-note-seed"), "and never over a no-text panel");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("A1.1: the host is sent the Result and, apart, the same text with what is still open put back to base — on a change of state alone too", { skip }, async () => {
+  const v = await run(`
+    mount(payload());
+    fake.result = "yours taken";
+    fake.unsettled = "base";
+    fake.emitResult();
+    await sleep(320);
+    const sent = posted.filter((m) => m.type === "resultChanged");
+    expect(sent.length === 1 && sent[0].text === "yours taken" && sent[0].unsettled === "base", "both texts, once: " + JSON.stringify(sent));
+    // Ignoring the other side settles the conflict without moving any text.
+    fake.unsettled = undefined;
+    fake.setCounts({ total: 1, pending: 0, hasProgress: true });
+    await sleep(320);
+    const again = posted.filter((m) => m.type === "resultChanged");
+    expect(again.length === 2 && again[1].text === "yours taken" && !("unsettled" in again[1]), "a settle with no text change is posted, with nothing open: " + JSON.stringify(again[1]));
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("A1.3: a file changed outside the editor is asked about inline — Reload the merge, or Keep what's here", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload({ fileName: "/Users/me/repo/src/app.ts" }));
+    shell.handle({ type: "fileChanged" });
+    const box = $(".ms-note-outside");
+    expect(shown(".ms-note-outside") && box.getAttribute("role") === "alert", "an inline question, announced");
+    expect(/^app\\.ts changed outside the merge editor/.test(text(".ms-note-outside")), "naming the file: " + text(".ms-note-outside"));
+    expect(text(".ms-outside-reload") === "Reload the merge" && text(".ms-outside-keep") === "Keep what's here", "with the two answers");
+    click(".ms-outside-keep");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "outsideEdit", answer: "keep" }), "Keep posts its answer: " + JSON.stringify(last()));
+    expect(!$(".ms-outside-keep") && /keeps the edit made outside the merge editor until you Apply/.test(text(".ms-note-outside")), "and leaves a quiet line: " + text(".ms-note-outside"));
+    shell.handle({ type: "fileChanged" });
+    click(".ms-outside-reload");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "outsideEdit", answer: "reload" }), "Reload posts its answer");
+    expect(!$(".ms-note-outside"), "and the question goes");
+    shell.handle({ type: "fileChanged" });
+    shell.handle({ type: "init", ...payload() });
+    expect(!$(".ms-note-outside"), "a fresh init has nothing to ask");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("after an Apply the host can undo, the bottom bar offers Undo in place", { skip }, async () => {
+  const v = await run(`
+    const shell = mount(payload());
+    fake.setCounts({ total: 1, pending: 0 });
+    expect(!shown(".ms-undo-apply"), "nothing to undo before an Apply");
+    click(".ms-apply");
+    shell.handle({ type: "applied", staged: true, undoable: true });
+    expect(shown(".ms-undo-apply") && text(".ms-undo-apply") === "Undo", "Undo is offered beside Apply");
+    click(".ms-undo-apply");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "undoApply" }), "and posts undoApply: " + JSON.stringify(last()));
+    expect($(".ms-undo-apply").disabled, "locked while the host runs it");
+    shell.handle({ type: "init", ...payload() });
+    expect(!shown(".ms-undo-apply"), "the conflict is back: nothing to undo");
+    click(".ms-apply");
+    shell.handle({ type: "applied", staged: true });
+    expect(!shown(".ms-undo-apply"), "a host that cannot undo offers no Undo");
+    shell.handle({ type: "init", ...payload() });
+    fake.setCounts({ total: 1, pending: 0 });
+    click(".ms-apply");
+    shell.handle({ type: "applied", staged: true, undoable: true });
+    fake.setCounts({ total: 1, pending: 1, hasProgress: true });
+    expect(!shown(".ms-undo-apply"), "work after the Apply takes the Undo away");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("a submodule's panel names the two commits the payload carries", { skip }, async () => {
+  const v = await run(`
+    mount(payload({ shape: "submodule", commits: { yours: "1c34b25aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", theirs: "9d20bedbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }));
+    expect(/yours at 1c34b25, theirs at 9d20bed/.test(text(".ms-notext-desc") || ""), "the sentence names both commits (" + text(".ms-notext-desc") + ")");
+    const btns = $$(".ms-notext-btn");
+    expect(/1c34b25/.test(btns[0].title) && /9d20bed/.test(btns[1].title), "and each Accept says which commit it records (" + btns.map((b) => b.title).join(" | ") + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the shell's danger ink is the host's --gs-danger (the desktop's own red, not VS Code's error colour)", { skip }, async () => {
+  const v = await run(`
+    document.body.style.setProperty("--gs-danger", "rgb(1, 2, 3)");
+    document.body.style.setProperty("--vscode-errorForeground", "rgb(200, 0, 0)");
+    mount(payload({ shape: "modify-delete", missingRole: "theirs" }));
+    const del = $(".ms-notext .ms-danger");
+    expect(!!del && getComputedStyle(del).color === "rgb(1, 2, 3)", "Delete the file is drawn in --gs-danger (" + (del && getComputedStyle(del).color) + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the sample's Close reads Close sample; Close's question is announced, and names what it asks", { skip }, async () => {
+  const v = await run(`
+    const SAMPLE = { ...OP, kind: "none", verbs: { abort: "Close sample" }, episode: "sample", title: "Sample · rebasing" };
+    const shell = mount(payload({ op: SAMPLE }));
+    shell.handle({ type: "opChanged", op: SAMPLE, remainingConflicts: 0 });
+    expect(text(".ms-close") === "Close sample", "the sample's Close says what it closes (" + text(".ms-close") + ")");
+    expect(!$(".ms-op-list"), "and it has no conflicts list to point to");
+    click(".ms-close");
+    expect(JSON.stringify(last()) === JSON.stringify({ type: "cancel", mode: "exit" }), "and closes it");
+    mount(payload());
+    expect(text(".ms-close") === "Close", "a real operation's reads Close (" + text(".ms-close") + ")");
+    fake.setCounts({ total: 2, pending: 1, conflictsPending: 1, hasProgress: true });
+    click(".ms-close");
+    const box = $(".ms-close-confirm");
+    expect(box && box.getAttribute("role") === "alert" && /Close without applying\\?/.test(box.textContent), "the question is announced, in its own words (" + (box && box.getAttribute("role")) + ")");
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("the no-text panel stays above the bottom bar: its Close is whole and takes the click, and a short pane scrolls the panel", { skip }, async () => {
+  // In VS Code the panel (height 100% plus its padding, content-box) ran past
+  // the content area and painted over the bottom bar: the only way out of a
+  // submodule, symlink or binary conflict showed as a sliver of its border.
+  //
+  // A click is tried at points on Close, so the whole 640px pane has to be in
+  // the view: a 1280x700 frame (runInChrome's `frame`). In a 700px WINDOW the
+  // CI runners' system Chrome, which keeps ~150px of it for its own toolbar,
+  // left a 557px view, and every point on Close — at y=604 — hit nothing.
+  const v = await run(`
+    const root = document.getElementById("root");
+    expect(innerHeight === 700, "the view is the frame's 700px (" + innerHeight + ")");
+    const covered = () => {
+      const close = $(".ms-close");
+      const b = close.getBoundingClientRect();
+      const r = root.getBoundingClientRect();
+      if (!(b.height > 0 && b.top >= r.top - 1 && b.bottom <= r.bottom + 1)) return "Close at " + Math.round(b.top) + "–" + Math.round(b.bottom) + " outside " + Math.round(r.top) + "–" + Math.round(r.bottom);
+      for (const y of [b.top + 2, b.top + b.height / 2, b.bottom - 2]) {
+        const hit = document.elementFromPoint(b.left + b.width / 2, y);
+        if (!hit || !close.contains(hit)) return "at y=" + Math.round(y) + " the click lands on " + (hit ? hit.className || hit.tagName : "nothing");
+      }
+      const panel = $(".ms-notext").getBoundingClientRect();
+      const bar = $(".jb-bottom-bar").getBoundingClientRect();
+      return panel.bottom <= bar.top + 1 ? "" : "the panel ends at " + Math.round(panel.bottom) + ", under the bar's top " + Math.round(bar.top);
+    };
+    for (const over of [
+      { shape: "submodule", commits: { yours: "1c34b25aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", theirs: "9d20bedbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } },
+      { shape: "symlink" },
+      { shape: "binary" },
+      { shape: "modify-delete", missingRole: "theirs" },
+    ]) {
+      root.style.height = "640px";
+      mount(payload(over));
+      expect(root.getBoundingClientRect().bottom <= innerHeight, over.shape + ": the pane is whole in the view (" + root.getBoundingClientRect().bottom + " of " + innerHeight + ")");
+      expect(shown(".ms-close") && !covered(), over.shape + ": " + covered());
+      root.style.height = "220px";
+      const why = covered();
+      const panel = $(".ms-notext");
+      expect(!why, over.shape + " in a short pane: " + why);
+      expect(panel.scrollHeight > panel.clientHeight + 1 ? getComputedStyle(panel).overflowY === "auto" : true, over.shape + ": what does not fit scrolls (" + getComputedStyle(panel).overflowY + ")");
+    }
+  `, { frame: { width: 1280, height: 700 } });
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});
+
+test("a narrow shell's legend drops each colour's words with the dash before them, and the dots between items", { skip }, async () => {
+  // At 900px and under the shell hid what a colour asks of you and kept the
+  // dash that led into it: a real VS Code capture of the sample read
+  // "Conflict — 3 · Same on both sides — 2 · One side only — 2 · Removed
+  // lines 1". The legend is the view's own, in the shell's slot, as the
+  // merge view mounts it.
+  const v = await run(`
+    const { MergeLegend, emptyMergeCounts } = window.__shell;
+    const root = document.getElementById("root");
+    mount(payload());
+    const legend = new MergeLegend(() => {});
+    fake.legendSlot.appendChild(legend.element);
+    const tone = (n) => ({ total: n, pending: n, yours: 0, theirs: 0, both: 0 });
+    legend.update(emptyMergeCounts(), { halfDone: [], tones: { conflict: tone(3), same: tone(2), "one-sided": tone(2), removed: tone(1) } });
+    // What is on screen: innerText leaves out what is not displayed.
+    const read = (el) => el.innerText.replace(/\\s+/g, " ").trim();
+    const chips = () => [...legend.element.querySelectorAll(".jb-legend-chip")].map(read);
+    const dots = () => [...legend.element.querySelectorAll(".jb-legend-sep")].filter((s) => getComputedStyle(s).display !== "none").length;
+
+    root.style.width = "1280px";
+    expect(JSON.stringify(chips()) === JSON.stringify(["Conflict — you choose 3", "Same on both sides — either arrow takes it 2", "One side only — safe to take 2", "Removed lines 1"]),
+      "wide, each colour says what it asks of you, after a dash: " + JSON.stringify(chips()));
+    expect(dots() === 3, "…with a dot between each two items (" + dots() + ")");
+
+    for (const width of [860, 520]) {
+      root.style.width = width + "px";
+      expect(JSON.stringify(chips()) === JSON.stringify(["Conflict 3", "Same on both sides 2", "One side only 2", "Removed lines 1"]),
+        width + "px: each colour's name and its count, no dash left hanging: " + JSON.stringify(chips()));
+      expect(!/[—·]/.test(read(legend.element)), width + "px: no dash and no dot anywhere in the legend: " + JSON.stringify(read(legend.element)));
+    }
+  `);
+  assert.deepEqual(v.fails, [], v.fails.join("\n"));
+});

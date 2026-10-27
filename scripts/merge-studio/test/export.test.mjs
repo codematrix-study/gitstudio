@@ -1,0 +1,432 @@
+// export.mjs: the pure pieces on hand-built inputs, then one real export of
+// this checkout into a scratch folder that stands in for a merge-studio
+// checkout — which check-parity must accept, and must reject after one
+// vendored byte changes.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { checkParity, sha256 } from "../check-parity.mjs";
+import {
+  blobId,
+  exportTo,
+  gitBytes,
+  GITSTUDIO_ROOT,
+  lockSubset,
+  resolveInLock,
+  standalonePackageJson,
+  standaloneTsconfig,
+  VENDOR_GITATTRIBUTES,
+  VENDORED_PACKAGES,
+} from "../export.mjs";
+import { shellFiles, toGitstudio } from "../layout.mjs";
+
+/**
+ * The blob git makes of gitstudio's file `rel`: what an export writes for it,
+ * not the CRLF a checkout with core.autocrlf (on Windows) has on disk.
+ */
+const gitstudioBlobId = (rel) => execFileSync("git", ["-C", GITSTUDIO_ROOT, "hash-object", "--", rel], { encoding: "utf8" }).trim();
+
+const entry = (version, extra = {}) => ({
+  version,
+  resolved: `https://registry.example/${version}.tgz`,
+  integrity: `sha512-${version}`,
+  ...extra,
+});
+
+/** A miniature gitstudio lockfile: one hoisted tool, one nested under a workspace, one nested dep. */
+function fakeLock() {
+  return {
+    packages: {
+      "": { name: "gitstudio-workspace" },
+      "apps/merge-studio": { name: "merge-studio" },
+      "apps/merge-studio/node_modules/@types/vscode": entry("1.78.0", { dev: true }),
+      "packages/ui": { name: "@gitstudio/ui" },
+      "node_modules/@gitstudio/ui": { resolved: "packages/ui", link: true },
+      "node_modules/esbuild": entry("0.28.1", { dev: true, optionalDependencies: { "@esbuild/linux-x64": "0.28.1" } }),
+      "node_modules/@esbuild/linux-x64": entry("0.28.1", { dev: true, optional: true, os: ["linux"], cpu: ["x64"] }),
+      "node_modules/monaco-editor": entry("0.55.1", { dependencies: { dompurify: "3.2.7", marked: "14.0.0" } }),
+      "node_modules/dompurify": entry("3.4.11"),
+      "node_modules/marked": entry("14.0.0"),
+      "node_modules/lit": entry("3.3.3", { dependencies: { "lit-html": "^3.3.0" } }),
+      "node_modules/lit/node_modules/lit-html": entry("3.3.9"),
+      "node_modules/lit-html": entry("2.0.0"),
+    },
+  };
+}
+
+test("resolveInLock follows node's lookup: nested first, then up to the root", () => {
+  const p = fakeLock().packages;
+  assert.equal(resolveInLock(p, "@types/vscode", "apps/merge-studio"), "apps/merge-studio/node_modules/@types/vscode");
+  assert.equal(resolveInLock(p, "esbuild", "apps/merge-studio"), "node_modules/esbuild");
+  assert.equal(resolveInLock(p, "lit-html", "node_modules/lit"), "node_modules/lit/node_modules/lit-html");
+  assert.equal(resolveInLock(p, "lit-html", "packages/ui"), "node_modules/lit-html");
+  assert.equal(resolveInLock(p, "nope", "packages/ui"), undefined);
+});
+
+test("the standalone package.json drops the workspace packages and pins every version gitstudio resolves", () => {
+  const lock = fakeLock();
+  const shell = {
+    name: "merge-studio",
+    version: "0.4.0",
+    scripts: { package: "node esbuild.js --production", test: "old" },
+    dependencies: { "@gitstudio/ui": "*" },
+    devDependencies: { esbuild: "^0.28.0", "@types/vscode": "1.78.0" },
+  };
+  const packages = { ui: { dependencies: { "@gitstudio/engine": "*", lit: "^3.3.1", "monaco-editor": "^0.55.1" } } };
+  const { pkg, resolved } = standalonePackageJson({ shell, packages, lock, rootPackage: { overrides: { dompurify: "3.4.11" } } });
+  assert.equal(pkg.dependencies, undefined);
+  assert.deepEqual(pkg.devDependencies, { "@types/vscode": "1.78.0", esbuild: "0.28.1", lit: "3.3.3", "monaco-editor": "0.55.1" });
+  assert.deepEqual(pkg.overrides, { dompurify: "3.4.11" });
+  assert.equal(pkg.scripts["check-parity"], "node scripts/check-parity.mjs");
+  assert.match(pkg.scripts.test, /scripts\/test\/\*\.test\.mjs/);
+  assert.equal(pkg.scripts.package, "node esbuild.js --production", "the shell's other scripts are kept");
+  assert.equal(shell.dependencies["@gitstudio/ui"], "*", "the input is not mutated");
+  assert.equal(resolved.get("@types/vscode"), "apps/merge-studio/node_modules/@types/vscode");
+});
+
+test("a dependency gitstudio's lockfile does not have stops the export", () => {
+  const shell = { name: "m", version: "1.0.0", devDependencies: { "left-pad": "1.0.0" } };
+  assert.throws(
+    () => standalonePackageJson({ shell, packages: {}, lock: fakeLock(), rootPackage: {} }),
+    /left-pad .* is not in gitstudio's package-lock\.json/,
+  );
+});
+
+test("the lockfile cut: the closure at gitstudio's versions, workspace-nested entries at the top, all dev", () => {
+  const lock = fakeLock();
+  const shell = { name: "merge-studio", version: "0.4.0", devDependencies: { esbuild: "^0.28.1", "@types/vscode": "1.78.0" } };
+  const packages = { ui: { dependencies: { lit: "^3.3.1", "monaco-editor": "^0.55.1" } } };
+  const { pkg, resolved } = standalonePackageJson({ shell, packages, lock, rootPackage: {} });
+  const out = lockSubset({ lock, pkg, resolved });
+  assert.equal(out.lockfileVersion, 3);
+  assert.deepEqual(Object.keys(out.packages), [
+    "",
+    "node_modules/@esbuild/linux-x64",
+    "node_modules/@types/vscode",
+    "node_modules/dompurify",
+    "node_modules/esbuild",
+    "node_modules/lit",
+    "node_modules/lit/node_modules/lit-html",
+    "node_modules/marked",
+    "node_modules/monaco-editor",
+  ]);
+  assert.deepEqual(out.packages[""].devDependencies, pkg.devDependencies);
+  assert.equal(out.packages["node_modules/@types/vscode"].version, "1.78.0");
+  assert.equal(out.packages["node_modules/lit/node_modules/lit-html"].version, "3.3.9", "nesting kept");
+  assert.ok(!("node_modules/lit-html" in out.packages), "the unused hoisted copy is not pulled in");
+  assert.equal(out.packages["node_modules/@esbuild/linux-x64"].optional, true);
+  assert.deepEqual(out.packages["node_modules/@esbuild/linux-x64"].os, ["linux"]);
+  for (const [k, v] of Object.entries(out.packages)) if (k) assert.equal(v.dev, true, k);
+  assert.equal(out.packages["node_modules/monaco-editor"].integrity, "sha512-0.55.1");
+});
+
+test("the standalone tsconfig maps every vendored package into vendor/gitstudio", () => {
+  const t = standaloneTsconfig({ compilerOptions: { strict: true, moduleResolution: "Bundler" } });
+  assert.equal(t.compilerOptions.strict, true);
+  assert.deepEqual(t.compilerOptions.types, ["node", "vscode"]);
+  assert.deepEqual(Object.keys(t.compilerOptions.paths).sort(), VENDORED_PACKAGES.map((p) => `@gitstudio/${p}/*`).sort());
+  assert.deepEqual(t.compilerOptions.paths["@gitstudio/engine/*"], ["./vendor/gitstudio/engine/src/*"]);
+  assert.equal(t.compilerOptions.baseUrl, undefined, "paths resolve from the tsconfig itself (baseUrl is deprecated)");
+});
+
+test("gitBytes, what the export writes: the bytes `git add` stores, not the CRLF a checkout with core.autocrlf (git for Windows' default) has on disk", () => {
+  const home = mkdtempSync(join(tmpdir(), "ms-export-eol-"));
+  const repo = join(home, "repo");
+  // Hermetic git: the config of the machine running this (autocrlf, on a Windows runner) decides nothing here.
+  writeFileSync(join(home, "gitconfig"), "");
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: join(home, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1" };
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    mkdirSync(repo);
+    git("init", "-q");
+    git("config", "user.name", "Maintainer");
+    git("config", "user.email", "maintainer@example.com");
+    const committed = {
+      "lf.ts": "one\ntwo\n",
+      "crlf.ts": "one\r\ntwo\r\n", // stored with CRLF: autocrlf never converts it
+      "edited.ts": "one\ntwo\n",
+      "icon.png": Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0]), // binary: never converted
+    };
+    for (const [rel, body] of Object.entries(committed)) writeFileSync(join(repo, rel), body);
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    const rels = [...Object.keys(committed), "new.ts"];
+    writeFileSync(join(repo, "new.ts"), "a\r\nb\n");
+    assert.deepEqual(gitBytes(repo, rels, { env }), rels.map((rel) => readFileSync(join(repo, rel))), "without autocrlf, the bytes on disk");
+
+    // git for Windows: every file checked out again, with CRLF on disk where git has LF.
+    git("config", "core.autocrlf", "true");
+    for (const rel of Object.keys(committed)) rmSync(join(repo, rel));
+    git("checkout", "--", ".");
+    assert.equal(readFileSync(join(repo, "lf.ts"), "utf8"), "one\r\ntwo\r\n", "precondition: CRLF on disk");
+    writeFileSync(join(repo, "edited.ts"), "one\r\ntwo\r\nthree\r\n"); // changed since the commit (--allow-dirty)
+    writeFileSync(join(repo, "new.ts"), "a\r\nb\r\n"); // never committed
+    const bytes = gitBytes(repo, rels, { env });
+    assert.equal(bytes[0].toString(), "one\ntwo\n");
+    assert.equal(bytes[1].toString(), "one\r\ntwo\r\n");
+    git("add", "-A");
+    rels.forEach((rel, i) => assert.ok(bytes[i].equals(git("cat-file", "blob", `:${rel}`)), `${rel}: what git add stores`));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a real export: replaces the old layout, vendors the packages, and passes check-parity until a byte changes", () => {
+  const into = mkdtempSync(join(tmpdir(), "ms-export-test-"));
+  try {
+    // What a merge-studio 0.3.4 checkout has that the shell replaces, and what it keeps.
+    for (const rel of ["src/extension.ts", "webview/main.ts", "test/old.test.ts", "test-harness/index.html", "test-fixtures/make-conflict.sh"]) {
+      mkdirSync(join(into, rel, ".."), { recursive: true });
+      writeFileSync(join(into, rel), "old\n");
+    }
+    const r = exportTo({ into, allowDirty: true });
+    assert.deepEqual(r.removed.sort(), ["src", "test", "test-harness", "webview"]);
+    assert.equal(existsSync(join(into, "webview")), false);
+    assert.equal(readFileSync(join(into, "test-fixtures/make-conflict.sh"), "utf8"), "old\n", "not the shell's: kept");
+    assert.ok(existsSync(join(into, "src/extension.ts")), "the shell's src");
+    assert.ok(existsSync(join(into, "test/parity.test.ts")));
+    for (const p of VENDORED_PACKAGES) assert.ok(existsSync(join(into, "vendor/gitstudio", p, "src")), p);
+    assert.ok(existsSync(join(into, "vendor/gitstudio/extension/src/merge/mergeIds.ts")));
+    assert.ok(existsSync(join(into, "vendor/gitstudio/LICENSE")));
+    // A Windows checkout must not rewrite the hashed bytes (core.autocrlf).
+    assert.equal(readFileSync(join(into, "vendor/gitstudio/.gitattributes"), "utf8"), VENDOR_GITATTRIBUTES);
+    assert.match(VENDOR_GITATTRIBUTES, /^\* -text$/m);
+
+    const pkg = JSON.parse(readFileSync(join(into, "package.json"), "utf8"));
+    assert.equal(pkg.name, "merge-studio");
+    assert.equal(pkg.dependencies, undefined);
+    assert.ok(!Object.keys(pkg.devDependencies).some((d) => d.startsWith("@gitstudio/")));
+    for (const v of Object.values(pkg.devDependencies)) assert.match(v, /^\d+\.\d+\.\d+$/, "pinned");
+    const tsconfig = JSON.parse(readFileSync(join(into, "tsconfig.json"), "utf8"));
+    assert.deepEqual(tsconfig.compilerOptions.paths["@gitstudio/merge-vscode/*"], ["./vendor/gitstudio/merge-vscode/src/*"]);
+    const lock = JSON.parse(readFileSync(join(into, "package-lock.json"), "utf8"));
+    assert.deepEqual(lock.packages[""].devDependencies, pkg.devDependencies);
+
+    const manifest = JSON.parse(readFileSync(join(into, "VENDORED_FROM.json"), "utf8"));
+    const head = execFileSync("git", ["-C", GITSTUDIO_ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    assert.equal(manifest.gitstudio.sha, head);
+    const mergeModel = "vendor/gitstudio/engine/src/mergeModel.ts";
+    const vendoredBytes = readFileSync(join(into, mergeModel));
+    assert.equal(manifest.files[mergeModel], sha256(vendoredBytes), "the hash is of the vendored bytes...");
+    assert.equal(blobId(vendoredBytes), gitstudioBlobId("packages/engine/src/mergeModel.ts"), "...which are gitstudio's, as git stores them");
+    assert.ok(existsSync(join(into, "scripts/check-parity.mjs")));
+
+    assert.deepEqual(checkParity(into).problems, []);
+    const bytes = readFileSync(join(into, mergeModel));
+    bytes[0] ^= 1;
+    writeFileSync(join(into, mergeModel), bytes);
+    assert.deepEqual(checkParity(into).problems, [`modified: ${mergeModel}`]);
+
+    // Idempotent: exporting again restores the vendored byte.
+    exportTo({ into, allowDirty: true });
+    assert.equal(checkParity(into).ok, true);
+  } finally {
+    rmSync(into, { recursive: true, force: true });
+  }
+});
+
+test("a shell file the previous export wrote and gitstudio no longer has is removed; nothing else is, whatever the manifest says", () => {
+  const outside = mkdtempSync(join(tmpdir(), "ms-export-outside-"));
+  const into = join(outside, "merge-studio");
+  mkdirSync(into);
+  try {
+    const files = {
+      "media/old-shot.png": "gone from gitstudio",
+      "docs/walkthrough/old.md": "gone from gitstudio, and its folder with it",
+      "OLD.md": "gone from gitstudio",
+      "test-fixtures/own.sh": "merge-studio's own: never listed",
+      "package-lock.json": "generated: an export without --no-lock writes it",
+      ".git/config": "never",
+      "escape/kept.txt": "through a symbolic link",
+    };
+    mkdirSync(join(outside, "elsewhere"));
+    for (const [rel, text] of Object.entries(files)) {
+      const at = rel.startsWith("escape/") ? join(outside, "elsewhere", "kept.txt") : join(into, rel);
+      mkdirSync(join(at, ".."), { recursive: true });
+      writeFileSync(at, text);
+    }
+    symlinkSync(join(outside, "elsewhere"), join(into, "escape"));
+    writeFileSync(join(outside, "outside.txt"), "outside the checkout");
+    // What a previous export recorded, plus what a pull request could add to it.
+    const listed = ["media/old-shot.png", "docs/walkthrough/old.md", "OLD.md", "package-lock.json", "README.md", "../outside.txt", ".git/config", "escape/kept.txt", "vendor/gitstudio/LICENSE", "/etc/hosts"];
+    writeFileSync(join(into, "VENDORED_FROM.json"), JSON.stringify({ schema: 1, files: {}, shell: Object.fromEntries(listed.map((p) => [p, "0"])) }));
+
+    const r = exportTo({ into, allowDirty: true, lock: false });
+    assert.deepEqual(r.stale.sort(), ["OLD.md", "docs/walkthrough/old.md", "media/old-shot.png"]);
+    for (const rel of r.stale) assert.equal(existsSync(join(into, rel)), false, rel);
+    assert.equal(existsSync(join(into, "docs")), false, "a folder left empty goes too");
+    assert.ok(existsSync(join(into, "media/icon.png")), "the shell's own media stay");
+    assert.ok(existsSync(join(into, "README.md")), "written by this export too");
+    assert.ok(existsSync(join(into, "vendor/gitstudio/LICENSE")), "the vendored copy is never removed");
+    assert.equal(readFileSync(join(into, "test-fixtures/own.sh"), "utf8"), files["test-fixtures/own.sh"]);
+    assert.equal(readFileSync(join(into, "package-lock.json"), "utf8"), files["package-lock.json"], "generated: --no-lock leaves it be");
+    assert.equal(readFileSync(join(into, ".git/config"), "utf8"), files[".git/config"]);
+    assert.ok(existsSync(join(outside, "outside.txt")));
+    assert.ok(existsSync(join(outside, "elsewhere", "kept.txt")), "never through a symbolic link");
+    // The new manifest lists what this export wrote, so the next one removes by it.
+    const shell = Object.keys(JSON.parse(readFileSync(join(into, "VENDORED_FROM.json"), "utf8")).shell);
+    assert.ok(shell.includes("README.md") && !shell.includes("OLD.md"));
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+/** A workflow's jobs, by name: the lines of each, read by indentation (no YAML library in either repository). */
+function workflowJobs(yml) {
+  const lines = yml.split("\n");
+  const start = lines.indexOf("jobs:");
+  assert.ok(start >= 0, "the workflow has jobs");
+  const jobs = {};
+  let current;
+  for (const line of lines.slice(start + 1)) {
+    const name = /^ {2}([\w-]+):\s*$/.exec(line);
+    if (name) jobs[(current = name[1])] = [];
+    else if (current && !/^\s*#/.test(line)) jobs[current].push(line);
+  }
+  return Object.fromEntries(Object.entries(jobs).map(([k, v]) => [k, v.join("\n")]));
+}
+
+test("the export writes merge-studio's CI: check-parity in a job of its own, neutral on a pull request, strict on main", () => {
+  const into = mkdtempSync(join(tmpdir(), "ms-export-ci-"));
+  try {
+    // merge-studio's hand-kept workflow before the first export that writes it.
+    mkdirSync(join(into, ".github/workflows"), { recursive: true });
+    writeFileSync(join(into, ".github/workflows/ci.yml"), "name: CI\n# hand-kept\n");
+    writeFileSync(join(into, ".github/workflows/release.yml"), "name: Release\n");
+    exportTo({ into, allowDirty: true, lock: false });
+
+    const ymlBytes = readFileSync(join(into, ".github/workflows/ci.yml"));
+    assert.equal(blobId(ymlBytes), gitstudioBlobId("scripts/merge-studio/merge-studio-ci.yml"), "written from gitstudio's template, byte for byte as git stores it");
+    const yml = ymlBytes.toString("utf8");
+    assert.equal(readFileSync(join(into, ".github/workflows/release.yml"), "utf8"), "name: Release\n", "merge-studio's own release workflow is left alone");
+    assert.match(yml, /^on:\n {2}push:\n {4}branches: \[main\]\n {2}pull_request:\n/m, "it runs on pushes to main and on pull requests");
+
+    const jobs = workflowJobs(yml);
+    assert.deepEqual(Object.keys(jobs).sort(), ["build", "parity"]);
+    // The parity job: the one place check-parity runs, relaxed on a pull request only.
+    const parityRuns = jobs.parity.split("\n").filter((l) => /check-parity/.test(l));
+    assert.deepEqual(parityRuns.map((l) => l.trim()), [
+      "run: node scripts/check-parity.mjs ${{ github.event_name == 'pull_request' && '--pull-request' || '' }}",
+    ]);
+    assert.doesNotMatch(jobs.parity, /npm ci/, "it needs no install");
+    // The build job type-checks and tests whatever the parity job says.
+    assert.doesNotMatch(jobs.build, /check-parity/);
+    assert.doesNotMatch(jobs.build, /\bneeds:/);
+    assert.doesNotMatch(jobs.build, /continue-on-error/);
+    for (const step of ["run: npm ci", "run: npm run check-types", "run: npm test"]) assert.ok(jobs.build.includes(step), step);
+
+    // Every npm script it runs is one the exported package.json has.
+    const pkg = JSON.parse(readFileSync(join(into, "package.json"), "utf8"));
+    for (const [, script] of yml.matchAll(/npm run ([\w:-]+)/g)) assert.ok(pkg.scripts[script], `npm run ${script}`);
+    assert.ok(existsSync(join(into, "scripts/check-parity.mjs")));
+
+    // The export records it with the shell files, so check-parity warns when merge-studio edits it by hand.
+    const manifest = JSON.parse(readFileSync(join(into, "VENDORED_FROM.json"), "utf8"));
+    assert.ok(".github/workflows/ci.yml" in manifest.shell);
+    writeFileSync(join(into, ".github/workflows/ci.yml"), `${yml}# local edit\n`);
+    assert.match(checkParity(into).warnings.join("\n"), /shell modified: \.github\/workflows\/ci\.yml/);
+  } finally {
+    rmSync(into, { recursive: true, force: true });
+  }
+});
+
+test("the export writes merge-studio's FUNDING.yml: GitStudio's own, byte for byte, over the one merge-studio kept by hand", () => {
+  const into = mkdtempSync(join(tmpdir(), "ms-export-funding-"));
+  try {
+    // merge-studio's hand-kept file before the first export that writes it:
+    // GitHub Sponsors alone, without the one-off tip.
+    mkdirSync(join(into, ".github"), { recursive: true });
+    writeFileSync(join(into, ".github/FUNDING.yml"), "github: antonarnaudov\n");
+    exportTo({ into, allowDirty: true, lock: false });
+
+    const bytes = readFileSync(join(into, ".github/FUNDING.yml"));
+    assert.equal(blobId(bytes), gitstudioBlobId(".github/FUNDING.yml"), "GitStudio's file, byte for byte as git stores it");
+    const yml = bytes.toString("utf8");
+    assert.match(yml, /^github: \[antonarnaudov\]$/m, "GitHub Sponsors");
+    assert.match(yml, /^custom: \["https:\/\/checkout\.revolut\.com\/pay\/7a6070ab-99ba-4170-a125-c5911b1a5c1d"\]$/m, "and the one-off tip");
+    assert.doesNotMatch(yml, /apps\/|scripts\//, "it names no path that exists in only one of the two repositories");
+
+    // Recorded with the shell files: a hand edit in merge-studio is reported,
+    // and an export that no longer writes it removes it.
+    const manifest = JSON.parse(readFileSync(join(into, "VENDORED_FROM.json"), "utf8"));
+    assert.ok(".github/FUNDING.yml" in manifest.shell);
+    writeFileSync(join(into, ".github/FUNDING.yml"), `${yml}# local edit\n`);
+    assert.match(checkParity(into).warnings.join("\n"), /shell modified: \.github\/FUNDING\.yml/);
+    // The import maps a pull request's change to it back to the same file.
+    assert.deepEqual(toGitstudio(".github/FUNDING.yml", { shell: new Set() }), { kind: "copied", gitstudio: ".github/FUNDING.yml", shell: false });
+    // It is the repository's, never the extension's: .github/ is not packaged.
+    assert.match(readFileSync(join(GITSTUDIO_ROOT, "apps/merge-studio/.vscodeignore"), "utf8"), /^\.github\/\*\*$/m);
+  } finally {
+    rmSync(into, { recursive: true, force: true });
+  }
+});
+
+test("the export carries Merge Studio's security policy, privacy note and issue forms, and leaves merge-studio's own release workflow alone", () => {
+  const into = mkdtempSync(join(tmpdir(), "ms-export-policy-"));
+  try {
+    // What merge-studio had before: its own, stale policy (supported: 0.3.x),
+    // and the release workflow that stays its own.
+    mkdirSync(join(into, ".github/workflows"), { recursive: true });
+    writeFileSync(join(into, "SECURITY.md"), "# Security Policy\n\n| 0.3.x | :white_check_mark: |\n");
+    writeFileSync(join(into, ".github/workflows/release.yml"), "name: Release\n");
+    exportTo({ into, allowDirty: true, lock: false });
+
+    const carried = [
+      "SECURITY.md",
+      "PRIVACY.md",
+      ".github/ISSUE_TEMPLATE/bug_report.yml",
+      ".github/ISSUE_TEMPLATE/feature_request.yml",
+      ".github/ISSUE_TEMPLATE/config.yml",
+    ];
+    const manifest = JSON.parse(readFileSync(join(into, "VENDORED_FROM.json"), "utf8"));
+    for (const rel of carried) {
+      assert.equal(blobId(readFileSync(join(into, rel))), gitstudioBlobId(`apps/merge-studio/${rel}`), `${rel} is the shell's, byte for byte`);
+      assert.ok(rel in manifest.shell, `${rel} is recorded with the shell files`);
+    }
+    // Merge Studio's, not GitStudio's: its own repository's private reporting.
+    const security = readFileSync(join(into, "SECURITY.md"), "utf8");
+    assert.match(security, /github\.com\/GitStudioHQ\/merge-studio\/security\/advisories\/new/);
+    assert.doesNotMatch(security, /0\.3\.x/, "the stale supported-versions table is gone");
+    const bug = readFileSync(join(into, ".github/ISSUE_TEMPLATE/bug_report.yml"), "utf8");
+    assert.match(bug, /^ {8}- Merge Studio extension$/m, "the bug form's product is Merge Studio");
+    assert.match(bug, /merge-studio\/security\/advisories\/new/);
+    // The prefilled "Report a problem" link opens /issues/new, which blank issues keep working.
+    assert.match(readFileSync(join(into, ".github/ISSUE_TEMPLATE/config.yml"), "utf8"), /^blank_issues_enabled: true$/m);
+    assert.equal(readFileSync(join(into, ".github/workflows/release.yml"), "utf8"), "name: Release\n", "merge-studio's own release workflow is left alone");
+    // The forms are the repository's, not the extension's: the VSIX leaves .github out.
+    assert.match(readFileSync(join(into, ".vscodeignore"), "utf8"), /^\.github\/\*\*$/m);
+    // A merge-studio change to them comes back to the shell.
+    const shell = new Set(shellFiles(GITSTUDIO_ROOT));
+    for (const rel of carried) {
+      assert.deepEqual(toGitstudio(rel, { shell }), { kind: "copied", gitstudio: `apps/merge-studio/${rel}`, shell: true }, rel);
+    }
+    assert.equal(toGitstudio(".github/workflows/release.yml", { shell }).kind, "unmapped", "merge-studio's own stays its own");
+  } finally {
+    rmSync(into, { recursive: true, force: true });
+  }
+});
+
+test("the export never writes into this gitstudio checkout", () => {
+  assert.throws(() => exportTo({ into: GITSTUDIO_ROOT, allowDirty: true }), /must be a merge-studio checkout/);
+});
+
+test("the dompurify gitstudio pins — and so every export — is past its advisories", () => {
+  // GHSA-c2j3-45gr-mqc4 and GHSA-55q2-fjhq-7xh7 cover every release up to
+  // 3.4.12; the override stood at 3.4.11. Monaco's vendored copy is
+  // redirected to this package by each esbuild config, so this pin is the
+  // DOMPurify every bundle carries.
+  const root = JSON.parse(readFileSync(join(GITSTUDIO_ROOT, "package.json"), "utf8"));
+  const lock = JSON.parse(readFileSync(join(GITSTUDIO_ROOT, "package-lock.json"), "utf8"));
+  const past = (v) => {
+    const [a, b, c] = v.split(".").map(Number);
+    return a > 3 || (a === 3 && (b > 4 || (b === 4 && c > 12)));
+  };
+  const pinned = root.overrides?.dompurify ?? "";
+  assert.match(pinned, /^\d+\.\d+\.\d+$/, `an exact pin, not a range: ${pinned}`);
+  assert.ok(past(pinned), `the override pins dompurify ${pinned}, inside the advisories' range (<= 3.4.12)`);
+  assert.equal(lock.packages["node_modules/dompurify"]?.version, pinned, "the lock installs the pinned version");
+});

@@ -1,0 +1,667 @@
+// Settings cards for the two AI features:
+//   • AI Models      — connect any model platform or a local server (BYO-key /
+//                      keyless local), manage connections, set the default.
+//   • Agent Access   — point an external agent (Claude Desktop, Cursor, Copilot,
+//                      Windsurf) at GitStudio's MCP server for this repo, with a
+//                      least-privilege permission choice.
+//
+// The renderer never holds an API key: it sends one to the main process via
+// ai:setKey and only ever reads back redacted views (hasKey/usable booleans).
+
+import { host } from "./bridge";
+import { el, span, glyph, settingsCard, settingsField, copyText, pill, cleanErr, runBusy } from "./ui";
+import { providerLogo } from "./providerLogos";
+import { invalidateAiEnabled } from "./aiAssist";
+import { toast, confirmDialog, promptInline } from "./dialogs";
+import { trapTab } from "./views/common";
+import { registerLayer, holdBackground } from "./overlays";
+import type { AiConnectionView, AiPresetView, AiSettingsView, McpInfo } from "../shared/ipc";
+import * as l10n from "@vscode/l10n";
+
+/** Shared with the "Configure" button's title so `openGallery`'s post-add
+ *  auto-open selector (`[title="..."]`) keeps matching after translation. */
+const CONFIGURE_LABEL = l10n.t("Configure");
+
+/** Say that the set of usable models may have changed.
+ *
+ *  The Assistant gates itself ONCE, on mount, and it is a keep-alive view — so
+ *  its cached DOM was re-attached unchanged on every later visit. Connecting a
+ *  model in Settings therefore never lifted the "Connect a model" panel: the
+ *  Assistant stayed gated for the rest of the session, with a working
+ *  connection sitting behind it. */
+export function announceAiChanged(): void {
+  window.dispatchEvent(new CustomEvent("gs:ai-changed"));
+}
+
+/** The "AI Models" card: manage model connections. */
+export function aiModelsCard(): HTMLElement {
+  const { card, body } = settingsCard(l10n.t("AI Models"), "sparkle");
+
+  const render = async (): Promise<void> => {
+    // Every connect / remove / set-key / set-default re-renders this card, so this
+    // is the one chokepoint that busts the inline-AI gate's cached enabled-state.
+    invalidateAiEnabled();
+    body.replaceChildren();
+    const sub = el("div", "settings-sub");
+    sub.textContent = l10n.t(
+      "Connect any model to power the ✨ helpers and the Assistant — bring your own key, or run a local model (Ollama / LM Studio) that never leaves your machine. AI is optional and never blocks Git.",
+    );
+    body.append(sub);
+
+    /** The card's one action, built where BOTH exits can use it. */
+    const addButton = (): HTMLElement => {
+      const add = el("button", "btn btn-primary ai-add-btn");
+      add.append(glyph("add"), span(l10n.t("Connect a model")));
+      add.addEventListener("click", () => openGallery(body, render));
+      return add;
+    };
+
+    let settings: AiSettingsView;
+    try {
+      settings = await host.invoke("ai:settings", undefined);
+    } catch (e) {
+      // A FAILED READ IS NOT AN EMPTY CARD. This returned before the button
+      // below was built, so one transient error — the settings file locked, a
+      // slow disk — left the card with an error line and nothing else: no
+      // models, no way to connect one, and no way to try again short of
+      // restarting the app. The card's entire purpose, gone, for a read that
+      // would have succeeded a second later.
+      body.append(errorLine(cleanErr(e)));
+      const retry = el("button", "mini-btn");
+      retry.append(glyph("refresh"), span(l10n.t("Try again")));
+      retry.addEventListener("click", () => void render());
+      const row = el("div", "settings-actions");
+      row.append(retry, addButton());
+      body.append(row);
+      return;
+    }
+
+    if (settings.connections.length === 0) {
+      const empty = el("div", "settings-empty");
+      empty.textContent = l10n.t("No models connected yet.");
+      body.append(empty);
+    } else {
+      const list = el("div", "ai-conn-list");
+      for (const c of settings.connections) {
+        list.append(connectionRow(c, settings.defaultId === c.id, render));
+      }
+      body.append(list);
+    }
+
+    body.append(addButton());
+  };
+
+  void render();
+  return card;
+}
+
+/** One connection row with inline expand-to-edit. */
+function connectionRow(c: AiConnectionView, isDefault: boolean, refresh: () => Promise<void>): HTMLElement {
+  const row = el("div", "ai-conn");
+  const head = el("div", "ai-conn-head");
+  head.append(providerLogo(c.preset) ?? glyph(iconForWire(c)));
+
+  const meta = el("div", "ai-conn-meta");
+  const top = el("div", "ai-conn-name");
+  top.append(span(c.label));
+  if (isDefault) top.append(pill(l10n.t("Default"), "is-default"));
+  if (c.local) top.append(pill(l10n.t("Local"), "is-local"));
+  const bottom = el("div", "ai-conn-sub");
+  bottom.textContent = l10n.t(
+    "{0} · {1}",
+    c.models.mid || c.models.fast || l10n.t("no model set"),
+    hostLabel(c.baseUrl),
+  );
+  meta.append(top, bottom);
+  head.append(meta);
+
+  const status = c.usable
+    ? pill(l10n.t("Ready"), "is-ready")
+    : c.needsKey && !c.hasKey
+      ? pill(l10n.t("Needs key"), "is-warn")
+      : pill(l10n.t("Incomplete"), "is-warn");
+  head.append(status);
+
+  const actions = el("div", "ai-conn-actions");
+  if (!isDefault && c.usable) {
+    const star = iconBtn("star-empty", l10n.t("Set as default"));
+    star.addEventListener("click", () =>
+      void runBusy(star, async () => {
+        await host.invoke("ai:setDefault", { id: c.id });
+        announceAiChanged();
+        void refresh();
+      }),
+    );
+    actions.append(star);
+  }
+  const edit = iconBtn("gear", CONFIGURE_LABEL);
+  const remove = iconBtn("trash", l10n.t("Remove"));
+  actions.append(edit, remove);
+  head.append(actions);
+  row.append(head);
+
+  // Inline editor (hidden until "Configure").
+  const editor = el("div", "ai-conn-editor");
+  editor.hidden = true;
+  edit.addEventListener("click", () => {
+    if (editor.hidden) {
+      buildEditor(editor, c, refresh);
+      editor.hidden = false;
+    } else {
+      editor.hidden = true;
+    }
+  });
+  remove.addEventListener("click", async () => {
+    const ok = await confirmDialog({
+      title: l10n.t("Remove model"),
+      // Only claim the key when there IS one. A local connection that needs no
+      // key, or one you have not given a key to yet, was told its key would be
+      // deleted — a confirm that describes a consequence that cannot happen
+      // teaches people to stop reading confirms.
+      message: c.hasKey
+        ? l10n.t("Remove “{0}”? Its stored API key will be deleted from this machine.", c.label)
+        : l10n.t("Remove “{0}”?", c.label),
+      confirmLabel: l10n.t("Remove"),
+      danger: true,
+    });
+    if (!ok) return;
+    await host.invoke("ai:removeConnection", { id: c.id });
+    announceAiChanged();
+    toast(l10n.t("Model removed."), "info");
+    void refresh();
+  });
+  row.append(editor);
+  return row;
+}
+
+function buildEditor(editor: HTMLElement, c: AiConnectionView, refresh: () => Promise<void>): void {
+  editor.replaceChildren();
+  const isCli = c.wire === "cli";
+
+  const labelF = settingsField(l10n.t("Name"), c.label, "My Claude");
+  // CLI connections have no base URL or API key — they use the local binary's own
+  // login. They just take optional model overrides (mapped to `--model`).
+  const urlF = settingsField(l10n.t("API base URL"), c.baseUrl, "https://api.example.com/v1");
+  const fastF = settingsField(
+    isCli ? l10n.t("Quick model (optional)") : l10n.t("Fast model"),
+    c.models.fast,
+    l10n.t("e.g. haiku"),
+  );
+  const midF = settingsField(
+    isCli ? l10n.t("Default model (optional)") : l10n.t("Standard model"),
+    c.models.mid,
+    l10n.t("e.g. sonnet"),
+  );
+  const deepF = settingsField(
+    isCli ? l10n.t("Deep model (optional)") : l10n.t("Deep model"),
+    c.models.deep,
+    l10n.t("e.g. opus"),
+  );
+  editor.append(labelF.row);
+  if (isCli) {
+    const note = el("div", "settings-sub");
+    note.textContent = l10n.t(
+      "Runs your local CLI with its own login — no API key. Model names map to the CLI's --model flag (leave blank to use its default).",
+    );
+    editor.append(note, fastF.row, midF.row, deepF.row);
+  } else {
+    editor.append(urlF.row, fastF.row, midF.row, deepF.row);
+  }
+
+  /** The key field, when this connection has one — read by the primary Save. */
+  let keyField: HTMLInputElement | undefined;
+  if (c.needsKey) {
+    const keyRow = el("div", "settings-field");
+    const kl = el("label", "settings-field-label") as HTMLLabelElement;
+    kl.textContent = l10n.t("API key");
+    const keyInput = document.createElement("input");
+    keyInput.type = "password";
+    keyInput.className = "settings-input";
+    // UNIQUE per connection. Two open editors both carried id="gs-ai-key", so
+    // clicking one card's "API key" label focused the OTHER card's field — and
+    // the document had two elements with the same id, which is invalid and
+    // makes every label ambiguous to a screen reader.
+    keyInput.id = `gs-ai-key-${c.id}`;
+    kl.htmlFor = keyInput.id;
+    keyInput.placeholder = c.hasKey
+      ? l10n.t("•••••••• (stored — leave blank to keep)")
+      : l10n.t("Paste your API key");
+    keyRow.append(kl, keyInput);
+    editor.append(keyRow);
+    keyField = keyInput;
+
+    const saveKey = el("button", "mini-btn");
+    saveKey.append(glyph("key"), span(c.hasKey ? l10n.t("Update key") : l10n.t("Save key")));
+    saveKey.addEventListener("click", () => {
+      if (!keyInput.value.trim()) {
+        toast(l10n.t("Enter a key first."), "info");
+        return;
+      }
+      void runBusy(saveKey, async () => {
+        await host.invoke("ai:setKey", { id: c.id, key: keyInput.value.trim() });
+        announceAiChanged();
+        keyInput.value = "";
+        toast(l10n.t("Key stored securely."), "success");
+        void refresh();
+      });
+    });
+    editor.append(saveKey);
+  }
+
+  const actions = el("div", "settings-actions");
+  const save = el("button", "btn btn-primary");
+  save.append(glyph("check"), span(l10n.t("Save")));
+  save.addEventListener("click", () =>
+    void runBusy(save, async () => {
+      await host.invoke("ai:updateConnection", {
+        id: c.id,
+        label: labelF.input.value.trim() || c.label,
+        baseUrl: urlF.input.value.trim(),
+        models: { fast: fastF.input.value.trim(), mid: midF.input.value.trim(), deep: deepF.input.value.trim() },
+      });
+      // The key too. It has its own button because it goes to a different
+      // channel and a different store — but the PRIMARY button is the one
+      // labelled Save, and it used to send everything on the card EXCEPT the
+      // field you had just typed into, then say "Saved." The key was gone, and
+      // the only sign was that the placeholder still read "Paste your API key"
+      // the next time you opened the card.
+      const typedKey = keyField?.value.trim();
+      if (typedKey) {
+        await host.invoke("ai:setKey", { id: c.id, key: typedKey });
+        announceAiChanged();
+        if (keyField) keyField.value = "";
+      }
+      toast(typedKey ? l10n.t("Saved, and the key stored securely.") : l10n.t("Saved."), "success");
+      void refresh();
+    }),
+  );
+
+  const test = el("button", "mini-btn");
+  test.append(glyph("debug-start"), span(l10n.t("Test")));
+  test.addEventListener("click", async () => {
+    (test as HTMLButtonElement).disabled = true;
+    test.replaceChildren(glyph("loading"), span(l10n.t("Testing…")));
+    try {
+      const r = await host.invoke("ai:test", { id: c.id });
+      toast(r.message, r.ok ? "success" : "error");
+    } catch (e) {
+      toast(cleanErr(e), "error");
+    } finally {
+      (test as HTMLButtonElement).disabled = false;
+      test.replaceChildren(glyph("debug-start"), span(l10n.t("Test")));
+    }
+  });
+
+  actions.append(save, test);
+  editor.append(actions);
+}
+
+/**
+ * The "connect a provider" gallery — grouped into clearly-separated sections so
+ * the no-key local options (your CLI login / a local model server) are distinct
+ * from the cloud providers that need an API key.
+ */
+async function openGallery(body: HTMLElement, refresh: () => Promise<void>): Promise<void> {
+  let presets: AiPresetView[] = [];
+  try {
+    presets = await host.invoke("ai:catalog", undefined);
+  } catch {
+    presets = [];
+  }
+  const overlay = el("div", "ai-gallery-pop");
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", l10n.t("Connect a model"));
+  // Electron: an overlay over a -webkit-app-region:drag surface needs no-drag or
+  // its controls aren't clickable.
+  overlay.style.setProperty("-webkit-app-region", "no-drag");
+  const prevFocus = document.activeElement as HTMLElement | null;
+  // A layer like every other floating surface. It set `aria-modal="true"` and
+  // then did none of the three things that makes true: it was not in the
+  // registry (so a route change left it hanging over the next view), it did not
+  // hold the page behind it back (so Tab walked straight out into a board the
+  // user could not see), and it did not stand down for anything above it. Every
+  // sibling surface in the app had each of those fixed in turn; this one was
+  // never in the list.
+  let releaseBg: (() => void) | undefined;
+  const closeOverlay = (): void => {
+    layer.release();
+    releaseBg?.();
+    overlay.remove();
+    document.removeEventListener("keydown", onKey, true);
+    prevFocus?.focus?.();
+  };
+  const layer = registerLayer(() => closeOverlay(), "modal");
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.key === "Escape") {
+      // `isTop()`, NOT `ownsEscape()`. The gallery registers itself as a
+      // "modal", and `ownsEscape()` asks "is any modal open?" — which its own
+      // registration makes true, so Escape could never close it at all. The
+      // registry answers the question each surface is actually asking: is
+      // anything still open that opened after me?
+      // `isTop()` ALONE. This asked `isTop() || ownsEscape()`'s conjunction
+      // and kept the exact term that broke it: the gallery registers itself as
+      // a "modal", `ownsEscape()` asks "is any modal open?", and its own
+      // registration makes that true — so Escape could never close it at all.
+      // Every layer that can sit above this one is IN the registry (the
+      // palette and menus included), so being top is the whole question.
+      if (!layer.isTop()) return;
+      e.preventDefault();
+      closeOverlay();
+      return;
+    }
+    trapTab(e, panel);
+  };
+
+  const choose = async (p: AiPresetView): Promise<void> => {
+    closeOverlay();
+    await host.invoke("ai:addConnection", { preset: p.id });
+    // A KEYLESS preset (a local model, a CLI agent) is usable the moment it is
+    // added — no key dialog follows, so nothing else on this path announces it.
+    // The four `setKey` / `removeConnection` / `setDefault` sites all do; this
+    // one did not, and it is the only way to connect the providers that need no
+    // key at all. Their users could never lift the Assistant's gate.
+    announceAiChanged();
+    const ready = !p.needsKey;
+    toast(
+      l10n.t(
+        "Added {0}. {1}",
+        p.label,
+        ready ? l10n.t("Ready to use.") : l10n.t("Add your API key to finish."),
+      ),
+      "success",
+    );
+    await refresh();
+    // Auto-open the new connection's editor (to paste a key / pick a model).
+    const editors = body.querySelectorAll<HTMLElement>(".ai-conn");
+    const gear = editors[editors.length - 1]?.querySelector<HTMLButtonElement>(
+      `.ai-conn-actions [title="${CONFIGURE_LABEL}"]`,
+    );
+    gear?.click();
+  };
+
+  const tile = (p: AiPresetView): HTMLElement => {
+    const card = el("button", "ai-prov-card");
+    card.append(providerLogo(p.id) ?? glyph(p.icon));
+    const t = el("div", "ai-prov-meta");
+    const name = el("div", "ai-prov-name");
+    name.append(span(p.label.replace(/\s*\(local\)$/i, "")));
+    if (p.wire === "cli") name.append(pill(l10n.t("Your login"), "is-local"));
+    else if (p.local) name.append(pill(l10n.t("On-device"), "is-local"));
+    else if (!p.needsKey) name.append(pill(l10n.t("No key"), "is-ready"));
+    const blurb = el("div", "ai-prov-blurb");
+    blurb.textContent = p.blurb;
+    t.append(name, blurb);
+    card.append(t);
+    card.addEventListener("click", () => void choose(p));
+    return card;
+  };
+
+  const section = (title: string, sub: string, items: AiPresetView[]): HTMLElement | null => {
+    if (items.length === 0) return null;
+    const wrap = el("div", "ai-gallery-section");
+    const head = el("div", "ai-gallery-section-head");
+    const h = el("div", "ai-gallery-section-title");
+    h.textContent = title;
+    const s = el("div", "ai-gallery-section-sub");
+    s.textContent = sub;
+    head.append(h, s);
+    const grid = el("div", "ai-gallery");
+    for (const p of items) grid.append(tile(p));
+    wrap.append(head, grid);
+    return wrap;
+  };
+
+  const agents = presets.filter((p) => p.wire === "cli");
+  const localModels = presets.filter((p) => p.local && p.wire !== "cli");
+  const cloud = presets.filter((p) => !p.local && p.wire !== "cli");
+
+  const panel = el("div", "ai-gallery-panel");
+  const ph = el("div", "ai-gallery-head");
+  ph.append(span(l10n.t("Connect a model")));
+  const close = iconBtn("close", l10n.t("Close"));
+  close.addEventListener("click", () => closeOverlay());
+  ph.append(close);
+  panel.append(ph);
+
+  const sections = [
+    section(
+      l10n.t("Use a local agent"),
+      l10n.t("Drive a CLI you've already signed in to — no API key, your own subscription."),
+      agents,
+    ),
+    section(
+      l10n.t("Run a model locally"),
+      l10n.t("Open models on your own machine — fully private, no key."),
+      localModels,
+    ),
+    section(
+      l10n.t("Connect with an API key"),
+      l10n.t("Bring your own key from a cloud provider."),
+      cloud,
+    ),
+  ].filter((x): x is HTMLElement => x !== null);
+  for (const s of sections) panel.append(s);
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeOverlay();
+  });
+  overlay.append(panel);
+  document.body.append(overlay);
+  // AFTER the mount, so the overlay itself is not one of the elements held
+  // back. `aria-modal` is a claim; this is the mechanism behind it.
+  releaseBg = holdBackground(overlay);
+  document.addEventListener("keydown", onKey, true);
+  // Focus the first card (or the close button) so keyboard users land inside.
+  (panel.querySelector<HTMLElement>(".ai-prov-card") ?? close).focus();
+}
+
+// ── Agent Access (MCP) card ────────────────────────────────────────────────────
+
+export function agentAccessCard(): HTMLElement {
+  const { card, body } = settingsCard(l10n.t("Agent Access · MCP"), "plug");
+  let permission: "read" | "write" | "destructive" = "read";
+
+  const render = async (): Promise<void> => {
+    body.replaceChildren();
+    const sub = el("div", "settings-sub");
+    sub.textContent = l10n.t(
+      "Expose this repository's Git tools to any MCP agent — Claude Desktop, Cursor, Copilot, Windsurf — so it can inspect history, diffs and branches (and, if you allow, commit) grounded in real state. Your repo, your rules.",
+    );
+    body.append(sub);
+
+    let info: McpInfo;
+    try {
+      info = await host.invoke("ai:mcpInfo", undefined);
+    } catch (e) {
+      body.append(errorLine(cleanErr(e)));
+      return;
+    }
+
+    // The main process says WHY there is no server, and it depends on the
+    // build: a dev tree has not bundled it yet, a shipped build is broken. This
+    // line used to tell every shipped build's user to "Run `npm run build` in
+    // apps/mcp" — beside an Add button that could not work.
+    if (!info.available) {
+      const warn = el("div", "settings-empty mcp-missing");
+      warn.textContent = info.missing ?? l10n.t("The MCP server isn't available in this build.");
+      body.append(warn);
+    }
+    if (!info.repoRoot) {
+      const warn = el("div", "settings-empty");
+      warn.textContent = l10n.t("Open a repository to scope the agent's access to it.");
+      body.append(warn);
+    }
+
+    // Permission selector.
+    const permWrap = el("div", "mcp-perm");
+    const permLabel = el("div", "settings-field-label");
+    // What the next Add or Update will GRANT — not what any client currently
+    // has. This control is an argument to `ai:mcpInstall`, and it resets to
+    // Read-only every time the card is built; labelled as a state ("what the
+    // agent may do") it therefore announced Read-only over a client installed
+    // with write, and its description asserted "the agent cannot change your
+    // repository" about an agent that could.
+    permLabel.textContent = l10n.t("Grant to the next client you add or update");
+    const seg = el("div", "settings-seg");
+    const perms: Array<{ id: typeof permission; label: string }> = [
+      { id: "read", label: l10n.t("Read-only") },
+      { id: "write", label: l10n.t("+ Commit & branch") },
+      { id: "destructive", label: l10n.t("+ Discard & reset") },
+    ];
+    for (const p of perms) {
+      const b = el("button", "settings-seg-btn" + (permission === p.id ? " active" : ""));
+      b.append(span(p.label));
+      b.addEventListener("click", () => {
+        permission = p.id;
+        void render();
+      });
+      seg.append(b);
+    }
+    // Explain what the SELECTED level will grant, so the choice is never a
+    // guess — in the future tense, because it applies to the next install and
+    // not to what is already there.
+    const permDesc = el("div", "mcp-perm-desc");
+    const permDescs: Record<typeof permission, string> = {
+      read: l10n.t(
+        "Adds inspect-only access — history, diffs, branches and file contents. A client added this way cannot change your repository.",
+      ),
+      write: l10n.t(
+        "Adds everything in Read-only, plus stage, commit and create or switch branches. It won't be able to discard or rewrite existing work.",
+      ),
+      destructive: l10n.t(
+        "Adds everything above, plus discard, reset and force operations that can lose uncommitted work or rewrite history.",
+      ),
+    };
+    permDesc.textContent = permDescs[permission];
+    permWrap.append(permLabel, seg, permDesc);
+    body.append(permWrap);
+    if (permission === "destructive") {
+      const note = el("div", "mcp-danger-note");
+      note.append(
+        glyph("warning"),
+        span(l10n.t("Only enable for an agent you trust — these tools can permanently lose work.")),
+      );
+      body.append(note);
+    }
+
+    // One-click client install rows.
+    const clients = el("div", "mcp-clients");
+    for (const cl of info.clients) {
+      const r = el("div", "mcp-client");
+      r.append(glyph("plug"));
+      const m = el("div", "mcp-client-meta");
+      const n = el("div", "mcp-client-name");
+      n.append(span(cl.label));
+      // Configured, but pointing at a GitStudio that is no longer there (the
+      // app was moved after Add): not "Connected" — it cannot start. Say why,
+      // and make the one button put the current path back.
+      if (cl.installed && cl.stale) n.append(pill(l10n.t("Moved"), "is-warn"));
+      else if (cl.installed) n.append(pill(l10n.t("Connected"), "is-ready"));
+      m.append(n);
+      if (cl.stale && cl.staleReason) {
+        const why = el("div", "mcp-client-stale");
+        why.textContent = cl.staleReason;
+        m.append(why);
+      }
+      r.append(m);
+      const btn = el("button", "mini-btn") as HTMLButtonElement;
+      btn.append(
+        glyph(cl.stale ? "refresh" : cl.installed ? "sync" : "add"),
+        span(cl.stale ? l10n.t("Re-add") : cl.installed ? l10n.t("Update") : l10n.t("Add")),
+      );
+      // No server, no install: a button that can only fail is not an offer.
+      if (!info.available) {
+        btn.disabled = true;
+        btn.title = info.missing ?? l10n.t("The MCP server isn't available in this build.");
+      }
+      btn.addEventListener("click", () => void runBusy(btn, async () => {
+        try {
+          const res = await host.invoke("ai:mcpInstall", {
+            client: cl.id,
+            write: permission !== "read",
+            destructive: permission === "destructive",
+          });
+          toast(res.message, res.ok ? "success" : res.expected ? "info" : "error");
+          if (res.ok) void render();
+        } catch (e) {
+          toast(cleanErr(e), "error");
+        }
+      }));
+      r.append(btn);
+      clients.append(r);
+    }
+    body.append(clients);
+
+    // Manual config snippet (copy) — only when it could work. With no server,
+    // or from a translocated copy or a disk image whose path vanishes, it names a
+    // command no client could run, and copying it is Add without the refusal.
+    if (!info.available) return;
+    const snippet = buildSnippet(info, permission);
+    const codeWrap = el("div", "mcp-snippet");
+    const codeHead = el("div", "mcp-snippet-head");
+    codeHead.append(span(l10n.t("Or paste this into any MCP client")));
+    const copyBtn = el("button", "icon-btn");
+    copyBtn.title = l10n.t("Copy config");
+    copyBtn.append(glyph("copy"));
+    copyBtn.addEventListener("click", () => void copyText(snippet, l10n.t("MCP config copied.")));
+    codeHead.append(copyBtn);
+    const pre = el("pre", "mcp-snippet-code");
+    pre.textContent = snippet;
+    codeWrap.append(codeHead, pre);
+    body.append(codeWrap);
+  };
+
+  void render();
+  return card;
+}
+
+/**
+ * The paste-it-yourself config, for the permission picked here.
+ *
+ * The command and env come from the main process, the same values Add writes.
+ * This spelled its own `command: "node"` — the twin of the one the installer
+ * had — so fixing only the installer would have left the snippet launching a
+ * runtime the user may not have.
+ */
+function buildSnippet(info: McpInfo, permission: "read" | "write" | "destructive"): string {
+  const args = [info.binPath];
+  if (info.repoRoot) args.push("--repo", info.repoRoot);
+  if (permission === "destructive") args.push("--allow-destructive");
+  else if (permission === "write") args.push("--write");
+  return JSON.stringify(
+    { mcpServers: { gitstudio: { command: info.command, args, env: info.env } } },
+    null,
+    2,
+  );
+}
+
+// ── small helpers ──────────────────────────────────────────────────────────────
+
+function iconBtn(icon: string, title: string): HTMLElement {
+  const b = el("button", "icon-btn");
+  b.title = title;
+  b.append(glyph(icon));
+  return b;
+}
+
+function iconForWire(c: AiConnectionView): string {
+  if (c.local) return "vm";
+  if (c.preset === "openrouter" || c.preset === "together") return "globe";
+  if (c.preset === "groq") return "zap";
+  return "sparkle";
+}
+
+function hostLabel(url: string): string {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url || l10n.t("no endpoint");
+  }
+}
+
+function errorLine(msg: string): HTMLElement {
+  const e = el("div", "settings-empty");
+  e.textContent = msg || l10n.t("Something went wrong.");
+  return e;
+}

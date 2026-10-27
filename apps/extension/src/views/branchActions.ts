@@ -1,0 +1,1207 @@
+import * as vscode from "vscode";
+import { failed, NO_REPOSITORY } from "../ui/notify";
+import type { GitContext } from "@gitstudio/git-service/index";
+import type { GitRef, GitRefType } from "@gitstudio/host-bridge/git";
+import type { RepoManager, RepoEntry, UndoOptions } from "../git/repoManager";
+import { pausedForUser, type OperationMarker } from "../git/pausedForUser";
+import { notifyPaused } from "../git/pauseNotice";
+import { applyOrAsk, checkoutOp, type Applied } from "../git/inTheWay";
+import { listedRefCheckout, resolveListedRef } from "./refCheckout";
+import { explainOptionLikeCheckout } from "./optionLikeBranch";
+import { refShortName } from "@gitstudio/git-service/checkoutRef";
+import { branchNameOf, remoteBranchOf } from "@gitstudio/git-service/BranchOps";
+import {
+  promptConfirm,
+  promptInput,
+  promptPick,
+  type DialogChoice,
+} from "../ui/dialogs";
+import { worktreeFromRef } from "./worktreesView";
+import { saidCheckedOutElsewhere } from "./branchElsewhere";
+import { pruneOnFetch } from "../git/fetchOptions";
+import {
+  askOverLocalBranch,
+  isCheckedOutHere,
+  resetBranchTo,
+  type BranchUndoRunner,
+} from "./branchReset";
+import * as l10n from "@vscode/l10n";
+
+// Branch / remote / tag context-menu actions for the Branches view. Each runs a
+// real git op via the GitContext provider methods, confirms destructive ops, and
+// routes merge / rebase / delete through the universal Undo envelope.
+//
+// The tree nodes carry a `ref: GitRef`; commands receive that node. A few title
+// actions (new branch, fetch, manage remotes) take no node.
+
+/** The shape branchesView's RefNode exposes (just the ref). */
+interface RefNodeLike {
+  readonly ref: GitRef;
+}
+
+function refOf(arg: unknown): GitRef | undefined {
+  if (arg && typeof arg === "object" && "ref" in arg) {
+    return (arg as RefNodeLike).ref;
+  }
+  return undefined;
+}
+
+/**
+ * The ref a command was invoked on (from a tree/graph node), or — when the
+ * command is run from the Command Palette with no node — one the user picks from
+ * a GitStudio dialog. This is what gives tag / remote-branch / set-upstream
+ * commands a real home in the palette instead of silently no-op'ing without a
+ * node.
+ */
+async function refOrPick(
+  a: RepoEntry,
+  arg: unknown,
+  type: GitRefType,
+  title: string,
+  icon: string,
+): Promise<GitRef | undefined> {
+  const direct = refOf(arg);
+  if (direct) {
+    return direct;
+  }
+  let refs: GitRef[] = [];
+  try {
+    refs = await a.ctx.refs.listRefs();
+  } catch {
+    /* ignore — handled as "none" below */
+  }
+  const candidates = refs.filter((r) => r.type === type);
+  if (candidates.length === 0) {
+    const noun =
+      type === "head"
+        ? l10n.t("branches")
+        : type === "remote"
+          ? l10n.t("remote branches")
+          : type === "tag"
+            ? l10n.t("tags")
+            : l10n.t("stashes");
+    void vscode.window.showInformationMessage(
+      l10n.t("GitStudio: this repository has no {0} to choose from.", noun),
+    );
+    return undefined;
+  }
+  const id = await promptPick({
+    title,
+    choices: candidates.map((r) => ({
+      id: r.name,
+      label: r.name,
+      icon,
+      detail: r.sha.slice(0, 7),
+    })),
+  });
+  return candidates.find((r) => r.name === id);
+}
+
+function active(repos: RepoManager): RepoEntry | undefined {
+  const a = repos.getActive();
+  if (!a) {
+    void vscode.window.showInformationMessage(NO_REPOSITORY);
+  }
+  return a;
+}
+
+// ── Local branch actions ─────────────────────────────────────────────────────
+
+export async function checkoutBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const ref = refOf(arg);
+  if (!a || !ref) {
+    return;
+  }
+  await runRefCheckout(repos, a, ref, refresh);
+}
+
+/**
+ * Check out `ref` by its FULL name — every checkout door in this file comes
+ * through here. `ref.name` is `%(refname:short)`: beside a tag of the same
+ * name a branch is "heads/release", and `git checkout heads/release` detached
+ * HEAD under a toast saying it had checked the branch out. The Changes view's
+ * branch menu sends a name and a type only; the full name is then looked up
+ * in the ref list, never rebuilt (refCheckout.ts).
+ *
+ * The planned switch runs through the shared door: uncommitted work in its
+ * way is said, with Stash & Retry, instead of git's text in red.
+ *
+ * A remote branch whose local branch has commits of its own is asked about
+ * first — switch to the local one, or reset it to the remote's (#32; see
+ * askOverLocalBranch). The graph's chips ask the same (commitActions).
+ */
+async function runRefCheckout(
+  repos: RepoManager,
+  a: RepoEntry,
+  ref: GitRef,
+  refresh: () => void,
+): Promise<void> {
+  const c = await listedRefCheckout(a.ctx, ref);
+  if (c.kind === "optionLike") {
+    // The branch IS here — its name starts with "-", which git would read as
+    // an option. Refreshing would change nothing; say so, offer the rename.
+    await explainOptionLikeCheckout(a.ctx, c.refusal, c.fullName, refresh);
+    return;
+  }
+  if (c.kind === "missing") {
+    void vscode.window.showErrorMessage(
+      l10n.t("GitStudio: {0} is not in this repository any more — refresh and try again.", ref.name),
+    );
+    return;
+  }
+  // The branch it lands on is checked out in another worktree: git refuses
+  // ("already used by worktree at …"). Said where, before anything is asked.
+  if (await saidCheckedOutElsewhere(a.ctx, c.plan.branch, "checkout")) {
+    return;
+  }
+  if (c.fullName.startsWith("refs/remotes/")) {
+    const over = await askOverLocalBranch(a.ctx, c.fullName);
+    if (over.choice === "cancel") {
+      return;
+    }
+    if (over.choice === "reset") {
+      if (!(await resetBranchTo(a.ctx, over.localFullName, c.fullName, branchUndo(repos, a)))) {
+        return; // backed out, refused, or nothing to reset — said there
+      }
+      refresh();
+      if (await isCheckedOutHere(a.ctx, over.localFullName)) {
+        return; // it was the checked-out branch: already where the checkout would land
+      }
+    }
+  }
+  const plan = c.plan;
+  await reportApplied(await applyOrAsk(a.ctx, checkoutOp(plan.args)), plan.success, refresh, l10n.t("Checkout"));
+}
+
+/**
+ * The ref an action was invoked on, AS GIT LISTS IT — with the full name every
+ * branch action now hands git (issue #30's follow-up). A tree node carries its
+ * full name already; the Changes view's branch menu sends a name and a type
+ * only, and the full name is looked up in the ref list by both (refCheckout.ts)
+ * — never rebuilt from the short name, which is "heads/release" beside a tag
+ * "release" and names nothing under refs/heads/. Says so and resolves
+ * undefined when the list has no such ref.
+ */
+async function listedRef(a: RepoEntry, ref: GitRef): Promise<GitRef & { fullName: string } | undefined> {
+  const hit = await resolveListedRef(a.ctx, ref);
+  if (!hit) {
+    void vscode.window.showErrorMessage(
+      l10n.t("GitStudio: {0} is not in this repository any more — refresh and try again.", ref.name),
+    );
+    return undefined;
+  }
+  return { ...ref, ...hit, fullName: hit.fullName };
+}
+
+/** How a ref is NAMED to a person: its full name shorn of the namespace —
+ *  "release", not git's disambiguated "heads/release". */
+function shown(ref: { fullName: string }): string {
+  return refShortName(ref.fullName);
+}
+
+/** The name `git tag -d` / a refs/tags/ refspec takes: the part under refs/tags/. */
+function tagNameOf(fullName: string): string | undefined {
+  return fullName.startsWith("refs/tags/") ? fullName.slice("refs/tags/".length) || undefined : undefined;
+}
+
+/** The name `git branch` takes for a listed local branch (see branchNameOf). */
+function localName(ref: { fullName: string; name: string }): string | undefined {
+  const name = branchNameOf(ref.fullName);
+  if (!name) {
+    void vscode.window.showErrorMessage(l10n.t("GitStudio: {0} is not a local branch.", ref.name));
+  }
+  return name;
+}
+
+/**
+ * HEAD as a merge or rebase question names it when it is on no branch —
+ * "HEAD (a1b2c3d)", as the branch menu's item does — or undefined on a branch.
+ */
+async function detachedHead(a: RepoEntry): Promise<string | undefined> {
+  try {
+    const head = await a.ctx.refs.getHead();
+    return head.detached && head.sha ? `HEAD (${head.sha.slice(0, 7)})` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function mergeBranchIntoCurrent(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a || !arg0) {
+    return;
+  }
+  const ref = await listedRef(a, arg0);
+  if (!ref) {
+    return;
+  }
+  const name = shown(ref);
+  // On a detached HEAD there is no current branch to name, and the merge
+  // commit lands on no branch.
+  const detached = await detachedHead(a);
+  const ok = await promptConfirm({
+    title: detached ? l10n.t("Merge {0} into {1}?", name, detached) : l10n.t("Merge {0} into the current branch?", name),
+    message:
+      l10n.t("Its commits join your history. If the two sides touched the same lines you'll get conflicts to resolve, and Undo can take you back either way.") +
+      (detached ? l10n.t(" HEAD is on no branch, so the merge is on no branch either: create a branch from it to keep it.") : ""),
+    confirmLabel: l10n.t("Merge"),
+  });
+  if (!ok) {
+    return;
+  }
+  await withUndo(repos, a, l10n.t("Merge {0}", name), async () => {
+    // By its FULL name: the bare "release" is the TAG beside a tag of that
+    // name, and git's "heads/release" merged the branch under the words
+    // "Merge branch 'heads/release'". BranchOps.merge records "Merge branch
+    // 'release'" for a full name, the way git would for an unambiguous one —
+    // and its argv (mergeArgs) runs through the shared door: uncommitted work
+    // in the merge's way is said, with Stash & Retry.
+    const args = await a.ctx.branches.mergeArgs(ref.fullName);
+    const applied = await applyOrAsk(a.ctx, { kind: "merge", target: ref.fullName, args });
+    if (applied.cancelled || applied.settled) {
+      if (applied.settled) refresh();
+      // Cancelled: nothing ran, and the envelope must not record an edit
+      // saved while the question was open as the merge's.
+      return applied.cancelled ? { cancelled: true } : undefined;
+    }
+    const result = { ok: applied.result.code === 0, code: applied.result.code, stderr: applied.result.stderr };
+    await reportMergeLike(
+      a.ctx,
+      result,
+      l10n.t("Merged {0}", name),
+      l10n.t("Merge"),
+      "MERGE_HEAD",
+      refresh,
+    );
+  });
+}
+
+export async function rebaseCurrentOnto(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a || !arg0) {
+    return;
+  }
+  const ref = await listedRef(a, arg0);
+  if (!ref) {
+    return;
+  }
+  const name = shown(ref);
+  // On a detached HEAD there is no current branch to name, and nothing to
+  // push: the rewritten commits land on no branch.
+  const detached = await detachedHead(a);
+  const ok = await promptConfirm({
+    title: detached ? l10n.t("Rebase {0} onto {1}?", detached, name) : l10n.t("Rebase the current branch onto {0}?", name),
+    message: detached
+      ? l10n.t("The commits HEAD has that {0} does not are rewritten on top of it, so they get new shas. HEAD is on no branch, so they are on no branch either: create a branch from them to keep them. Undo can take you back.", name)
+      : l10n.t("Your local commits are rewritten on top of {0}, so they get new shas. If you have already pushed them, the next push needs a force. Undo can take you back.", name),
+    confirmLabel: l10n.t("Rebase"),
+  });
+  if (!ok) {
+    return;
+  }
+  await withUndo(repos, a, l10n.t("Rebase onto {0}", name), async () => {
+    // By its full name — the bare one is the tag's, beside a tag of that name.
+    // A rebase needs a clean tree: a refusal over the user's work is said,
+    // with Stash & Retry, instead of git's "cannot rebase: You have unstaged
+    // changes" in red.
+    const applied = await applyOrAsk(a.ctx, { kind: "rebase", onto: ref.fullName, args: ["rebase", ref.fullName] });
+    if (applied.cancelled || applied.settled) {
+      if (applied.settled) refresh();
+      // Cancelled: nothing ran (see Merge).
+      return applied.cancelled ? { cancelled: true } : undefined;
+    }
+    const result = { ok: applied.result.code === 0, code: applied.result.code, stderr: applied.result.stderr };
+    await reportMergeLike(
+      a.ctx,
+      result,
+      l10n.t("Rebased onto {0}", name),
+      l10n.t("Rebase"),
+      "REBASE_HEAD",
+      refresh,
+    );
+  });
+}
+
+export async function renameBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a || !arg0) {
+    return;
+  }
+  const ref = await listedRef(a, arg0);
+  const old = ref && localName(ref);
+  if (!ref || !old) {
+    return;
+  }
+  // The name under refs/heads/: `git branch -m heads/release …` beside a tag
+  // "release" is "fatal: no branch named 'heads/release'", and the box
+  // offered that as the name to edit.
+  const neu = await promptInput({
+    title: l10n.t("Rename branch {0}", old),
+    hint: l10n.t("Only the local name changes — the commits and the remote branch stay where they are."),
+    value: old,
+    confirmLabel: l10n.t("Rename"),
+    validate: "refName",
+  });
+  if (!neu || neu === old) {
+    return;
+  }
+  const result = await a.ctx.branches.rename(old, neu);
+  if (!result.ok) {
+    report(result, l10n.t("Renamed to {0}", neu), refresh, l10n.t("Rename branch"));
+    return;
+  }
+  await reconcileUpstreamAfterRename(a, old, neu, refresh);
+  report(result, l10n.t("Renamed to {0}", neu), refresh, l10n.t("Rename branch"));
+}
+
+/**
+ * A rename leaves a published branch tracking its OLD name on the remote.
+ *
+ * `git branch -m` deliberately keeps the tracking config, because the branch on
+ * the server was not renamed — so `branch.<new>.merge` still says
+ * `refs/heads/<old>`. Everything downstream then quietly refers to the old
+ * branch: the push modal targets it, the ↑/↓ badges count against it, and a
+ * push either lands on the old name or is refused outright depending on the
+ * user's `push.default`. Renaming and then pushing "into the new branch" is the
+ * obvious thing to want, and it silently did not happen.
+ *
+ * Git can't decide this for us — tracking a differently-named branch is legal
+ * and sometimes deliberate — so ask, with the overwhelmingly common intent
+ * first. Only fires when the upstream actually named the OLD branch; a branch
+ * that was already tracking something else is left alone.
+ */
+async function reconcileUpstreamAfterRename(
+  a: RepoEntry,
+  oldName: string,
+  newName: string,
+  refresh: () => void,
+): Promise<void> {
+  let upstream: { remote: string; branch: string } | null = null;
+  try {
+    upstream = await a.ctx.branches.upstreamOf(newName);
+  } catch {
+    return; // never let this block the rename that already succeeded
+  }
+  if (!upstream || upstream.branch !== oldName) {
+    return; // unpublished, or deliberately tracking some other branch
+  }
+  const { remote } = upstream;
+
+  const choice = await promptPick({
+    title: l10n.t("Rename {0} on {1} too?", oldName, remote),
+    hint: l10n.t("This branch still tracks {0}/{1} — renaming locally doesn't rename it on the remote.", remote, oldName),
+    choices: [
+      {
+        id: "rename",
+        label: l10n.t("Rename on {0}", remote),
+        icon: "cloud-upload",
+        description: l10n.t("Push {0}, track it, and delete {1}/{2}.", newName, remote, oldName),
+      },
+      {
+        id: "publish",
+        label: l10n.t("Publish {0}, keep {1}", newName, oldName),
+        icon: "repo-forked",
+        description: l10n.t("Push {0} and track it, but leave {1}/{2} in place.", newName, remote, oldName),
+      },
+      {
+        id: "keep",
+        label: l10n.t("Keep tracking {0}/{1}", remote, oldName),
+        icon: "link",
+        description: l10n.t("Git's default. The new name stays local-only."),
+      },
+    ],
+  });
+  if (!choice || choice === "keep") {
+    return;
+  }
+
+  // push-force-reviewed: publishes an unpublished branch (the user just
+  // chose a remote for it), so no remote history exists to overwrite.
+  const pushed = await a.ctx.sync.push({
+    remote,
+    branch: newName,
+    setUpstream: true,
+  });
+  if (!pushed.ok) {
+    void vscode.window.showErrorMessage(
+      l10n.t("GitStudio: renamed locally, but publishing {0} failed{1}. It still tracks {2}/{3}.", newName, pushed.stderr ? ` — ${pushed.stderr.trim()}` : "", remote, oldName),
+    );
+    return;
+  }
+  if (choice === "publish") {
+    flash(l10n.t("Published {0} to {1}", newName, remote));
+    refresh();
+    return;
+  }
+
+  // "rename": the old remote branch has served its purpose. Deleting it is the
+  // destructive half, so a failure here is reported but never undoes the push.
+  const removed = await a.ctx.branches.deleteRemoteBranch(remote, oldName);
+  if (!removed.ok) {
+    void vscode.window.showWarningMessage(
+      l10n.t("GitStudio: {0} is published and tracked, but {1}/{2} could not be deleted{3}.", newName, remote, oldName, removed.stderr ? ` — ${removed.stderr.trim()}` : ""),
+    );
+  } else {
+    flash(l10n.t("Renamed on {0}: {1} → {2}", remote, oldName, newName));
+  }
+  refresh();
+}
+
+export async function deleteBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a || !arg0) {
+    return;
+  }
+  const ref = await listedRef(a, arg0);
+  const name = ref && localName(ref);
+  if (!ref || !name) {
+    return;
+  }
+  // Another worktree has it checked out: git refuses the delete. Said where,
+  // instead of asking "Delete branch x?" and then showing git's refusal.
+  if (await saidCheckedOutElsewhere(a.ctx, ref.fullName, "delete")) {
+    return;
+  }
+  const ok = await confirm(
+    l10n.t("Delete branch {0}?", name),
+    l10n.t("The branch label is removed. Its commits stay reachable from anywhere else that points at them, and GitStudio's Undo can put the branch back."),
+    l10n.t("Delete"),
+  );
+  if (!ok) {
+    return;
+  }
+  // Refs only: the second question below is open while the envelope is,
+  // and what the user saves meanwhile is theirs, not the delete's.
+  await withUndo(
+    repos,
+    a,
+    l10n.t("Delete branch {0}", name),
+    async () => {
+      // The name under refs/heads/ — git's "heads/release" names no branch.
+      let result = await a.ctx.branches.delete(name);
+      if (!result.ok && /not fully merged/i.test(result.stderr)) {
+        const force = await confirm(
+          `${name} is not fully merged`,
+          l10n.t("Some of its commits are not on any other branch, so deleting it may leave them unreachable. Undo can still recover them."),
+          l10n.t("Force Delete"),
+        );
+        if (!force) {
+          return { cancelled: true };
+        }
+        result = await a.ctx.branches.delete(name, { force: true });
+      }
+      report(result, l10n.t("Deleted {0}", name), refresh, l10n.t("Delete branch"));
+      return undefined;
+    },
+    { refsOnly: true },
+  );
+}
+
+/**
+ * `gitstudio.branch.resetToUpstream` — the branch menu's "Reset to
+ * 'origin/feature'…" (#32): make a local branch match the remote branch it
+ * tracks. Fetches, asks (saying what would be lost), and runs under Undo —
+ * see branchReset.ts.
+ */
+export async function resetBranchToUpstream(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a || !arg0) {
+    return;
+  }
+  // The LISTED ref, by its full name: the menu sends a name and a type, and
+  // beside a tag of the same name the short one is the tag's.
+  const ref = await listedRef(a, arg0);
+  if (!ref || !localName(ref)) {
+    return;
+  }
+  if (await resetBranchTo(a.ctx, ref.fullName, undefined, branchUndo(repos, a))) {
+    refresh();
+  }
+}
+
+export async function pushBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a || !arg0) {
+    return;
+  }
+  // The LISTED ref: the Changes view's menu sends a name and a type, with no
+  // upstream — and read off that, every tracked branch looked unpublished.
+  const ref = await listedRef(a, arg0);
+  const name = ref && localName(ref);
+  if (!ref || !name) {
+    return;
+  }
+  // If no upstream, offer to publish (set-upstream).
+  const upstream = ref.upstream;
+  if (!upstream) {
+    const remotes = await a.ctx.remotes.list();
+    const remote = await pickRemote(remotes, l10n.t("Publish to which remote?"));
+    if (!remote) {
+      return;
+    }
+    // push-force-reviewed: publish with --set-upstream; nothing on the
+    // remote yet. By the name under refs/heads/ — SyncOps qualifies it, and
+    // "heads/release" qualified is refs/heads/heads/release, which is nothing.
+    const result = await a.ctx.sync.push({
+      remote,
+      branch: name,
+      setUpstream: true,
+    });
+    report(result, l10n.t("Published {0} to {1}", name, remote), refresh, l10n.t("Publish"));
+    return;
+  }
+  // Push the ref we were invoked ON, not whatever happens to be checked out.
+  // A bare push() pushes the CURRENT branch, so invoking this on any other
+  // branch pushed the wrong one and then reported the right one's name.
+  const slash = upstream.indexOf("/");
+  const remote = slash > 0 ? upstream.slice(0, slash) : undefined;
+  const result = remote
+    // push-force-reviewed: pushes ANOTHER branch, not the checked-out one,
+    // so an amend of HEAD cannot put it in a diverged state. A force here
+    // would need its own ahead/behind check against that branch's upstream.
+    ? await a.ctx.sync.push({ remote, branch: name })
+    : await a.ctx.sync.push();
+  report(result, l10n.t("Pushed {0}", name), refresh, l10n.t("Push"));
+}
+
+export async function setUpstream(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const picked = await refOrPick(
+    a,
+    arg,
+    "head",
+    l10n.t("Set the upstream for which branch?"),
+    "git-branch",
+  );
+  const ref = picked && (await listedRef(a, picked));
+  const name = ref && localName(ref);
+  if (!ref || !name) {
+    return;
+  }
+  let refs: GitRef[] = [];
+  try {
+    refs = await a.ctx.refs.listRefs();
+  } catch {
+    /* ignore */
+  }
+  // A remote's HEAD pointer is not a branch to track.
+  const remoteBranches = refs.filter((r) => r.type === "remote" && !r.symref);
+  // Picked by FULL name, handed to git as one: `--set-upstream-to` resolves a
+  // bare name like any revision, and a local branch or tag sharing a
+  // remote-tracking branch's short name would answer first.
+  const upstream = await promptPick({
+    title: l10n.t("Set upstream for {0}", name),
+    hint: l10n.t("The remote-tracking branch this branch pushes to and compares against."),
+    choices: remoteBranches.map((r) => ({
+      id: r.fullName,
+      label: refShortName(r.fullName),
+      icon: "cloud",
+      detail: r.sha.slice(0, 7),
+    })),
+  });
+  if (!upstream) {
+    return;
+  }
+  const result = await a.ctx.branches.setUpstream(name, upstream);
+  report(result, l10n.t("Set upstream of {0} → {1}", name, refShortName(upstream)), refresh, l10n.t("Set upstream"));
+}
+
+export async function newBranchFrom(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const arg0 = refOf(arg);
+  if (!a) {
+    return;
+  }
+  // The start point by its FULL name: a bare "release" beside a tag of that
+  // name starts the branch at the TAG. (git's "heads/release" happened to
+  // resolve — but it is the same short form every other door has stopped
+  // handing git, and the prompt read it out.)
+  const ref = arg0 ? await listedRef(a, arg0) : undefined;
+  if (arg0 && !ref) {
+    return;
+  }
+  const startPoint = ref?.fullName;
+  const from = ref ? shown(ref) : undefined;
+  const name = await promptInput({
+    title: from ? l10n.t("New branch from {0}", from) : l10n.t("New branch"),
+    hint: from
+      ? l10n.t("The branch starts at {0}.", from)
+      : l10n.t("The branch starts at HEAD."),
+    placeholder: "feature/my-branch",
+    confirmLabel: l10n.t("Continue"),
+    validate: "refName",
+  });
+  if (!name) {
+    return;
+  }
+  const checkout = await promptPick({
+    title: l10n.t("Create {0}", name),
+    hint: l10n.t("Switch to the new branch after creating it?"),
+    choices: [
+      {
+        id: "switch",
+        label: l10n.t("Create and Switch"),
+        icon: "git-branch",
+        description: l10n.t("Create the branch and check it out."),
+      },
+      {
+        id: "only",
+        label: l10n.t("Create Only"),
+        icon: "add",
+        description: l10n.t("Create the branch and stay on the current one."),
+      },
+    ],
+  });
+  if (checkout === undefined) {
+    return;
+  }
+  if (checkout === "switch") {
+    // Switching to a branch that starts somewhere else is a checkout, and is
+    // refused the same way over uncommitted work in its way.
+    await reportApplied(
+      await applyOrAsk(a.ctx, checkoutOp(["checkout", "-b", name, ...(startPoint ? [startPoint] : [])])),
+      l10n.t("Created {0}", name),
+      refresh,
+      l10n.t("Create branch"),
+    );
+    return;
+  }
+  report(await a.ctx.branches.create(name, startPoint), l10n.t("Created {0}", name), refresh, l10n.t("Create branch"));
+}
+
+/** "Create worktree for this branch" — pick a folder, add a worktree on `ref`.
+ *  Delegates to the shared worktree flow so it can also create a new named
+ *  branch from this ref (including remote branches), from any current branch. */
+export async function createWorktreeForBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  const ref = refOf(arg);
+  if (!a || !ref) {
+    return;
+  }
+  await worktreeFromRef(repos, ref, refresh);
+}
+
+// ── Remote branch actions ────────────────────────────────────────────────────
+
+export async function checkoutRemoteBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const ref = await refOrPick(
+    a,
+    arg,
+    "remote",
+    l10n.t("Check out which remote branch?"),
+    "cloud",
+  );
+  if (!ref) {
+    return;
+  }
+  // Straight to the branch — no name prompt. Renaming is a separate thing you
+  // can do afterwards, and "New Branch From Here…" already covers landing on a
+  // different name in one step. planRefCheckout hands a refs/remotes/ name to
+  // planRemoteCheckout, which switches to a local branch of that name or
+  // creates one tracking the remote.
+  await runRefCheckout(repos, a, ref, refresh);
+}
+
+export async function deleteRemoteBranch(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const picked = await refOrPick(
+    a,
+    arg,
+    "remote",
+    l10n.t("Delete which remote branch?"),
+    "cloud",
+  );
+  const ref = picked && (await listedRef(a, picked));
+  if (!ref) {
+    return;
+  }
+  // refs/remotes/origin/feature → remote "origin", branch "feature" — from
+  // the full name: the short one is "remotes/origin/feature" beside a local
+  // branch called "origin/feature", and split at its first slash that named
+  // a remote called "remotes".
+  const pair = remoteBranchOf(ref.fullName);
+  if (!pair) {
+    return;
+  }
+  const { remote, branch } = pair;
+  const ok = await confirm(
+    l10n.t("Delete {0} on {1}?", branch, remote),
+    l10n.t("This removes the branch from the remote for everyone, not just from your copy. Your local {0} (if you have one) is untouched.", branch),
+    l10n.t("Delete Remote Branch"),
+  );
+  if (!ok) {
+    return;
+  }
+  const result = await a.ctx.branches.deleteRemoteBranch(remote, branch);
+  report(result, l10n.t("Deleted {0}/{1}", remote, branch), refresh, l10n.t("Delete remote branch"));
+}
+
+// ── Tag actions ──────────────────────────────────────────────────────────────
+
+export async function checkoutTag(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const ref = await refOrPick(a, arg, "tag", l10n.t("Select a tag to check out"), "tag");
+  if (!ref) {
+    return;
+  }
+  const ok = await promptConfirm({
+    title: l10n.t("Check out tag {0}?", ref.name),
+    message:
+      l10n.t("You'll be on a detached HEAD — commits made here belong to no branch until you create one."),
+    confirmLabel: l10n.t("Checkout"),
+  });
+  if (!ok) {
+    return;
+  }
+  // `checkout --detach refs/tags/<name>`: by the full name, the detach lands
+  // on the TAG even where a branch shares the name.
+  await runRefCheckout(repos, a, ref, refresh);
+}
+
+export async function deleteTag(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const picked = await refOrPick(a, arg, "tag", l10n.t("Select a tag to delete"), "tag");
+  const ref = picked && (await listedRef(a, picked));
+  const name = ref && tagNameOf(ref.fullName);
+  if (!ref || !name) {
+    return;
+  }
+  const ok = await confirm(
+    l10n.t("Delete tag {0}?", name),
+    l10n.t("This deletes the tag locally. If it was already pushed, it stays on the remote until you delete it there too."),
+    l10n.t("Delete"),
+  );
+  if (!ok) {
+    return;
+  }
+  // The name under refs/tags/: beside a branch "release" the tag lists as
+  // "tags/release", and `git tag -d tags/release` finds no such tag.
+  const result = await a.ctx.tags.delete(name);
+  report(result, l10n.t("Deleted tag {0}", name), refresh, l10n.t("Delete tag"));
+}
+
+export async function pushTag(
+  repos: RepoManager,
+  arg: unknown,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const picked = await refOrPick(a, arg, "tag", l10n.t("Select a tag to push"), "tag");
+  const ref = picked && (await listedRef(a, picked));
+  const name = ref && tagNameOf(ref.fullName);
+  if (!ref || !name) {
+    return;
+  }
+  const remotes = await a.ctx.remotes.list();
+  const remote = await pickRemote(remotes, l10n.t("Push {0} to which remote?", name));
+  if (!remote) {
+    return;
+  }
+  // TagOps qualifies it as refs/tags/<name>; "tags/release" would have been
+  // refs/tags/tags/release, which is nothing.
+  const result = await a.ctx.tags.push(remote, name);
+  report(result, l10n.t("Pushed tag {0} to {1}", name, remote), refresh, l10n.t("Push tag"));
+}
+
+// ── Title actions ────────────────────────────────────────────────────────────
+
+export async function fetchAll(
+  repos: RepoManager,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const result = await a.ctx.sync.fetch({ all: true, prune: pruneOnFetch() });
+  report(result, l10n.t("Fetched all remotes"), refresh, l10n.t("Fetch"));
+}
+
+/** `gitstudio.addRemote` — add a new remote. */
+export async function addRemote(
+  repos: RepoManager,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const name = await promptInput({
+    title: l10n.t("Add remote"),
+    hint: l10n.t("The short name you'll refer to it by — origin, upstream, fork."),
+    placeholder: "origin",
+    confirmLabel: l10n.t("Continue"),
+    validate: "remoteName",
+  });
+  if (!name) {
+    return;
+  }
+  const url = await promptInput({
+    title: l10n.t("Add remote {0}", name),
+    hint: l10n.t("An https:// URL, an ssh URL, git@host:owner/repo.git, or a local path."),
+    placeholder: "https://github.com/owner/repo.git",
+    confirmLabel: l10n.t("Add Remote"),
+    validate: "url",
+  });
+  if (!url) {
+    return;
+  }
+  const result = await a.ctx.remotes.add(name.trim(), url.trim());
+  report(result, l10n.t("Added remote {0}", name), refresh, l10n.t("Add remote"));
+}
+
+/** `gitstudio.manageRemotes` — pick a remote, then an action. */
+export async function manageRemotes(
+  repos: RepoManager,
+  refresh: () => void,
+): Promise<void> {
+  const a = active(repos);
+  if (!a) {
+    return;
+  }
+  const remotes = await a.ctx.remotes.list();
+  if (remotes.length === 0) {
+    const add = await promptConfirm({
+      title: l10n.t("No remotes configured"),
+      message:
+        l10n.t("This repository has no remotes, so there is nothing to fetch from or push to."),
+      confirmLabel: l10n.t("Add Remote…"),
+    });
+    if (add) {
+      await addRemote(repos, refresh);
+    }
+    return;
+  }
+  // A sentinel id no remote can collide with: git forbids ":" in a remote name.
+  const ADD = "gitstudio:add-remote";
+  const pickedRemote = await promptPick({
+    title: l10n.t("Manage remotes"),
+    choices: [
+      ...remotes.map((r) => ({
+        id: r.name,
+        label: r.name,
+        icon: "cloud",
+        description: r.fetchUrl,
+      })),
+      { id: ADD, label: l10n.t("Add remote…"), icon: "add" },
+    ],
+  });
+  if (!pickedRemote) {
+    return;
+  }
+  if (pickedRemote === ADD) {
+    await addRemote(repos, refresh);
+    return;
+  }
+  const remote = remotes.find((r) => r.name === pickedRemote);
+  if (!remote) {
+    return;
+  }
+
+  const action = await promptPick({
+    title: l10n.t("Remote: {0}", remote.name),
+    hint: remote.fetchUrl,
+    choices: [
+      { id: "fetch", label: l10n.t("Fetch"), icon: "sync", description: l10n.t("Update this remote's branches.") },
+      { id: "prune", label: l10n.t("Prune Stale Branches"), icon: "trash", description: l10n.t("Drop remote-tracking branches that no longer exist on the server.") },
+      { id: "url", label: l10n.t("Edit URL"), icon: "link", description: remote.fetchUrl },
+      { id: "rename", label: l10n.t("Rename"), icon: "edit" },
+      { id: "remove", label: l10n.t("Remove"), icon: "trash", danger: true },
+    ],
+  });
+  if (!action) {
+    return;
+  }
+  switch (action) {
+    case "fetch":
+      report(
+        await a.ctx.remotes.fetch(remote.name, { prune: pruneOnFetch() }),
+        l10n.t("Fetched {0}", remote.name),
+        refresh,
+        l10n.t("Fetch"),
+      );
+      break;
+    case "prune":
+      report(
+        await a.ctx.remotes.prune(remote.name),
+        l10n.t("Pruned {0}", remote.name),
+        refresh,
+        l10n.t("Prune"),
+      );
+      break;
+    case "url": {
+      const url = await promptInput({
+        title: l10n.t("Edit URL of {0}", remote.name),
+        hint: l10n.t("Where this remote fetches from and pushes to."),
+        value: remote.fetchUrl,
+        confirmLabel: l10n.t("Update URL"),
+        validate: "url",
+      });
+      if (!url) {
+        return;
+      }
+      report(
+        await a.ctx.remotes.setUrl(remote.name, url.trim()),
+        l10n.t("Updated {0} URL", remote.name),
+        refresh,
+        l10n.t("Edit URL"),
+      );
+      break;
+    }
+    case "rename": {
+      const neu = await promptInput({
+        title: l10n.t("Rename {0}", remote.name),
+        hint: l10n.t("Its remote-tracking branches are renamed to match."),
+        value: remote.name,
+        confirmLabel: l10n.t("Rename"),
+        validate: "remoteName",
+      });
+      if (!neu || neu === remote.name) {
+        return;
+      }
+      report(
+        await a.ctx.remotes.rename(remote.name, neu.trim()),
+        l10n.t("Renamed remote to {0}", neu),
+        refresh,
+        l10n.t("Rename remote"),
+      );
+      break;
+    }
+    case "remove": {
+      const ok = await confirm(
+        l10n.t("Remove remote {0}?", remote.name),
+        l10n.t("Its remote-tracking branches go with it. Nothing on the server changes."),
+        l10n.t("Remove"),
+      );
+      if (!ok) {
+        return;
+      }
+      report(
+        await a.ctx.remotes.remove(remote.name),
+        l10n.t("Removed remote {0}", remote.name),
+        refresh,
+        l10n.t("Remove remote"),
+      );
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+async function pickRemote(
+  remotes: { name: string; fetchUrl: string }[],
+  title: string,
+): Promise<string | undefined> {
+  if (remotes.length === 0) {
+    void vscode.window.showInformationMessage(l10n.t("GitStudio: no remotes configured."));
+    return undefined;
+  }
+  if (remotes.length === 1) {
+    return remotes[0].name;
+  }
+  const choices: DialogChoice[] = remotes.map((r) => ({
+    id: r.name,
+    label: r.name,
+    icon: "cloud",
+    description: r.fetchUrl,
+  }));
+  return promptPick({ title, choices });
+}
+
+/**
+ * Run a door's op under the Undo envelope. `fn` returns `{ cancelled: true }`
+ * when a question inside it was cancelled and nothing ran.
+ */
+async function withUndo(
+  repos: RepoManager,
+  repo: RepoEntry,
+  label: string,
+  fn: () => Promise<{ cancelled: true } | undefined>,
+  opts?: UndoOptions,
+): Promise<void> {
+  const ledger = repos.getUndoLedger();
+  if (ledger) {
+    await ledger.runWithUndo(repo, label, fn, opts);
+  } else {
+    await fn();
+  }
+}
+
+/** The Undo envelope for an op that names the branch it moves (branchReset.ts). */
+function branchUndo(repos: RepoManager, repo: RepoEntry): BranchUndoRunner | undefined {
+  const ledger = repos.getUndoLedger();
+  return ledger ? (label, fn, opts) => ledger.runWithUndo(repo, label, fn, opts) : undefined;
+}
+
+/**
+ * `report` for a command run through the shared door (git/inTheWay.ts): a
+ * question the user cancelled says nothing, a refusal already said there says
+ * nothing more, and a stash-and-retry that went through refreshes like any
+ * success.
+ */
+async function reportApplied(applied: Applied, success: string, refresh: () => void, action: string): Promise<void> {
+  if (applied.cancelled) {
+    return;
+  }
+  if (applied.settled) {
+    refresh();
+    return;
+  }
+  report({ ok: applied.result.code === 0, stderr: applied.result.stderr }, success, refresh, action);
+}
+
+/**
+ * A branch action's outcome: a flash on success; on failure, the action by
+ * name and git's reason — "GitStudio: Delete branch failed — <reason>" — as
+ * every failure reads (ui/notify.ts). It showed git's stderr alone, with no
+ * name, no action, and "error: …" for its first word.
+ */
+function report(
+  result: { ok: boolean; stderr: string },
+  success: string,
+  refresh: () => void,
+  action: string,
+): void {
+  if (result.ok) {
+    flash(success);
+    refresh();
+  } else {
+    void vscode.window.showErrorMessage(failed(action, result.stderr));
+  }
+}
+
+/**
+ * Like report, but an operation that merely PAUSED for a conflict is surfaced as
+ * a softer warning with a next step, not as a failure.
+ *
+ * This used to ask git's stderr — `/conflict/i` — which is the same defect that
+ * made a routine cherry-pick read as a crash on a Russian locale (fixed in
+ * 1.5.2). It asks git directly now: exit code 1 AND the operation's marker ref.
+ * `MERGE_HEAD` / `REBASE_HEAD` are spelled the same in every language.
+ *
+ * Both halves matter here even more than they do for cherry-pick, because for
+ * these two operations exit 1 is genuinely ambiguous: `git merge nosuchref` and
+ * a rebase refused over a dirty tree BOTH exit 1 without pausing. The marker is
+ * what keeps those on the error path.
+ */
+async function reportMergeLike(
+  ctx: GitContext,
+  result: { ok: boolean; code: number; stderr: string },
+  success: string,
+  verb: string,
+  marker: OperationMarker,
+  refresh: () => void,
+): Promise<void> {
+  if (result.ok) {
+    flash(success);
+    refresh();
+    return;
+  }
+  if (await pausedForUser(ctx.process, result.code, marker)) {
+    notifyPaused(l10n.t("{0} hit conflicts. Resolve them, then continue or abort.", verb));
+    refresh();
+    return;
+  }
+  void vscode.window.showErrorMessage(failed(verb, result.stderr));
+}
+
+/**
+ * A destructive-action confirmation, in GitStudio's own dialog rather than an OS
+ * modal sheet. `title` is the question, `action` the button.
+ */
+async function confirm(
+  title: string,
+  message: string,
+  action: string,
+): Promise<boolean> {
+  return promptConfirm({ title, message, confirmLabel: action, danger: true });
+}
+
+function flash(message: string): void {
+  void vscode.window.setStatusBarMessage(l10n.t("$(check) {0}", message), 2500);
+}

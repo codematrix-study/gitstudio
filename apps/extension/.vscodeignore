@@ -1,0 +1,24 @@
+.vscode/**
+.github/**
+src/**
+test/**
+harness/**
+node_modules/**
+**/*.ts
+**/*.map
+**/*-harness.html
+esbuild.js
+tsconfig.json
+.gitignore
+.vscodeignore
+**/.DS_Store
+*.vsix
+media/*.svg
+!media/activitybar.svg
+# Store artwork is served from GitHub — the release workflow passes
+# --baseImagesUrl, so vsce rewrites the README's relative image links to
+# raw.githubusercontent.com and none of these need to ship in the vsix.
+media/shots/**
+media/banner.png
+# How the README media is made: for the repository, not the extension.
+SHOTS.md

@@ -1,0 +1,685 @@
+// The bottom dock's content: three top-level tabs in the bar — "Diff"
+// (only on the commits view), "Output" (the live git-command log), and a single
+// "Terminal" view. The Terminal is ONE tab (VS-Code style): its multiple shells
+// are managed by a side list (right of the terminal) with a "New terminal" button
+// and a per-terminal kill button — not by extra top tabs.
+//
+// Sessions persist for the whole repo session: collapsing the dock or switching
+// the top tab keeps every PTY alive (surfaces are hidden, not disposed). A PTY is
+// opened lazily — only when its terminal first becomes visible.
+
+import { BottomDock } from "./bottomDock";
+import { TerminalPanel } from "./terminalPanel";
+import { OutputsPanel } from "./outputsPanel";
+import { ChatPanel } from "./chatPanel";
+import { el, span, glyph, wireResizerKeys } from "./ui";
+import * as l10n from "@vscode/l10n";
+
+interface TermSession {
+  id: string;
+  label: string;
+  surface: HTMLElement;
+  panel: TerminalPanel;
+  /** True once the PTY has been opened (lazy). */
+  opened: boolean;
+}
+
+/** A footer AI chat tab (one per ✨ action), named + closable. */
+interface ChatTab {
+  id: string;
+  label: string;
+  surface: HTMLElement;
+  panel: ChatPanel;
+}
+
+/** What opens an inline AI chat tab in the footer (from the ✨ affordances). */
+export interface AssistantTabRequest {
+  title: string;
+  goal: string;
+  nav?: (view: string) => void;
+}
+
+/** A descriptor for one top tab in the strip. */
+interface TopTabDesc {
+  id: string;
+  label: string;
+  icon: string;
+  /** True for an AI chat tab — gets the ✨ accent + a close button. */
+  chat?: boolean;
+  /** Carries a ✕ without the chat styling (the Diff tab). */
+  closable?: boolean;
+}
+
+export interface TerminalDockOptions {
+  /** Start expanded vs collapsed-to-footer. */
+  expanded: boolean;
+  /** Body height in px when expanded. */
+  height: number;
+  /** Persist the dock's expanded + height state. */
+  onStateChange: (s: { expanded: boolean; height: number }) => void;
+  /** The Diff tab's ✕ — the renderer owns the DiffPanel's lifecycle. */
+  onCloseDetails?: () => void;
+  /** The repository this dock belongs to — one dock per repository tab, so
+   *  its Output log shows that repository's commands only (issue #32). */
+  root?: string;
+}
+
+/** How many shells one window will hold. A held-down "+" must not be able
+ *  to spawn unbounded PTYs; the button reports the limit rather than
+ *  swallowing the click. */
+const MAX_TERMINALS = 16;
+
+export class TerminalDock {
+  private readonly dock: BottomDock;
+  private readonly outputs: OutputsPanel;
+  private readonly tabStrip: HTMLElement;
+
+  /** The active TOP tab id ("commit-details" | "output" | "terminal" | "chat-N"). */
+  private active = "terminal";
+
+  // Inline AI chat tabs (one per ✨ action), each a self-contained ChatPanel.
+  private chats: ChatTab[] = [];
+  private chatSeq = 0;
+
+  // Commit-details (added only on the commits view; surface owned by renderer).
+  private detailsVisible = false;
+  private detailsEl?: HTMLElement;
+  /** The Diff tab's label — the open file's basename. */
+  private detailsLabel = "";
+  private detailsTitle = "";
+
+  // The single Terminal view: a stage (the shell surfaces) + a side tab list.
+  private readonly termGroup: HTMLElement;
+  private readonly termStage: HTMLElement;
+  private readonly termEmpty: HTMLElement;
+  private readonly termSide: HTMLElement;
+  private terminals: TermSession[] = [];
+  private activeTermId = "";
+  private termSeq = 0;
+
+  constructor(host: HTMLElement, private readonly opts: TerminalDockOptions) {
+    this.dock = new BottomDock(host, {
+      collapsed: !opts.expanded,
+      height: opts.height,
+      minHeight: 120,
+      label: l10n.t("Panel"),
+      onResize: () => this.layoutActive(),
+      onToggle: (collapsed) => {
+        if (!collapsed) {
+          // Remember where the keyboard WAS before the dock takes it.
+          this.rememberFocus();
+          this.revealActive();
+        } else {
+          // …and give it back. Closing the dock left focus on the xterm
+          // textarea inside it, which is now hidden: every keystroke after
+          // ⌘` ⌘` went into a terminal nobody could see, and the list you were
+          // reading before had no focus, no selection and no way back to the
+          // keyboard except the mouse.
+          this.restoreFocus();
+        }
+        // The footer's actions belong to the tab that is showing, and a
+        // collapsed dock is showing none. showActive() is the one place that
+        // decides; collapsing never used to reach it.
+        this.showActive();
+        this.persist();
+      },
+      onHeightChange: () => this.persist(),
+    });
+
+    // Top tab strip (Diff · Output · Terminal).
+    this.tabStrip = el("div", "term-tabs");
+    this.dock.tabsEl.appendChild(this.tabStrip);
+
+    // ── Output surface (subscribes to git:log immediately, even while collapsed). ──
+    this.outputs = new OutputsPanel(opts.root);
+    this.outputs.el.style.display = "none";
+    this.dock.bodyEl.appendChild(this.outputs.el);
+    // The Output tab's controls live in the dock's footer action slot — the
+    // one horizontal control row the dock already has — rather than in a bar
+    // of Output's own, which made the body start 32px lower than Terminal's.
+    this.dock.actionsEl.appendChild(this.outputs.bar);
+
+    // ── Terminal group: stage (surfaces) + side list. ──
+    this.termGroup = el("div", "term-group");
+    this.termStage = el("div", "term-stage");
+    this.termEmpty = el("div", "term-empty");
+    this.termEmpty.append(
+      glyph("terminal"),
+      span(l10n.t("No terminals — start one from the list."), "term-empty-text"),
+    );
+    this.termSide = el("div", "term-side");
+    // Width is user-resizable (the list was a fixed, oversized slab before) and
+    // persists across sessions. Clamped so it can't swallow the terminal.
+    const SIDE_MIN = 132, SIDE_MAX = 320;
+    const savedW = Number(localStorage.getItem("gitstudio.termSideW"));
+    let sideW = Number.isFinite(savedW) && savedW > 0 ? Math.min(SIDE_MAX, Math.max(SIDE_MIN, savedW)) : 168;
+    this.termSide.style.width = `${sideW}px`;
+    const setSideW = (w: number): void => {
+      sideW = Math.min(SIDE_MAX, Math.max(SIDE_MIN, w));
+      this.termSide.style.width = `${sideW}px`;
+    };
+    const sideResizer = el("div", "term-side-resizer");
+    sideResizer.append(el("div", "term-side-resizer-grip"));
+    wireResizerKeys(sideResizer, {
+      orientation: "vertical",
+      label: l10n.t("Resize terminal list"),
+      min: SIDE_MIN,
+      max: () => SIDE_MAX,
+      get: () => sideW,
+      // The list is the RIGHT pane, so → has to SHRINK it. That is exactly what
+      // `inverted` is for. It was done by mirroring the value inside `set`
+      // instead — `set(MIN + MAX - w)` — while `get` returned the un-mirrored
+      // width, so the two disagreed and the handle oscillated between two
+      // widths: from 168, → gave 268, → again gave 168, forever. Two keystrokes
+      // and you were back where you started, with no way to reach anything in
+      // between from the keyboard.
+      set: setSideW,
+      inverted: true,
+      onCommit: () => localStorage.setItem("gitstudio.termSideW", String(sideW)),
+    });
+    sideResizer.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      const startX = e.clientX, startW = sideW;
+      document.body.classList.add("resizing-h");
+      const move = (ev: PointerEvent): void => setSideW(startW - (ev.clientX - startX));
+      const up = (): void => {
+        document.body.classList.remove("resizing-h");
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        localStorage.setItem("gitstudio.termSideW", String(sideW));
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    });
+    this.termStage.appendChild(this.termEmpty);
+    this.termGroup.append(this.termStage, sideResizer, this.termSide);
+    this.termGroup.style.display = "none";
+    this.dock.bodyEl.appendChild(this.termGroup);
+
+    // One terminal to start, made active so opening the Terminal lands on a shell.
+    const first = this.createTerminal();
+    this.activeTermId = first.id;
+
+    this.renderTabs();
+    this.renderSide();
+    this.showActive();
+  }
+
+  // ── Terminal sessions ───────────────────────────────────────────────────────
+
+  /** Build a terminal session (surface + panel) into the stage; return it. */
+  private createTerminal(): TermSession {
+    const n = ++this.termSeq;
+    const surface = el("div", "term-surface");
+    surface.style.display = "none";
+    const t: TermSession = {
+      id: `term-${n}`,
+      label: l10n.t("Terminal {0}", n),
+      surface,
+      panel: new TerminalPanel(surface),
+      opened: false,
+    };
+    // Repaint the side list when the shell dies, so the row stops claiming to
+    // be a running terminal the moment it stops being one.
+    t.panel.onExit = () => this.renderSide();
+    this.terminals.push(t);
+    this.termStage.appendChild(surface);
+    return t;
+  }
+
+  /** Public: add a terminal, focus it, switch to the Terminal tab + expand. */
+  newTerminal(): void {
+    // Cap concurrent terminals so a held-down "+" can't spawn unbounded PTYs.
+    // The button says so rather than swallowing the click — see `syncAddBtn`.
+    if (this.terminals.length >= MAX_TERMINALS) return;
+    const t = this.createTerminal();
+    this.activeTermId = t.id;
+    this.active = "terminal";
+    this.expand();
+    this.renderTabs();
+    this.renderSide();
+    this.showActive();
+  }
+
+  private closeTerminal(id: string): void {
+    const idx = this.terminals.findIndex((t) => t.id === id);
+    if (idx < 0) return;
+    this.terminals[idx].panel.dispose();
+    this.terminals[idx].surface.remove();
+    this.terminals.splice(idx, 1);
+    if (this.activeTermId === id) {
+      const next = this.terminals[Math.min(idx, this.terminals.length - 1)];
+      this.activeTermId = next ? next.id : "";
+    }
+    this.renderSide();
+    this.showActive();
+  }
+
+  private setActiveTerm(id: string): void {
+    this.activeTermId = id;
+    this.expand();
+    this.renderSide();
+    this.showActive();
+  }
+
+  // ── Top tabs ────────────────────────────────────────────────────────────────
+
+  private topTabs(): TopTabDesc[] {
+    const tabs: TopTabDesc[] = [];
+    // The commit metadata now lives beside the graph; this tab is where a file
+    // DIFF opens, so the dock shows code rather than duplicating the details.
+    // Named for the FILE it is showing, not "Diff" — the tab strip is where you
+    // look to see what is open, and a diff of one file among nine should say
+    // which. Closable, like a chat tab, because the close belongs on the thing
+    // being closed rather than in a second header inside the body.
+    if (this.detailsVisible) {
+      tabs.push({
+        id: "commit-details",
+        label: this.detailsLabel || l10n.t("Diff"),
+        icon: "diff",
+        closable: true,
+      });
+    }
+    tabs.push({ id: "output", label: l10n.t("Output"), icon: "output" });
+    tabs.push({ id: "terminal", label: l10n.t("Terminal"), icon: "terminal" });
+    for (const c of this.chats) tabs.push({ id: c.id, label: c.label, icon: "sparkle", chat: true });
+    return tabs;
+  }
+
+  private setActiveTab(id: string): void {
+    this.active = id;
+    this.expand();
+    this.renderTabs();
+    this.showActive();
+  }
+
+  private renderTabs(): void {
+    this.tabStrip.replaceChildren();
+    this.tabStrip.setAttribute("role", "tablist");
+    this.tabStrip.setAttribute("aria-label", l10n.t("Panel tabs"));
+    for (const t of this.topTabs()) {
+      const sel = t.id === this.active;
+      const cls =
+        "term-tab" + (sel ? " active" : "") + (t.id === "output" ? " is-output" : "") + (t.chat ? " is-chat" : "");
+      const btn = el("button", cls);
+      btn.append(glyph(t.icon), span(t.label, "term-tab-label"));
+      // The full path on the diff tab: a basename alone cannot tell two
+      // like-named files in different folders apart.
+      const full = t.id === "commit-details" && this.detailsTitle ? this.detailsTitle : t.label;
+      btn.title = full;
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("aria-label", t.id === "commit-details" ? l10n.t("Diff of {0}", full) : t.label);
+      btn.setAttribute("aria-selected", sel ? "true" : "false");
+      btn.tabIndex = sel ? 0 : -1;
+      btn.addEventListener("click", () => this.setActiveTab(t.id));
+      btn.addEventListener("keydown", (e) => this.onTabKey(e, t.id));
+      // Chat and diff tabs carry an inline close affordance (✕), like a
+      // browser tab.
+      if (t.chat || t.closable) {
+        const close = el("span", "term-tab-close");
+        close.append(glyph("close"));
+        close.title = l10n.t("Close {0}", t.label);
+        close.setAttribute("role", "button");
+        close.setAttribute("aria-label", l10n.t("Close {0}", t.label));
+        close.tabIndex = -1;
+        const doClose = (e: Event): void => {
+          e.stopPropagation();
+          if (t.chat) this.closeChat(t.id);
+          else this.opts.onCloseDetails?.();
+        };
+        close.addEventListener("click", doClose);
+        close.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") doClose(e);
+        });
+        btn.appendChild(close);
+      }
+      this.tabStrip.appendChild(btn);
+    }
+  }
+
+  /** Left/right roving navigation across the top tabs. */
+  private onTabKey(e: KeyboardEvent, id: string): void {
+    const order = this.topTabs().map((t) => t.id);
+    const idx = order.indexOf(id);
+    let next = -1;
+    if (e.key === "ArrowRight") next = (idx + 1) % order.length;
+    else if (e.key === "ArrowLeft") next = (idx - 1 + order.length) % order.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = order.length - 1;
+    else return;
+    e.preventDefault();
+    this.setActiveTab(order[next]);
+    (this.tabStrip.children[next] as HTMLElement | undefined)?.focus();
+  }
+
+  // ── Terminal side list (VS-Code-style tabs on the right) ─────────────────────
+
+  private renderSide(): void {
+    this.termSide.replaceChildren();
+    const addBtn = el("button", "term-side-add") as HTMLButtonElement;
+    addBtn.append(glyph("add"), span(l10n.t("New terminal")));
+    // At the cap the button used to stay fully lit and do nothing — a click
+    // that `newTerminal`'s own guard swallowed, with no message anywhere. A
+    // control that cannot act says so.
+    const atCap = this.terminals.length >= MAX_TERMINALS;
+    addBtn.disabled = atCap;
+    addBtn.title = atCap
+      ? l10n.t(
+          "{0} terminals is the most this window will open at once — close one first",
+          MAX_TERMINALS,
+        )
+      : l10n.t("New terminal");
+    addBtn.setAttribute("aria-label", addBtn.title);
+    addBtn.addEventListener("click", () => this.newTerminal());
+    this.termSide.appendChild(addBtn);
+
+    const list = el("div", "term-side-list");
+    list.setAttribute("role", "tablist");
+    list.setAttribute("aria-orientation", "vertical");
+    list.setAttribute("aria-label", l10n.t("Terminals"));
+    const rowEls: HTMLElement[] = [];
+    for (const t of this.terminals) {
+      const sel = t.id === this.activeTermId;
+      const row = el("button", "term-side-row" + (sel ? " active" : ""));
+      row.setAttribute("role", "tab");
+      row.setAttribute("aria-selected", sel ? "true" : "false");
+      // Roving tabindex so a tablist behaves like one: only the active tab is in
+      // the Tab order; Up/Down move between terminals (standard tablist keys).
+      row.tabIndex = sel ? 0 : -1;
+      row.addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+        e.preventDefault();
+        const i = rowEls.indexOf(row);
+        const n = this.terminals.length;
+        const ni = e.key === "ArrowDown" ? (i + 1) % n : (i - 1 + n) % n;
+        const nt = this.terminals[ni];
+        if (!nt) return;
+        this.setActiveTerm(nt.id); // rebuilds the list (renderSide)
+        // Focus the freshly-rendered active row so keyboard focus follows.
+        (this.termSide.querySelector(".term-side-row.active") as HTMLElement | null)?.focus();
+      });
+      rowEls.push(row);
+      const dead = t.panel.isExited();
+      row.classList.toggle("is-exited", dead);
+      row.append(glyph(dead ? "circle-slash" : "terminal"), span(t.label, "term-side-label"));
+      if (dead) row.append(span(l10n.t("exited"), "term-side-dead"));
+      row.title = dead ? l10n.t("{0} — the shell has exited", t.label) : t.label;
+      row.addEventListener("click", () => this.setActiveTerm(t.id));
+      // The kill control is a SIBLING of the row, not a child of it. It used to
+      // be a role=button span inside the row's <button>, which is invalid: an
+      // interactive element cannot contain another one. The outer button's
+      // accessible name absorbed it, and no assistive tech could reach it — the
+      // tabIndex = -1 that kept it out of the Tab order was hiding the problem
+      // rather than solving it. `.term-side-item` positions the two together.
+      const kill = el("button", "term-side-close") as HTMLButtonElement;
+      // Roves WITH its row. The row above is a roving tabindex — only the
+      // active one is in the Tab order — but this sibling kept the default 0,
+      // so tabbing through a dock with six shells open hit six "Kill Terminal
+      // N" buttons and exactly one terminal row. The destructive control was
+      // more reachable than the thing it destroys.
+      kill.tabIndex = sel ? 0 : -1;
+      kill.append(glyph("trash"));
+      kill.title = l10n.t("Kill {0}", t.label);
+      kill.setAttribute("aria-label", l10n.t("Kill {0}", t.label));
+      kill.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.closeTerminal(t.id);
+      });
+      const item = el("div", "term-side-item");
+      item.append(row, kill);
+      list.appendChild(item);
+    }
+    this.termSide.appendChild(list);
+  }
+
+  // ── Visibility / layout ──────────────────────────────────────────────────────
+
+  /** Show the active top surface; within the Terminal, the active shell. */
+  private showActive(): void {
+    this.outputs.el.style.display = this.active === "output" ? "" : "none";
+    // Collapsed counts as "no tab is showing" — see .dock-mount.collapsed
+    // .dock-actions in app.css, which is the rule that actually survives a
+    // collapse path that never repaints.
+    this.outputs.bar.hidden = this.active !== "output" || this.dock.isCollapsed();
+    if (this.detailsEl) this.detailsEl.style.display = this.active === "commit-details" ? "" : "none";
+    this.termGroup.style.display = this.active === "terminal" ? "" : "none";
+
+    for (const t of this.terminals) {
+      t.surface.style.display = t.id === this.activeTermId ? "" : "none";
+    }
+    this.termEmpty.style.display = this.terminals.length === 0 ? "" : "none";
+
+    for (const c of this.chats) {
+      c.surface.style.display = c.id === this.active ? "" : "none";
+    }
+
+    if (this.dock.isCollapsed()) this.layoutActive();
+    else this.revealActive();
+  }
+
+  /** Where the keyboard was before the dock took it, so closing hands it back.
+   *  Null when focus was already inside the dock (or nowhere in particular). */
+  private returnFocusTo: HTMLElement | null = null;
+
+  private rememberFocus(): void {
+    const a = document.activeElement as HTMLElement | null;
+    // Only somewhere OUTSIDE the dock, and only something still focusable —
+    // otherwise closing would hand focus back into the panel it just hid.
+    this.returnFocusTo =
+      a && a !== document.body && !this.dock.root.contains(a) ? a : null;
+  }
+
+  private restoreFocus(): void {
+    const back = this.returnFocusTo;
+    this.returnFocusTo = null;
+    // NOTHING to go back to is still a decision. The dock is often opened from
+    // INSIDE itself — the chevron, the tab strip — in which case nothing outside
+    // was remembered; and the remembered node may have been re-rendered away
+    // while it was open. Either way, closing it while the keyboard is in the
+    // terminal used to leave focus on <body>: the next Tab starts from the top
+    // of the window and no shortcut bound to a view can fire.
+    if (!back?.isConnected) {
+      const here = document.activeElement as HTMLElement | null;
+      if (here && here !== document.body && !this.dock.root.contains(here)) return;
+      // The view behind, as a whole — it carries tabIndex -1 for exactly this.
+      document.querySelector<HTMLElement>(".view-host")?.focus();
+      return;
+    }
+    // Only when the dock still HAS the keyboard. If the reader clicked into the
+    // view behind while the dock was open — which is an ordinary thing to do,
+    // the dock is not modal — then focus is already where they put it, and
+    // yanking it back to wherever they happened to be when they opened the dock
+    // is the same unasked-for jump this was meant to fix, pointed the other way.
+    const here = document.activeElement as HTMLElement | null;
+    if (here && here !== document.body && !this.dock.root.contains(here)) return;
+    back.focus();
+  }
+
+  /** Open the active shell's PTY (lazily) and re-fit it; focus the active chat. */
+  private revealActive(): void {
+    // The Output panel is display:none while another tab is up, so nothing that
+    // arrived meanwhile could position its scroller — see `OutputsPanel.reveal`.
+    if (this.active === "output") this.outputs.reveal();
+    if (this.active === "terminal") {
+      const t = this.terminals.find((x) => x.id === this.activeTermId);
+      if (t) this.openTerm(t);
+    } else {
+      this.chats.find((c) => c.id === this.active)?.panel.reveal();
+    }
+    requestAnimationFrame(() => this.layoutActive());
+  }
+
+  // ── Inline AI chat tabs (✨ Explain / Review / Analyze / Draft) ───────────────
+
+  /** Open a named, closable AI chat tab seeded with `goal`, and reveal it. */
+  // SUPERSEDED, and deliberately so — this method has no callers.
+  //
+  // The ✨ actions used to open a chat tab down here, which split the window in
+  // half; they now route to the Assistant section (renderer.ts, where
+  // `registerAssistantTab` says why). The machinery below — ChatPanel, the
+  // chat tabs, their close buttons — is therefore dead, and left in place
+  // rather than deleted because it is the only other consumer of chatRender and
+  // deleting it is a change worth making deliberately rather than in passing.
+  //
+  // If you are reading this because you changed something in chatRender: this
+  // is the second caller, and it is not reachable from the UI.
+  openChat(req: AssistantTabRequest): void {
+    const id = `chat-${++this.chatSeq}`;
+    const panel = new ChatPanel({ seedGoal: req.goal, seedLabel: req.title, nav: req.nav });
+    panel.el.classList.add("dock-chat-surface");
+    panel.el.style.display = "none";
+    this.dock.bodyEl.appendChild(panel.el);
+    this.chats.push({ id, label: req.title, surface: panel.el, panel });
+    this.active = id;
+    this.expand();
+    this.renderTabs();
+    this.showActive();
+  }
+
+  private closeChat(id: string): void {
+    const idx = this.chats.findIndex((c) => c.id === id);
+    if (idx < 0) return;
+    this.chats[idx].panel.dispose(); // aborts any in-flight turn + detaches the surface
+    this.chats.splice(idx, 1);
+    if (this.active === id) {
+      // Fall back to a remaining chat, else the Terminal.
+      const next = this.chats[Math.min(idx, this.chats.length - 1)];
+      this.active = next ? next.id : "terminal";
+    }
+    this.renderTabs();
+    this.showActive();
+  }
+
+  private openTerm(t: TermSession): void {
+    if (t.opened) {
+      t.panel.focus();
+      return;
+    }
+    t.opened = true;
+    void t.panel.open().then(() => {
+      t.panel.layout();
+      t.panel.focus();
+    });
+  }
+
+  private layoutActive(): void {
+    if (this.dock.isCollapsed()) return;
+    // The diff needs telling too. Its own ResizeObserver does fire, but a frame
+    // late — so dragging the dock's top edge left Monaco trailing the pointer
+    // instead of following it.
+    if (this.active === "commit-details") {
+      this.onDetailsLayout?.();
+      return;
+    }
+    if (this.active !== "terminal") return;
+    const t = this.terminals.find((x) => x.id === this.activeTermId);
+    if (t && t.opened) t.panel.layout();
+  }
+
+  /** Set by the renderer when it mounts a diff into the Diff tab, so a dock
+   *  resize can relayout Monaco on the same frame as the drag. */
+  onDetailsLayout?: () => void;
+
+  // ── Diff tab (present only on the commits/graph view) ───────────────────────
+
+  setDetailsVisible(visible: boolean): void {
+    if (visible) {
+      if (this.detailsVisible) return;
+      this.detailsVisible = true;
+      this.detailsEl = el("div", "dock-details-surface");
+      this.detailsEl.style.display = "none";
+      this.dock.bodyEl.appendChild(this.detailsEl);
+      this.renderTabs();
+      return;
+    }
+    if (!this.detailsVisible) return;
+    this.detailsVisible = false;
+    this.detailsLabel = "";
+    this.detailsTitle = "";
+    this.detailsEl?.remove();
+    this.detailsEl = undefined;
+    if (this.active === "commit-details") {
+      this.active = "terminal";
+      this.showActive();
+    }
+    this.renderTabs();
+  }
+
+  /** The element the renderer mounts the file diff into (when the tab exists). */
+  detailsSurface(): HTMLElement | undefined {
+    return this.detailsEl;
+  }
+
+  /** Name the Diff tab after the file it is showing. */
+  setDetailsLabel(path: string): void {
+    const base = path.split("/").pop() || path;
+    if (base === this.detailsLabel) return;
+    this.detailsLabel = base;
+    this.detailsTitle = path;
+    this.renderTabs();
+  }
+
+  /** Activate the Diff tab and expand the dock (when a file is opened). */
+  openDetails(): void {
+    if (!this.detailsVisible) return;
+    // Was the Diff tab already the one on screen? If so the current height is a
+    // deliberate choice for reading diffs and we leave it alone. Otherwise we
+    // are switching INTO it — from a collapsed dock or from Terminal/Output —
+    // and must not inherit a height dragged out for a terminal, which is what
+    // crushed the graph down to a few rows.
+    const wasShowingDiff = !this.dock.isCollapsed() && this.active === "commit-details";
+    this.setActiveTab("commit-details");
+    if (!wasShowingDiff) {
+      const preferred = Math.round(window.innerHeight * 0.45);
+      if (this.dock.height > preferred) {
+        this.dock.setHeight(preferred);
+      }
+    }
+  }
+
+  /** Keep the dock within its share of the window as the window changes. */
+  handleWindowResize(): void {
+    this.dock.reclamp();
+  }
+
+  private persist(): void {
+    this.opts.onStateChange({ expanded: !this.dock.isCollapsed(), height: this.dock.height });
+  }
+
+  // ── Public controls (driven by the nav button / shortcut / host) ────────────
+
+  toggle(): void {
+    this.dock.toggle();
+  }
+
+  expand(): void {
+    if (this.dock.isCollapsed()) this.dock.toggle();
+  }
+
+  collapse(): void {
+    if (!this.dock.isCollapsed()) this.dock.toggle();
+  }
+
+  isExpanded(): boolean {
+    return !this.dock.isCollapsed();
+  }
+
+  /** Re-fit the active terminal (after a sibling layout change, e.g. rail collapse). */
+  layout(): void {
+    this.layoutActive();
+  }
+
+  /** Re-read the CSS-token theme for every terminal (on light/dark flips). */
+  applyTheme(): void {
+    for (const t of this.terminals) t.panel.applyTheme();
+  }
+
+  dispose(): void {
+    for (const t of this.terminals) t.panel.dispose();
+    this.terminals = [];
+    for (const c of this.chats) c.panel.dispose();
+    this.chats = [];
+    this.outputs.dispose();
+    this.dock.dispose();
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@gitstudio/engine",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Pure, host-agnostic Git engine for GitStudio: diff/merge models, lane layout, blame parsing, rebase-todo, line staging. No vscode/monaco/fs imports.",
+  "exports": {
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "test": "tsx --import ../../scripts/test/hermetic-git.mjs --test \"test/**/*.test.ts\"",
+    "check-types": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@gitstudio/host-bridge": "*",
+    "@vscode/l10n": "^0.0.18",
+    "vscode-diff": "^3.0.1"
+  }
+}

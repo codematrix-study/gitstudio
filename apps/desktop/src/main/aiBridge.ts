@@ -1,0 +1,929 @@
+// The desktop's AI layer: owns the user's model connections, runs the inline ✨
+// tasks and the Assistant agent, and brokers the MCP "Agent Access" config.
+//
+// It is the ONLY place API keys live: each connection's key is encrypted at rest
+// in userData/secrets/ and never crosses to the renderer — the renderer only
+// ever sees a redacted AiConnectionView. All model traffic runs here in the main
+// process (Node fetch), so there's no CORS and no secret in a web context.
+// Everything degrades silently: with no usable connection the ✨ affordances and
+// the Assistant simply stay hidden; git is never gated or blocked by AI.
+//
+// Keys are NOT in the OS keyring. Electron's safeStorage keeps its master key in
+// the login keychain, whose ACL is bound to the app's code signature — so every
+// rebuild or update voided it and the next read raised "GitStudio wants to make
+// changes. Enter your password to allow this." See @gitstudio/secret-store for
+// the trade-off that replaces it, and migrateLegacyKeys() for the one-way import
+// of keys written by the old scheme.
+
+import { app } from "electron";
+import { netFetch } from "./netFetch";
+import * as l10n from "@vscode/l10n";
+import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { SecretStore } from "@gitstudio/secret-store/secretStore";
+import {
+  DEFAULT_AGENT_CONFIG,
+  EMPTY_AI_SETTINGS,
+  PROVIDER_PRESETS,
+  assist,
+  connectionFromPreset,
+  generateChangelog,
+  generateCommitMessage,
+  generatePrDescription,
+  explainDiff,
+  isConnectionUsable,
+  knownModels,
+  makeProvider,
+  pickConnection,
+  resolveModelId,
+  reviewDiff,
+  runAgent,
+  selectTools,
+  suggestBranchNames,
+  summarizeChanges,
+  AiError,
+  type AiSettings,
+  type Connection,
+  type GitTool,
+  type Provider,
+} from "@gitstudio/ai/index";
+import { createGitToolHost } from "@gitstudio/git-service/index";
+import { mcpInfo, installMcp } from "./mcpConfig";
+import { CliProvider, cliSpecFor, detectCli, withThinking } from "./cliProvider";
+import { ConversationStore, type ChatSession } from "./assistantSessions";
+import type { RepoStore } from "./repoStore";
+import type {
+  AgentConfig,
+  AgentConfirmAnswer,
+  AgentRunRequest,
+  AiConnectionPatch,
+  AiConnectionView,
+  AiDone,
+  AiModelOption,
+  AiPresetView,
+  AiSettingsView,
+  AiTaskInput,
+  AiTaskName,
+  AiTestResult,
+  ChatSendRequest,
+  ChatSummary,
+  ChatView,
+  IpcEvents,
+  McpInfo,
+  McpInstallRequest,
+} from "../shared/ipc";
+
+type Send = <E extends keyof IpcEvents>(event: E, data: IpcEvents[E]) => void;
+
+/** How long the agent waits for the user to approve a write before giving up. */
+const CONFIRM_TIMEOUT_MS = 120_000;
+
+export class AiBridge {
+  // A copy down to the array: a shallow spread shared EMPTY_AI_SETTINGS's
+  // connections, so an add before any settings file was read pushed into it.
+  private settings: AiSettings = { ...EMPTY_AI_SETTINGS, connections: [...EMPTY_AI_SETTINGS.connections] };
+  private loaded = false;
+  /**
+   * Keychain-free key storage. Lazily constructed because `app.getPath` is only
+   * valid once Electron is ready, and AiBridge is built during startup.
+   */
+  private store: SecretStore | undefined;
+  /** In-flight requests → their AbortController (for ai:cancel). */
+  private readonly aborts = new Map<string, AbortController>();
+  /** Pending agent write-confirmations → their resolver. */
+  private readonly confirms = new Map<string, (approved: boolean) => void>();
+  /** Cached CLI-availability per preset (is `claude`/`codex`/`gemini` installed?). */
+  private readonly cliDetect = new Map<string, boolean>();
+  /** Persisted Assistant chats + their warm CLI processes (survive refresh). */
+  private readonly chats = new ConversationStore();
+
+  constructor(
+    private readonly repos: RepoStore,
+    private readonly send: Send,
+  ) {}
+
+  // ── persistence ────────────────────────────────────────────────────────────
+
+  private settingsPath(): string {
+    return join(app.getPath("userData"), "ai-settings.json");
+  }
+  /** Pre-1.4 location: a safeStorage blob, i.e. the OS keyring. */
+  private legacyKeyPath(id: string): string {
+    return join(app.getPath("userData"), "ai-keys", `${id}.bin`);
+  }
+
+  private secrets(): SecretStore {
+    this.store ??= new SecretStore(join(app.getPath("userData"), "secrets"));
+    return this.store;
+  }
+
+  private async ensureLoaded(): Promise<void> {
+    if (this.loaded) {
+      return;
+    }
+    this.loaded = true;
+    try {
+      const raw = await readFile(this.settingsPath(), "utf8");
+      const parsed = JSON.parse(raw) as AiSettings;
+      if (parsed && Array.isArray(parsed.connections)) {
+        this.settings = parsed;
+      }
+    } catch {
+      // No settings yet — start empty.
+    }
+  }
+
+  private async persist(): Promise<void> {
+    try {
+      await mkdir(app.getPath("userData"), { recursive: true });
+      await writeFile(this.settingsPath(), JSON.stringify(this.settings, null, 2));
+    } catch {
+      // Best-effort; never block a UI action on persistence.
+    }
+  }
+
+  // ── keys (encrypted at rest, no OS keyring) ──────────────────────────────────
+
+  /**
+   * Is a key stored for this connection?
+   *
+   * Answers from the filesystem only. This backs `usable` on every connection
+   * row, so it runs whenever the settings view renders — it must never decrypt.
+   */
+  private hasKeyFile(id: string): boolean {
+    // Only the keychain-free store counts: a leftover pre-1.4 keyring blob is
+    // unreadable by design (see loadKey), so it must not make a connection
+    // look `usable` when every real request would then fail.
+    return this.secrets().has(id);
+  }
+
+  private async loadKey(id: string): Promise<string | undefined> {
+    const current = await this.secrets().get(id);
+    if (current !== undefined) {
+      return current;
+    }
+    // NO KEYRING, EVER. A pre-1.4 safeStorage blob could only be read through
+    // the OS keychain, whose ACL is bound to the app's code signature — every
+    // rebuilt/re-signed binary raised the macOS password prompt again. That
+    // migration is gone: any leftover blob is deleted unread; re-enter the key
+    // once in Settings → AI models and it lands in the prompt-free store.
+    await unlink(this.legacyKeyPath(id)).catch(() => {});
+    return undefined;
+  }
+
+  private async storeKey(id: string, key: string): Promise<void> {
+    await this.secrets().set(id, key);
+    // A re-entered key supersedes any pre-1.4 blob; drop it so `hasKeyFile`
+    // can't be satisfied by a stale file we will never read again.
+    await unlink(this.legacyKeyPath(id)).catch(() => {});
+  }
+
+  private async deleteKey(id: string): Promise<void> {
+    await this.secrets().delete(id);
+    try {
+      await unlink(this.legacyKeyPath(id));
+    } catch {
+      // already gone
+    }
+  }
+
+  // ── views ────────────────────────────────────────────────────────────────────
+
+  private connView(conn: Connection): AiConnectionView {
+    const hasKey = this.hasKeyFile(conn.id);
+    // For a CLI connection, "usable" means the binary was detected on PATH
+    // (defaults to optimistic `true` until the first detection completes).
+    const usable =
+      conn.wire === "cli"
+        ? this.cliDetect.get(conn.preset) ?? true
+        : isConnectionUsable(conn, hasKey);
+    return {
+      id: conn.id,
+      label: conn.label,
+      preset: conn.preset,
+      wire: conn.wire,
+      baseUrl: conn.baseUrl,
+      models: { ...conn.models },
+      needsKey: conn.needsKey,
+      local: conn.local === true,
+      hasKey,
+      usable,
+    };
+  }
+
+  /** Probe each distinct CLI preset in use so the settings view shows real status. */
+  private async refreshCliDetection(): Promise<void> {
+    const presets = new Set(
+      this.settings.connections.filter((c) => c.wire === "cli").map((c) => c.preset),
+    );
+    await Promise.all(
+      [...presets].map(async (preset) => {
+        const spec = cliSpecFor(preset);
+        if (spec) {
+          const { ok } = await detectCli(spec.command);
+          this.cliDetect.set(preset, ok);
+        }
+      }),
+    );
+  }
+
+  private agentConfig() {
+    return { ...DEFAULT_AGENT_CONFIG, ...(this.settings.agent ?? {}) };
+  }
+
+  private view(): AiSettingsView {
+    const connections = this.settings.connections.map((c) => this.connView(c));
+    return {
+      connections,
+      defaultId: this.settings.defaultId,
+      enabled: connections.some((c) => c.usable),
+      agent: this.agentConfig(),
+    };
+  }
+
+  async setAgentConfig(patch: Partial<AgentConfig>): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    this.settings.agent = { ...this.agentConfig(), ...patch };
+    await this.persist();
+    return this.view();
+  }
+
+  /**
+   * The models the connection's provider offers — propagated to the in-app
+   * picker so the user picks a real model directly (no manual setup). HTTP
+   * providers are queried live (`/models`); CLIs and any failures fall back to a
+   * known catalog. The connection's own configured models are always included.
+   */
+  async listModels(connectionId?: string): Promise<AiModelOption[]> {
+    await this.ensureLoaded();
+    const conn =
+      (connectionId ? this.settings.connections.find((c) => c.id === connectionId) : undefined) ??
+      pickConnection(this.settings);
+    if (!conn) {
+      return [];
+    }
+    const ids: string[] = [];
+    // Always offer whatever the connection already has configured.
+    for (const t of ["mid", "deep", "fast"] as const) {
+      const m = conn.models[t]?.trim();
+      if (m) ids.push(m);
+    }
+    if (conn.wire !== "cli") {
+      const live = await this.fetchModels(conn).catch(() => []);
+      ids.push(...live);
+    }
+    ids.push(...knownModels(conn.preset));
+    // Dedupe, preserving order (configured + live first, then known).
+    const seen = new Set<string>();
+    const out: AiModelOption[] = [];
+    for (const id of ids) {
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        out.push({ id });
+      }
+    }
+    return out;
+  }
+
+  /** Live-query a HTTP provider's model list (best-effort, short timeout). */
+  private async fetchModels(conn: Connection): Promise<string[]> {
+    const base = conn.baseUrl.replace(/\/+$/, "");
+    const isAnthropic = conn.wire === "anthropic";
+    const url = isAnthropic ? `${base}/v1/models` : `${base}/models`;
+    const headers: Record<string, string> = {};
+    const key = await this.loadKey(conn.id);
+    if (isAnthropic) {
+      if (!key) return [];
+      headers["x-api-key"] = key;
+      headers["anthropic-version"] = "2023-06-01";
+    } else if (key) {
+      headers["Authorization"] = `Bearer ${key}`;
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4000);
+    try {
+      const res = await netFetch(url, { headers, signal: ctrl.signal });
+      if (!res.ok) return [];
+      const json = (await res.json()) as {
+        data?: Array<{ id?: string; name?: string }>;
+        models?: Array<{ id?: string; name?: string }>;
+      };
+      const list = json.data ?? json.models ?? [];
+      return list.map((m) => m.id ?? m.name ?? "").filter((s): s is string => s.length > 0);
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async getSettings(): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    await this.refreshCliDetection();
+    return this.view();
+  }
+
+  catalog(): AiPresetView[] {
+    return PROVIDER_PRESETS.map((p) => ({
+      id: p.id,
+      label: p.label,
+      blurb: p.blurb,
+      wire: p.wire,
+      baseUrl: p.baseUrl,
+      needsKey: p.needsKey,
+      local: p.local === true,
+      keyUrl: p.keyUrl,
+      icon: p.icon,
+      note: p.note,
+      models: { ...p.models },
+    }));
+  }
+
+  // ── connection CRUD ──────────────────────────────────────────────────────────
+
+  async addConnection(presetId: string): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    const conn = connectionFromPreset(presetId, randomUUID());
+    this.settings.connections.push(conn);
+    if (!this.settings.defaultId) {
+      this.settings.defaultId = conn.id;
+    }
+    await this.persist();
+    return this.view();
+  }
+
+  async updateConnection(patch: AiConnectionPatch): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    const conn = this.settings.connections.find((c) => c.id === patch.id);
+    if (conn) {
+      if (typeof patch.label === "string") conn.label = patch.label;
+      if (typeof patch.baseUrl === "string") conn.baseUrl = patch.baseUrl;
+      if (patch.models) conn.models = { ...patch.models };
+      await this.persist();
+    }
+    return this.view();
+  }
+
+  async removeConnection(id: string): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    this.settings.connections = this.settings.connections.filter((c) => c.id !== id);
+    if (this.settings.defaultId === id) {
+      this.settings.defaultId = this.settings.connections[0]?.id;
+    }
+    await this.deleteKey(id);
+    await this.persist();
+    return this.view();
+  }
+
+  async setDefault(id: string): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    if (this.settings.connections.some((c) => c.id === id)) {
+      this.settings.defaultId = id;
+      await this.persist();
+    }
+    return this.view();
+  }
+
+  async setKey(id: string, key: string): Promise<AiSettingsView> {
+    await this.ensureLoaded();
+    if (key.trim().length === 0) {
+      await this.deleteKey(id);
+    } else {
+      await this.storeKey(id, key.trim());
+    }
+    return this.view();
+  }
+
+  async test(id: string): Promise<AiTestResult> {
+    await this.ensureLoaded();
+    const conn = this.settings.connections.find((c) => c.id === id);
+    if (!conn) {
+      // The Settings list and this lookup can disagree for one repaint after a
+      // connection is removed. A stale id is a condition, not a defect, so it
+      // is not crash-reported (see main/expectedError.ts). An unknown PRESET
+      // below is the opposite: only our own table can produce one.
+      return { ok: false, expected: true, message: l10n.t("Connection not found.") };
+    }
+    // CLI connections: just confirm the binary is installed (don't spend quota).
+    if (conn.wire === "cli") {
+      const spec = cliSpecFor(conn.preset);
+      if (!spec) {
+        return { ok: false, message: l10n.t("Unknown local CLI.") };
+      }
+      const { ok, version } = await detectCli(spec.command);
+      this.cliDetect.set(conn.preset, ok);
+      return ok
+        ? {
+            ok: true,
+            message: version
+              ? l10n.t("Found `{0}` ({1}).", spec.command, version)
+              : l10n.t("Found `{0}`.", spec.command),
+          }
+        : {
+            ok: false,
+            expected: true,
+            message: l10n.t("`{0}` isn't installed or not on PATH. {1}", spec.command, spec.install),
+          };
+    }
+    const provider = this.providerFor(conn);
+    try {
+      const r = await provider.chat(
+        // Sent to the MODEL as a connectivity probe, never shown to a person —
+        // must stay literal English regardless of the app's language.
+        [{ role: "user", content: "Reply with exactly: OK" }],
+        { model: "fast", maxTokens: 16 },
+      );
+      const model = resolveModelId(conn, "fast") ?? "model";
+      if (r.text.trim().length > 0 || r.stopReason === "stop") {
+        return { ok: true, message: l10n.t("Connected — {0} responded.", model), model };
+      }
+      return { ok: false, message: l10n.t("The model returned an empty response.") };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // What the provider said about THIS connection — a key it refused, an
+      // endpoint it could not reach, no model chosen — is the answer the Test
+      // button exists to give, and it arrived in the crash tracker as
+      // "Ai test" (reports #28, #29). Anything else keeps reporting: a 400 or a
+      // 404 may be a request or a URL we built wrong, and a non-AiError is ours.
+      return connectionAnswer(err) ? { ok: false, expected: true, message } : { ok: false, message };
+    }
+  }
+
+  // ── provider resolution ──────────────────────────────────────────────────────
+
+  private providerFor(conn: Connection): Provider {
+    if (conn.wire === "cli") {
+      return new CliProvider({
+        preset: conn.preset,
+        cwd: this.repos.current()?.root,
+        resolveModel: (tier) => resolveModelId(conn, tier ?? "mid"),
+        label: `${conn.label}${conn.models.mid ? ` · ${conn.models.mid}` : ""}`,
+      });
+    }
+    return makeProvider(conn, () => this.loadKey(conn.id), netFetch);
+  }
+
+  private async resolveProvider(connectionId?: string, task?: string): Promise<{ provider: Provider; conn: Connection } | undefined> {
+    await this.ensureLoaded();
+    let conn: Connection | undefined;
+    if (connectionId) {
+      conn = this.settings.connections.find((c) => c.id === connectionId);
+    }
+    conn ??= pickConnection(this.settings, task);
+    if (!conn) {
+      return undefined;
+    }
+    if (!isConnectionUsable(conn, this.hasKeyFile(conn.id))) {
+      return undefined;
+    }
+    return { provider: this.providerFor(conn), conn };
+  }
+
+  // ── one-shot tasks ───────────────────────────────────────────────────────────
+
+  async runTask(requestId: string, task: AiTaskName, input: AiTaskInput): Promise<AiDone> {
+    const resolved = await this.resolveProvider(input.connectionId, task);
+    if (!resolved) {
+      return {
+        requestId,
+        ok: false,
+        expected: true,
+        message: l10n.t("No AI model is connected. Add one in Settings ▸ AI."),
+      };
+    }
+    const ctx = this.repos.getContext();
+    if (!ctx) {
+      return { requestId, ok: false, expected: true, message: l10n.t("No repository is open.") };
+    }
+    const host = createGitToolHost(ctx);
+    const abort = new AbortController();
+    this.aborts.set(requestId, abort);
+    const onDelta = (delta: string) => this.send("ai:delta", { requestId, delta });
+    const taskCtx = { signal: abort.signal, onDelta };
+
+    try {
+      const { provider } = resolved;
+      let text: string | null = null;
+      switch (task) {
+        case "commitMessage": {
+          const diff = input.diff ?? (await host.diff({ staged: true }));
+          if (!diff.trim()) {
+            return { requestId, ok: false, expected: true, message: l10n.t("Nothing is staged to summarize.") };
+          }
+          const recent = input.commits ?? (await host.log({ limit: 10 })).map((c) => c.subject);
+          text = await generateCommitMessage(provider, diff, { recentSubjects: recent, ctx: taskCtx });
+          break;
+        }
+        case "explainDiff": {
+          const diff = input.diff ?? (await this.gatherDiff(host, input));
+          if (!diff.trim())
+            return { requestId, ok: false, expected: true, message: l10n.t("No changes to explain.") };
+          text = await explainDiff(provider, diff, taskCtx);
+          break;
+        }
+        case "summarizeChanges": {
+          const diff = input.diff ?? (await this.gatherDiff(host, input));
+          if (!diff.trim())
+            return { requestId, ok: false, expected: true, message: l10n.t("No changes to summarize.") };
+          text = await summarizeChanges(provider, diff, taskCtx);
+          break;
+        }
+        case "prDescription": {
+          const base = input.base ?? "main";
+          const cmp = input.commits ? undefined : await host.compare(base, "HEAD");
+          const commits = input.commits ?? (cmp?.commits ?? []).map((c) => c.subject);
+          const diff = input.diff ?? (await host.diff({ base, head: "HEAD" }));
+          text = await generatePrDescription(provider, commits, diff, taskCtx);
+          break;
+        }
+        case "reviewDiff": {
+          const diff = input.diff ?? (await this.gatherDiff(host, input));
+          if (!diff.trim())
+            return { requestId, ok: false, expected: true, message: l10n.t("No changes to review.") };
+          text = await reviewDiff(provider, diff, taskCtx);
+          break;
+        }
+        case "changelog": {
+          const base = input.base;
+          const range = base ? `${base}..HEAD` : "HEAD";
+          const commits = input.commits ?? (await host.log({ ref: range, limit: 200 })).map((c) => c.subject);
+          text = await generateChangelog(provider, commits, { ctx: taskCtx });
+          break;
+        }
+        case "branchName": {
+          text = await suggestBranchNames(provider, input.description ?? "", taskCtx);
+          break;
+        }
+        case "assist": {
+          text = await assist(provider, input.description ?? "", taskCtx);
+          break;
+        }
+        default:
+          return { requestId, ok: false, message: l10n.t("Unknown task: {0}", task) };
+      }
+      if (text === null) {
+        return { requestId, ok: false, message: l10n.t("The model returned nothing.") };
+      }
+      return { requestId, ok: true, text };
+    } catch (err) {
+      return { requestId, ok: false, message: err instanceof Error ? err.message : String(err) };
+    } finally {
+      this.aborts.delete(requestId);
+    }
+  }
+
+  private async gatherDiff(host: ReturnType<typeof createGitToolHost>, input: AiTaskInput): Promise<string> {
+    if (input.sha) {
+      // The commit's diff vs its first parent.
+      return host.diff({ base: `${input.sha}^`, head: input.sha, path: input.path });
+    }
+    if (input.base) {
+      // Honour an explicit head (PR / Compare diff base…head); else compare base…HEAD.
+      return host.diff({ base: input.base, head: input.head ?? "HEAD", path: input.path });
+    }
+    // Default: the unstaged working-tree diff (fall back to staged if empty).
+    const working = await host.diff({ path: input.path });
+    return working.trim() ? working : host.diff({ staged: true, path: input.path });
+  }
+
+  cancel(requestId: string): void {
+    this.aborts.get(requestId)?.abort();
+    this.aborts.delete(requestId);
+    // Deny any pending confirmations for this request so the agent unwinds.
+    for (const [callId, resolve] of this.confirms) {
+      if (callId.startsWith(requestId)) {
+        resolve(false);
+        this.confirms.delete(callId);
+      }
+    }
+  }
+
+  // ── agent ────────────────────────────────────────────────────────────────────
+
+  async runAgentTask(req: AgentRunRequest): Promise<AiDone> {
+    const { requestId } = req;
+    const resolved = await this.resolveProvider(req.connectionId, "agent");
+    if (!resolved) {
+      return {
+        requestId,
+        ok: false,
+        expected: true,
+        message: l10n.t("No AI model is connected. Add one in Settings ▸ AI."),
+      };
+    }
+    const ctx = this.repos.getContext();
+    if (!ctx) {
+      return { requestId, ok: false, expected: true, message: l10n.t("Open a repository first.") };
+    }
+    const host = createGitToolHost(ctx);
+    const tools = selectTools({ write: req.allowWrite, destructive: req.allowDestructive });
+    const abort = new AbortController();
+    this.aborts.set(requestId, abort);
+
+    try {
+      const cfg = this.agentConfig();
+      const result = await runAgent(req.goal, {
+        provider: resolved.provider,
+        host,
+        tools,
+        model: req.model ?? cfg.model,
+        modelId: req.modelId ?? cfg.modelId,
+        thinking: req.thinking ?? cfg.thinking,
+        signal: abort.signal,
+        onTextDelta: (delta) => this.send("ai:delta", { requestId, delta }),
+        onEvent: (e) => {
+          this.send("ai:agentEvent", {
+            requestId,
+            kind: e.type,
+            text: "text" in e ? e.text : undefined,
+            tool: "name" in e ? e.name : undefined,
+            args: e.type === "tool_call" ? e.args : undefined,
+            isError: e.type === "tool_result" ? e.isError : undefined,
+            callId: "id" in e ? e.id : undefined,
+          });
+        },
+        confirm: (tool, args) => this.awaitConfirm(requestId, tool, args),
+      });
+      return { requestId, ok: result.stopped !== "error", text: result.text };
+    } catch (err) {
+      return { requestId, ok: false, message: err instanceof Error ? err.message : String(err) };
+    } finally {
+      this.aborts.delete(requestId);
+    }
+  }
+
+  /** Ask the renderer to approve a write/destructive tool, resolving on its answer. */
+  private awaitConfirm(requestId: string, tool: GitTool, args: Record<string, unknown>): Promise<boolean> {
+    const callId = `${requestId}:${randomUUID()}`;
+    this.send("ai:confirmRequest", {
+      requestId,
+      callId,
+      tool: tool.name,
+      title: tool.title,
+      summary: summarizeArgs(tool, args),
+      mode: tool.mode === "destructive" ? "destructive" : "write",
+    });
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.confirms.delete(callId);
+        resolve(false);
+      }, CONFIRM_TIMEOUT_MS);
+      this.confirms.set(callId, (approved) => {
+        clearTimeout(timer);
+        resolve(approved);
+      });
+    });
+  }
+
+  confirmAnswer(answer: AgentConfirmAnswer): void {
+    const resolve = this.confirms.get(answer.callId);
+    if (resolve) {
+      this.confirms.delete(answer.callId);
+      resolve(answer.approved);
+    }
+  }
+
+  // ── MCP "Agent Access" ───────────────────────────────────────────────────────
+
+  mcpInfo(): McpInfo {
+    return mcpInfo(this.repos.current()?.root);
+  }
+
+  mcpInstall(req: McpInstallRequest): { ok: boolean; message: string } {
+    return installMcp(this.repos.current()?.root, req);
+  }
+
+  // ── Assistant chats (persisted sessions) ─────────────────────────────────────
+
+  private static chatView(s: ChatSession): ChatView {
+    return {
+      id: s.id,
+      title: s.title,
+      connectionId: s.connectionId,
+      turns: s.turns.map((t) => ({ role: t.role, text: t.text })),
+    };
+  }
+
+  async chatList(): Promise<ChatSummary[]> {
+    const root = this.repos.current()?.root;
+    if (!root) return [];
+    return (await this.chats.list(root)).map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt }));
+  }
+
+  async chatGet(id: string): Promise<ChatView | undefined> {
+    const s = await this.chats.get(id);
+    return s ? AiBridge.chatView(s) : undefined;
+  }
+
+  async chatCurrent(): Promise<ChatView | undefined> {
+    const root = this.repos.current()?.root;
+    if (!root) return undefined;
+    const s = await this.chats.current(root);
+    return s ? AiBridge.chatView(s) : undefined;
+  }
+
+  async chatNew(makeCurrent = true): Promise<ChatView | undefined> {
+    await this.ensureLoaded();
+    const root = this.repos.current()?.root;
+    const conn = pickConnection(this.settings);
+    if (!root || !conn) return undefined;
+    const s = await this.chats.create(root, conn.id, randomUUID(), makeCurrent);
+    return AiBridge.chatView(s);
+  }
+
+  async chatSetCurrent(id: string): Promise<void> {
+    const root = this.repos.current()?.root;
+    if (root) await this.chats.setCurrent(root, id);
+  }
+
+  async chatDelete(id: string): Promise<void> {
+    await this.chats.delete(id);
+  }
+
+  /** Send a message in a chat — warm CLI session for a CLI provider, multi-turn agent for HTTP. */
+  async chatSend(req: ChatSendRequest): Promise<AiDone> {
+    const { chatId, requestId } = req;
+    const session = await this.chats.get(chatId);
+    if (!session) {
+      return { requestId, ok: false, expected: true, message: l10n.t("This chat no longer exists.") };
+    }
+    const resolved = await this.resolveProvider(session.connectionId, "agent");
+    if (!resolved) {
+      return {
+        requestId,
+        ok: false,
+        expected: true,
+        message: l10n.t("No AI model is connected. Add one in Settings ▸ AI."),
+      };
+    }
+    const ctx = this.repos.getContext();
+    if (!ctx) {
+      return { requestId, ok: false, expected: true, message: l10n.t("Open a repository first.") };
+    }
+    const cfg = this.agentConfig();
+    const abort = new AbortController();
+    this.aborts.set(requestId, abort);
+    // History (prior turns) is captured BEFORE we append this user message.
+    const history = session.turns.map((t) => ({ role: t.role, content: t.text }));
+    await this.chats.appendTurn(chatId, { role: "user", text: req.goal, at: Date.now() });
+
+    try {
+      if (resolved.conn.wire === "cli") {
+        const model = req.modelId ?? resolveModelId(resolved.conn, cfg.model);
+        const warm = this.chats.warmFor(chatId, { cwd: ctx.root, model, resumeId: session.cliSessionId });
+        // Cold start (the agent process needs booting) reads as "Loading", not
+        // a silent spinner; a warm session goes straight to "Thinking".
+        if (!warm.warm) {
+          this.send("ai:agentEvent", { requestId, kind: "status", text: l10n.t("Loading the agent") });
+        }
+        const prompt = withThinking(req.goal, req.thinking ?? cfg.thinking);
+        let acc = "";
+        const text = await warm.send(prompt, {
+          onDelta: (d) => {
+            acc += d;
+            this.send("ai:delta", { requestId, delta: d });
+          },
+          signal: abort.signal,
+        });
+        await this.chats.setCliSessionId(chatId, warm.id);
+        const final = (text || acc).trim();
+        await this.chats.appendTurn(chatId, { role: "assistant", text: final, at: Date.now() });
+        return { requestId, ok: true, text: final };
+      }
+
+      const host = createGitToolHost(ctx);
+      const tools = selectTools({ write: req.allowWrite, destructive: req.allowDestructive });
+      const result = await runAgent(req.goal, {
+        provider: resolved.provider,
+        host,
+        tools,
+        model: cfg.model,
+        modelId: req.modelId ?? cfg.modelId,
+        thinking: req.thinking ?? cfg.thinking,
+        history,
+        signal: abort.signal,
+        onTextDelta: (delta) => this.send("ai:delta", { requestId, delta }),
+        onEvent: (e) => {
+          this.send("ai:agentEvent", {
+            requestId,
+            kind: e.type,
+            text: "text" in e ? e.text : undefined,
+            tool: "name" in e ? e.name : undefined,
+            args: e.type === "tool_call" ? e.args : undefined,
+            isError: e.type === "tool_result" ? e.isError : undefined,
+            callId: "id" in e ? e.id : undefined,
+          });
+        },
+        confirm: (tool, args) => this.awaitConfirm(requestId, tool, args),
+      });
+      await this.chats.appendTurn(chatId, { role: "assistant", text: result.text, at: Date.now() });
+      return { requestId, ok: result.stopped !== "error", text: result.text };
+    } catch (err) {
+      return { requestId, ok: false, message: err instanceof Error ? err.message : String(err) };
+    } finally {
+      this.aborts.delete(requestId);
+    }
+  }
+
+  /** Kill warm CLI processes (called on app quit). */
+  dispose(): void {
+    this.chats.disposeAll();
+  }
+}
+
+/** A short, human-readable summary of what a tool call will do, for the confirm UI. */
+/** The sentence a human reads before approving an agent's write.
+ *
+ *  Exported for its test: this is the LAST gate before an automated actor does
+ *  something to the repository, and the destructive cases have to say what is
+ *  lost. They once read weaker than the app's own confirm dialogs for the same
+ *  operations — "Reset (hard) to abc123." asked you to approve, in git's
+ *  vocabulary, the destruction of every uncommitted change you had. */
+export function summarizeArgs(tool: GitTool, args: Record<string, unknown>): string {
+  switch (tool.name) {
+    case "git_commit":
+      return l10n.t("Commit staged changes:\n“{0}”", String(args.message ?? "").split("\n")[0]);
+    case "git_stage":
+      return args.all ? l10n.t("Stage all changes.") : l10n.t("Stage: {0}", asList(args.paths));
+    case "git_unstage":
+      return args.all ? l10n.t("Unstage everything.") : l10n.t("Unstage: {0}", asList(args.paths));
+    case "git_create_branch":
+      return args.checkout
+        ? l10n.t("Create branch “{0}” and switch to it.", String(args.name ?? ""))
+        : l10n.t("Create branch “{0}”.", String(args.name ?? ""));
+    case "git_checkout":
+      return l10n.t("Switch to “{0}”.", String(args.ref ?? ""));
+    case "git_stash_save":
+      return args.message
+        ? l10n.t("Stash working-tree changes (“{0}”).", String(args.message))
+        : l10n.t("Stash working-tree changes.");
+    // The three destructive ones say what the app's OWN confirm dialogs say for
+    // the same operations. They used to be the weakest text in the app for the
+    // most dangerous thing in it: "Reset (hard) to abc123." asked you to
+    // approve, in git's vocabulary, the deletion of every uncommitted change
+    // you had — while pressing Discard on one file by hand spelled out that it
+    // could not be undone. The agent's confirm is the LAST gate before an
+    // automated actor does it, so it should read stronger, not weaker.
+    case "git_discard":
+      return l10n.t(
+        "Discard your changes to: {0}\n\nTheir current contents are lost. This can't be undone, and files git isn't tracking are deleted from disk outright.",
+        asList(args.paths),
+      );
+    case "git_delete_branch":
+      return args.force
+        ? l10n.t(
+            "Delete branch “{0}”.\n\nForced: commits on it that are not merged anywhere else go with it.",
+            String(args.name ?? ""),
+          )
+        : l10n.t("Delete branch “{0}”.", String(args.name ?? ""));
+    case "git_reset": {
+      const mode = String(args.mode ?? "");
+      const to = String(args.ref ?? "");
+      const modeLabel = mode || "mixed";
+      if (mode === "hard") {
+        return l10n.t(
+          "Move this branch to {0} ({1} reset).\n\nEvery uncommitted change in your working tree is destroyed. This can't be undone.",
+          to,
+          modeLabel,
+        );
+      }
+      if (mode === "soft") {
+        return l10n.t(
+          "Move this branch to {0} ({1} reset).\n\nThe commits are undone; their changes stay staged.",
+          to,
+          modeLabel,
+        );
+      }
+      return l10n.t(
+        "Move this branch to {0} ({1} reset).\n\nThe commits are undone; their changes stay in your working tree.",
+        to,
+        modeLabel,
+      );
+    }
+    default:
+      return l10n.t("{0}: {1}", tool.title, JSON.stringify(args));
+  }
+}
+
+function asList(v: unknown): string {
+  return Array.isArray(v) ? v.map(String).join(", ") : String(v ?? "");
+}
+
+/**
+ * Whether a failed connection test is the provider's answer about the
+ * connection itself (see AiBridge.test): an AiError with no status — no model
+ * configured, cancelled, or the network itself (the providers build the key
+ * and the request before the fetch's try, so a failure of ours there is never
+ * "couldn't reach") — a refused key (401/403), a rate limit (429), or the
+ * provider's own trouble (5xx).
+ *
+ * Not 404. It is what a wrong base URL or model id gets, and also what a URL
+ * our endpoint() joined wrong gets (it has, once: "…/gpt//chat/completions"),
+ * and the two cannot be told apart from here.
+ */
+export function connectionAnswer(err: unknown): boolean {
+  if (!(err instanceof AiError)) return false;
+  const s = err.status;
+  return s === undefined || s === 401 || s === 403 || s === 429 || s >= 500;
+}

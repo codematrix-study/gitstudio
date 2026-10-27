@@ -1,0 +1,455 @@
+// The "Output" tab body: a live, scrollback log of every git command GitStudio
+// runs on the open repo. It subscribes to the main process's `git:log` event the
+// moment it's constructed (so the log fills even while the dock is collapsed),
+// keeps a capped ring of rows, and sticks to the bottom unless the user has
+// scrolled up to read history.
+//
+// Readability contract:
+// - Commands executed by ONE user action (same `actionId`, tagged by the main
+//   process) group under that action's label ("Pull", "Commit", …) once the
+//   action runs a 2nd command; single-command actions stay lean rows with a
+//   muted action tag. Group headers are collapsible and total their commands.
+// - Consecutive identical single-command actions coalesce into one ×N row
+//   (background pollers would otherwise flood the log).
+// - The subcommand carries the line ("git" is muted; `fetch` is the keyword).
+// - Failures are tinted, show their exit code, and expand on click to reveal
+//   the captured stderr — the WHY, not just the fact.
+// - A sticky toolbar shows totals, filters to failures only, and clears.
+
+import { host } from "./bridge";
+import { el, span, glyph, copyText } from "./ui";
+import type { GitLogEntry } from "../shared/ipc";
+import * as l10n from "@vscode/l10n";
+
+/** Hard cap on rendered top-level blocks (rows/groups). */
+const MAX_BLOCKS = 600;
+/** Durations at/above this read as slow and get the warn tint. */
+const SLOW_MS = 800;
+
+/** The in-flight action being appended to (one group / lean row). */
+interface ActionCtx {
+  actionId: number | undefined;
+  action: string | undefined;
+  /** Group container + body once promoted (2+ commands). */
+  group: HTMLElement | null;
+  body: HTMLElement | null;
+  /** Live header meta (count · duration), present once promoted. */
+  meta: HTMLElement | null;
+  rows: HTMLElement[];
+  count: number;
+  totalMs: number;
+  failed: boolean;
+  /** For in-group ×N coalescing of an immediately repeated command. */
+  lastCommand: string | null;
+  lastRow: HTMLElement | null;
+  repeat: number;
+}
+
+export class OutputsPanel {
+  /** The tab surface — the scrolling list ALONE. */
+  readonly el: HTMLElement;
+  /**
+   * The panel's controls, for the dock to mount in its footer's action slot.
+   *
+   * These used to be a sticky bar on top of `el`, which gave Output a 40px
+   * chrome row that Terminal did not have — so the dock's content origin
+   * jumped as you switched tabs. The dock already owns one horizontal control
+   * row (its footer); this is that row's Output half.
+   */
+  readonly bar: HTMLElement;
+  private readonly scroller: HTMLElement;
+  private readonly list: HTMLElement;
+  private readonly empty: HTMLElement;
+  private readonly countEl: HTMLElement;
+  private off: (() => void) | null = null;
+  private stick = true;
+  private total = 0;
+  private failed = 0;
+  private failuresOnly = false;
+  /** Set in the constructor; the one place the filter's three surfaces
+   *  (the flag, the button, the wrapper class) are changed together. */
+  private setFailuresOnly!: (on: boolean) => void;
+  private filteredEmpty!: HTMLElement;
+  /** Filter + clear — hidden while there is nothing to filter or clear. */
+  private readonly controls: HTMLButtonElement[];
+  private ctx: ActionCtx | null = null;
+  /** The last CLOSED single-command action, for cross-action ×N coalescing. */
+  private lastSingle: {
+    command: string;
+    action: string | undefined;
+    row: HTMLElement;
+    count: number;
+  } | null = null;
+
+  /** `root`: the repository whose commands this log shows — each repository tab has its own dock, and every git command of every tab arrives here (issue #32). Undefined shows them all. */
+  constructor(private readonly root?: string) {
+    this.el = el("div", "outputs-wrap");
+
+    // ── Controls: totals · failures filter · clear ────────────────────────
+    const bar = el("div", "outputs-bar");
+    this.bar = bar;
+    this.countEl = el("span", "outputs-count");
+    // Footer-native buttons, NOT `.mini-btn`.
+    //
+    // These live in the dock's 23px status bar, and `.mini-btn` is a 28px
+    // bordered pill with a sheen — so the pair stood 5px proud of the bar it
+    // sits in, bled over the hairline above and, with the dock collapsed,
+    // 3px past the bottom of the window. They also read as the loudest thing
+    // on screen next to the quiet "Output / Terminal" tabs.
+    const failBtn = el("button", "outputs-act-btn outputs-failbtn") as HTMLButtonElement;
+    // A FILTER, not an error. `error` is a filled ✕-in-a-circle and `clear-all`
+    // is a ✕ with lines, so the two adjacent controls both wore a cross and the
+    // pair read as "cancel / cancel". The filled variant carries the pressed
+    // state in SHAPE as well as colour.
+    const failIcon = glyph("filter");
+    failBtn.append(failIcon, span(l10n.t("Errors only")));
+    failBtn.title = l10n.t("Show only failed commands");
+    failBtn.setAttribute("aria-pressed", "false");
+    this.setFailuresOnly = (on: boolean): void => {
+      this.failuresOnly = on;
+      failBtn.setAttribute("aria-pressed", String(on));
+      failIcon.className = `glyph codicon codicon-${on ? "filter-filled" : "filter"}`;
+      failBtn.title = on ? l10n.t("Showing only failed commands") : l10n.t("Show only failed commands");
+      this.el.classList.toggle("failures-only", on);
+      this.renderCount();
+    };
+    failBtn.addEventListener("click", () => {
+      this.setFailuresOnly(!this.failuresOnly);
+      if (this.stick) this.scroller.scrollTop = this.scroller.scrollHeight;
+    });
+    const copyBtn = el("button", "outputs-act-btn") as HTMLButtonElement;
+    copyBtn.append(glyph("copy"), span(l10n.t("Copy")));
+    copyBtn.title = l10n.t("Copy the whole log");
+    copyBtn.addEventListener("click", () => void this.copyAll());
+    const clearBtn = el("button", "outputs-act-btn") as HTMLButtonElement;
+    clearBtn.append(glyph("clear-all"), span(l10n.t("Clear")));
+    clearBtn.title = l10n.t("Clear the log");
+    clearBtn.addEventListener("click", () => this.clear());
+    bar.append(this.countEl, failBtn, copyBtn, clearBtn);
+    // Nothing logged yet means nothing to filter and nothing to clear. The
+    // controls used to sit there enabled beside a defiant "0 commands".
+    this.controls = [failBtn, copyBtn, clearBtn];
+
+    // ── Scrolling log ──────────────────────────────────────────────────────
+    this.scroller = el("div", "outputs-panel");
+    this.empty = el("div", "outputs-empty");
+    this.empty.append(
+      span(l10n.t("Git command log"), "outputs-empty-title"),
+      span(l10n.t("Every git command GitStudio runs will appear here."), "outputs-empty-sub"),
+    );
+    // "Errors only" is a CSS filter over the rows — with nothing failed it hid
+    // every one of them and left a blank panel beside a count still reading
+    // "40 commands". A filter that empties a list has to say it was the filter.
+    this.filteredEmpty = el("div", "outputs-empty");
+    this.filteredEmpty.append(
+      span(l10n.t("No failures"), "outputs-empty-title"),
+      span(l10n.t("Nothing has failed. Turn off “Errors only” to see every command."), "outputs-empty-sub"),
+    );
+    this.filteredEmpty.hidden = true;
+    this.list = el("div", "outputs-list");
+    this.scroller.append(this.empty, this.filteredEmpty, this.list);
+    this.el.append(this.scroller);
+    this.renderCount();
+
+    // Stick to the bottom only when the user is already near it.
+    this.scroller.addEventListener("scroll", () => {
+      this.stick =
+        this.scroller.scrollHeight - this.scroller.scrollTop - this.scroller.clientHeight < 32;
+    });
+
+    this.off = host.on("git:log", (e) => {
+      if (this.root && e.root && e.root !== this.root) return;
+      this.append(e);
+    });
+  }
+
+  private renderCount(): void {
+    // An empty log says so once, in the empty state below — not twice, and not
+    // as a count of nothing beside two controls that would do nothing.
+    for (const b of this.controls) b.hidden = this.total === 0;
+    this.filteredEmpty.hidden = !(this.total > 0 && this.failuresOnly && this.failed === 0);
+    if (this.total === 0) {
+      this.countEl.replaceChildren();
+      return;
+    }
+    this.countEl.replaceChildren(
+      span(
+        this.total === 1 ? l10n.t("{0} command", this.total) : l10n.t("{0} commands", this.total),
+        "outputs-count-n",
+      ),
+    );
+    if (this.failed > 0) {
+      this.countEl.append(span(l10n.t("· {0} failed", this.failed), "outputs-count-f"));
+    }
+  }
+
+  private append(e: GitLogEntry): void {
+    if (this.empty.isConnected) this.empty.remove();
+    this.total++;
+    if (e.failed) this.failed++;
+
+    if (this.ctx && e.actionId !== undefined && this.ctx.actionId === e.actionId) {
+      this.appendToAction(this.ctx, e);
+    } else {
+      this.startAction(e);
+    }
+
+    // Trim the oldest top-level blocks past the cap.
+    while (this.list.childElementCount > MAX_BLOCKS) {
+      this.list.firstElementChild?.remove();
+    }
+    this.renderCount();
+    if (this.stick) this.scroller.scrollTop = this.scroller.scrollHeight;
+  }
+
+  /** Close the current action and open a new one for this entry. */
+  private startAction(e: GitLogEntry): void {
+    // The previous action closed as a lean single row → remember it so an
+    // identical follow-up action (the status poller) coalesces into ×N.
+    const prev = this.ctx;
+    if (prev && !prev.group && prev.count === 1 && !prev.failed) {
+      this.lastSingle = {
+        command: prev.lastCommand ?? "",
+        action: prev.action,
+        row: prev.rows[0],
+        count: this.lastSingle && this.lastSingle.row === prev.rows[0]
+          ? this.lastSingle.count
+          : 1,
+      };
+    } else if (prev) {
+      this.lastSingle = null;
+    }
+
+    // Cross-action ×N: an identical, successful, single-command action right
+    // after the same one bumps the existing row instead of adding a line.
+    if (
+      this.lastSingle &&
+      !e.failed &&
+      this.lastSingle.command === e.command &&
+      this.lastSingle.action === e.action
+    ) {
+      this.lastSingle.count++;
+      this.updateRepeat(this.lastSingle.row, this.lastSingle.count, e);
+      this.ctx = null;
+      return;
+    }
+
+    const row = this.buildRow(e, true);
+    this.list.appendChild(row);
+    this.ctx = {
+      actionId: e.actionId,
+      action: e.action,
+      group: null,
+      body: null,
+      meta: null,
+      rows: [row],
+      count: 1,
+      totalMs: e.durationMs,
+      failed: e.failed,
+      lastCommand: e.command,
+      lastRow: row,
+      repeat: 1,
+    };
+  }
+
+  /** A 2nd+ command for the SAME action: group it under the action label. */
+  private appendToAction(ctx: ActionCtx, e: GitLogEntry): void {
+    this.lastSingle = null;
+    // Immediate repeat of the same successful command inside the action.
+    if (!e.failed && ctx.lastCommand === e.command && ctx.lastRow) {
+      ctx.repeat++;
+      ctx.count++;
+      ctx.totalMs += e.durationMs;
+      this.updateRepeat(ctx.lastRow, ctx.repeat, e);
+      this.updateGroupMeta(ctx);
+      return;
+    }
+
+    if (!ctx.group) this.promoteToGroup(ctx);
+
+    const row = this.buildRow(e, false);
+    ctx.body!.appendChild(row);
+    ctx.rows.push(row);
+    ctx.count++;
+    ctx.totalMs += e.durationMs;
+    ctx.lastCommand = e.command;
+    ctx.lastRow = row;
+    ctx.repeat = 1;
+    if (e.failed) {
+      ctx.failed = true;
+      ctx.group!.classList.add("has-fail");
+    }
+    this.updateGroupMeta(ctx);
+  }
+
+  /** Wrap a lean first row into a labeled, collapsible action group. */
+  private promoteToGroup(ctx: ActionCtx): void {
+    const group = el("div", "outputs-group" + (ctx.failed ? " has-fail" : ""));
+    const head = el("button", "outputs-group-head") as HTMLButtonElement;
+    const chev = glyph("chevron-down");
+    chev.classList.add("outputs-group-chev");
+    const label = span(ctx.action ?? l10n.t("Action"), "outputs-group-label");
+    const meta = span("", "outputs-group-meta");
+    head.append(chev, label, meta);
+    head.setAttribute("aria-expanded", "true");
+    head.addEventListener("click", () => {
+      const collapsed = group.classList.toggle("is-collapsed");
+      head.setAttribute("aria-expanded", String(!collapsed));
+    });
+    const body = el("div", "outputs-group-body");
+
+    const first = ctx.rows[0];
+    this.list.replaceChild(group, first);
+    // The first row's inline action tag is redundant under the group header.
+    first.querySelector(".outputs-act")?.remove();
+    body.appendChild(first);
+    group.append(head, body);
+    ctx.group = group;
+    ctx.body = body;
+    ctx.meta = meta;
+  }
+
+  private updateGroupMeta(ctx: ActionCtx): void {
+    if (ctx.meta) {
+      ctx.meta.textContent =
+        ctx.count === 1
+          ? l10n.t("{0} command · {1}", ctx.count, dur(ctx.totalMs))
+          : l10n.t("{0} commands · {1}", ctx.count, dur(ctx.totalMs));
+    }
+  }
+
+  /** One log line: time · git subcommand args · [action] · ×N · duration. */
+  private buildRow(e: GitLogEntry, leanTag: boolean): HTMLElement {
+    const row = el("div", "outputs-row" + (e.failed ? " is-failed" : ""));
+    const line = el("div", "outputs-line");
+    const sub = e.args[0] ?? "";
+    const rest = e.args.slice(1).join(" ");
+    line.append(
+      span(clock(e.at), "outputs-time"),
+      span("git", "outputs-kw"),
+      span(sub, "outputs-sub"),
+      span(rest, "outputs-args"),
+    );
+    // Lean (ungrouped) rows carry their action as a muted inline tag.
+    if (leanTag && e.action) {
+      line.appendChild(span(e.action, "outputs-act"));
+    }
+    line.append(
+      span("", "outputs-rep"),
+      span(dur(e.durationMs), "outputs-dur" + (e.durationMs >= SLOW_MS ? " is-slow" : "")),
+    );
+    if (e.failed || (e.exitCode !== null && e.exitCode !== 0)) {
+      const code = el("span", "outputs-code");
+      code.textContent = e.exitCode === null ? l10n.t("error") : l10n.t("exit {0}", e.exitCode);
+      line.appendChild(code);
+    }
+    row.appendChild(line);
+
+    // Failures expand to show WHY (the captured stderr).
+    const err = e.failed ? (e.stderr ?? "").trim() : "";
+    if (err) {
+      const chev = glyph("chevron-right");
+      chev.classList.add("outputs-chevron");
+      line.prepend(chev);
+      const detail = el("pre", "outputs-stderr");
+      detail.textContent = err;
+      row.appendChild(detail);
+      line.setAttribute("role", "button");
+      line.setAttribute("tabindex", "0");
+      line.title = l10n.t("Show error output");
+      const toggle = (): void => {
+        const open = row.classList.toggle("is-open");
+        line.title = open ? l10n.t("Hide error output") : l10n.t("Show error output");
+      };
+      line.addEventListener("click", toggle);
+      line.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+    }
+    return row;
+  }
+
+  /** Refresh a coalesced row in place: ×N badge, latest time + duration. */
+  private updateRepeat(row: HTMLElement, count: number, e: GitLogEntry): void {
+    const rep = row.querySelector(".outputs-rep");
+    if (rep) rep.textContent = `×${count}`;
+    const time = row.querySelector(".outputs-time");
+    if (time) time.textContent = clock(e.at);
+    const d = row.querySelector(".outputs-dur");
+    if (d) {
+      d.textContent = dur(e.durationMs);
+      d.classList.toggle("is-slow", e.durationMs >= SLOW_MS);
+    }
+  }
+
+  /** Clear the log. */
+  /** Called when the Output tab becomes visible: land on the NEWEST command.
+   *
+   *  The panel is hidden with `display: none` while another tab is up, so its
+   *  scroller has no height and `scrollTop` cannot be set — every log entry
+   *  that arrived meanwhile left it pinned at 0. Opening Output therefore
+   *  showed the OLDEST command in the session, and the next git command to
+   *  finish hit `if (this.stick)` and jerked the pane a thousand pixels to the
+   *  bottom, unasked.
+   *
+   *  A log is read from its tail; `stick` already says the reader has not
+   *  moved away from it. */
+  reveal(): void {
+    if (this.stick) this.scroller.scrollTop = this.scroller.scrollHeight;
+  }
+
+  clear(): void {
+    this.list.replaceChildren();
+    this.ctx = null;
+    this.lastSingle = null;
+    this.total = 0;
+    this.failed = 0;
+    this.setFailuresOnly(false);
+    // Turn the filter OFF with it. `renderCount` hides both controls at zero,
+    // so clearing while "Errors only" was on left the toggle switched on and
+    // out of reach — every command logged afterwards was filtered away by a
+    // control the reader could no longer see, and the panel looked dead.
+    this.renderCount();
+    if (!this.empty.isConnected) this.scroller.insertBefore(this.empty, this.list);
+  }
+
+  /**
+   * The whole log as text, for the clipboard.
+   *
+   * Reading the DOM rather than a parallel model on purpose: what a person
+   * means by "copy this" is what they can see, which includes the ×N
+   * coalescing, the durations and the stderr — and it stays correct for free
+   * when the rendering changes. When "Errors only" is on, this copies what the
+   * filter left, because that is what is on screen.
+   */
+  private async copyAll(): Promise<void> {
+    const rows = [...this.list.querySelectorAll<HTMLElement>(".outputs-line, .outputs-group-head")];
+    const visible = rows.filter((r) => r.offsetParent !== null);
+    const text = visible
+      .map((r) => (r.innerText ?? r.textContent ?? "").replace(/\s*\n\s*/g, " ").trim())
+      .filter(Boolean)
+      .join("\n");
+    if (!text) return;
+    await copyText(text, this.failuresOnly ? l10n.t("Failed commands copied.") : l10n.t("Command log copied."));
+  }
+
+  dispose(): void {
+    this.off?.();
+    this.off = null;
+  }
+}
+
+/** Format an epoch (ms) as a local HH:MM:SS clock. */
+function clock(at: number): string {
+  const d = new Date(at);
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** Compact duration: 45ms, 1.3s. */
+function dur(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}

@@ -1,0 +1,42 @@
+node_modules/
+dist/
+out/
+# electron-builder's output (apps/desktop/electron-builder.yml). Anchored: a bare
+# "release/" also hid scripts/release/, which the release workflows run.
+/apps/desktop/release/
+*.vsix
+.DS_Store
+.vscode-test/
+
+# IDE dependency-graph plugin artifacts
+.dependencygraph/
+
+# Claude Code's per-repo scratch area. It holds nested git worktrees, so a single
+# `git add -A` would otherwise commit entire checkouts into this repo.
+.claude/
+
+# A literal "~" directory, created by an unquoted ~ in a shell command and
+# then swept in by `git add -A`. It held npm logs, not source.
+~/
+
+# A 584KB minified main-process bundle that `npm run package` drops beside
+# package.json. The real output is dist/main/main.js (which package.json's
+# "main" points at, and which dist/ already ignores); this copy is a build
+# side-effect and `git add -A` swept it in.
+apps/desktop/main.js
+
+# Python bytecode from the brand asset scripts.
+__pycache__/
+*.pyc
+
+# Build outputs collected by download.sh.
+downloads/
+
+# c8 coverage reports (CI uploads them to Codecov)
+coverage/
+
+# Translation work batches (scripts/i18n/todo.mjs)
+l10n/.todo/
+
+# graphify: the code graph is built locally (see CLAUDE.md), never committed
+graphify-out/

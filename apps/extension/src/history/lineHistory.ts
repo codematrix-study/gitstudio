@@ -1,0 +1,147 @@
+import * as vscode from "vscode";
+import { failed, notice } from "../ui/notify";
+import type { LineHistoryEntry } from "@gitstudio/git-service/index";
+import type { RepoEntry, RepoManager } from "../git/repoManager";
+import { relativeTime } from "../util/relativeTime";
+import { commitChangeSides, openSidesDiff } from "./revisionContentProvider";
+import { resolveActiveFile } from "./historyContext";
+import { promptPickWithButtons } from "../ui/dialogs";
+import { SHOW_IN_GRAPH_BUTTON, revealInGraph, showInGraphButton } from "./revealInGraph";
+import * as l10n from "@vscode/l10n";
+
+/**
+ * `gitstudio.showLineHistory`: walks the evolution of the active selection's
+ * line range. Presents the commits that touched those lines in a GitStudio
+ * dialog; the pick opens that commit's diff for the file. The dialog re-opens
+ * after each diff so you can step through the range's history without
+ * re-invoking.
+ */
+export async function showLineHistory(repos: RepoManager): Promise<void> {
+  const active = resolveActiveFile(repos);
+  if (!active) {
+    return;
+  }
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return;
+  }
+
+  // 1-based inclusive line range from the selection (a caret = a single line).
+  const sel = editor.selection;
+  const startLine = sel.start.line + 1;
+  const endLine = sel.end.line + 1;
+
+  let entries: LineHistoryEntry[];
+  try {
+    entries = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Window,
+        title: l10n.t("Loading line history ({0}–{1})…", startLine, endLine),
+      },
+      () =>
+        active.entry.ctx.history.lineHistory(active.rel, startLine, endLine, {
+          maxCount: 200,
+        }),
+    );
+  } catch (err) {
+    void vscode.window.showErrorMessage(failed(l10n.t("Line history"), err instanceof Error ? err.message : String(err)));
+    return;
+  }
+
+  if (entries.length === 0) {
+    void vscode.window.showInformationMessage(
+      notice(l10n.t("No history for lines {0}–{1} of {2}.", startLine, endLine, baseName(active.rel))),
+    );
+    return;
+  }
+
+  const range =
+    startLine === endLine ? `line ${startLine}` : l10n.t("lines {0}–{1}", startLine, endLine);
+  const fileName = baseName(active.rel);
+
+  // The walker: pick a commit → open its diff → reopen the QuickPick so the
+  // user can step to an older/newer revision. Escape closes the loop.
+  let keepWalking = true;
+  while (keepWalking) {
+    const choice = await pickCommit(entries, `${fileName} · ${range}`);
+    const picked = choice?.entry;
+    if (!picked) {
+      keepWalking = false;
+      break;
+    }
+    if (choice?.button === SHOW_IN_GRAPH_BUTTON) {
+      // Where the commit sits in the graph is the answer: the walk ends there.
+      await revealInGraph(repos, active.entry, picked.sha);
+      break;
+    }
+    // `git log -L` follows the lines through renames, so the picked commit
+    // may know the file by an older name. Its name there, and in its parent,
+    // come from the file's own history; built from today's name, a commit
+    // before a rename opened as an empty diff.
+    const at = await pathsAt(active.entry, active.rel, picked.sha);
+    await openSidesDiff(
+      active.entry.root,
+      active.rel,
+      commitChangeSides({ sha: picked.sha, parent: `${picked.sha}~1`, ...at }),
+      `${fileName} (${picked.shortSha})`,
+      "history",
+    );
+    revealRange(startLine, endLine);
+  }
+}
+
+/** The file's path in `sha`, and in its parent when `sha` renamed it (today's name when not found). */
+async function pathsAt(
+  entry: RepoEntry,
+  rel: string,
+  sha: string,
+): Promise<{ path: string; oldPath?: string }> {
+  try {
+    const hit = (await entry.ctx.history.fileHistory(rel, { follow: true })).find((h) => h.sha === sha);
+    if (hit) {
+      return { path: hit.path, oldPath: hit.oldPath };
+    }
+  } catch {
+    // Fall through to today's name.
+  }
+  return { path: rel };
+}
+
+async function pickCommit(
+  entries: LineHistoryEntry[],
+  title: string,
+): Promise<{ entry: LineHistoryEntry; button?: string } | undefined> {
+  const graph = showInGraphButton();
+  const picked = await promptPickWithButtons({
+    title: l10n.t("Line History — {0}", title),
+    hint: l10n.t("Pick a commit to diff it against its parent."),
+    choices: entries.map((e, i) => ({
+      id: String(i),
+      label: e.subject,
+      icon: "git-commit",
+      detail: e.shortSha,
+      description: `${e.author} · ${relativeTime(e.authorDate)}`,
+      buttons: [graph],
+    })),
+  });
+  const entry = picked === undefined ? undefined : entries[Number(picked.id)];
+  return entry ? { entry, button: picked?.button } : undefined;
+}
+
+/** Best-effort scroll of the freshly-opened diff to the range of interest. */
+function revealRange(startLine: number, endLine: number): void {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return;
+  }
+  const max = editor.document.lineCount;
+  const from = Math.min(Math.max(startLine - 1, 0), Math.max(max - 1, 0));
+  const to = Math.min(Math.max(endLine - 1, 0), Math.max(max - 1, 0));
+  const range = new vscode.Range(from, 0, to, 0);
+  editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
+
+function baseName(rel: string): string {
+  const parts = rel.replace(/\\/g, "/").split("/");
+  return parts[parts.length - 1] || rel;
+}

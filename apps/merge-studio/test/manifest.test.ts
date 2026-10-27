@@ -1,0 +1,431 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { configurationProperties } from "@gitstudio/merge-vscode/contract";
+import {
+  MS_DEFERS_CONTEXT_KEY,
+  MS_MERGE_VIEW_TYPES,
+  MS_OPERATION_CONTEXT_KEY,
+  MS_SUPPORT_COMMAND,
+  MS_WALKTHROUGH_ID,
+} from "../src/ids";
+import { MS_SPONSOR_URL } from "../src/links";
+
+// Merge Studio's own listing: the manifest's brand slots, the walkthrough, the
+// README and the CHANGELOG (POLISH B1, B2, B4, B5). The shared merge contract
+// and the GitStudio twins are parity.test.ts.
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
+
+interface Step {
+  id: string;
+  title: string;
+  description: string;
+  when?: string;
+  media: { svg?: string; image?: string | Record<string, string>; markdown?: string; altText?: string };
+  completionEvents?: string[];
+}
+// The manifest as VS Code shows it in English: every `%key%` looked up in
+// package.nls.json, so these tests read the words, not the keys.
+const nls = JSON.parse(read("package.nls.json")) as Record<string, string>;
+const localize = (value: unknown): unknown =>
+  typeof value === "string"
+    ? value.length > 2 && value.startsWith("%") && value.endsWith("%") && value.slice(1, -1) in nls
+      ? nls[value.slice(1, -1)]
+      : value
+    : Array.isArray(value)
+      ? value.map(localize)
+      : value && typeof value === "object"
+        ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, localize(v)]))
+        : value;
+const pkg = localize(JSON.parse(read("package.json"))) as {
+  name: string;
+  publisher: string;
+  version: string;
+  license: string;
+  engines: { vscode: string };
+  repository: { url: string };
+  keywords: string[];
+  contributes: {
+    commands: { command: string; icon?: string }[];
+    menus: Record<string, { command?: string; when?: string }[]>;
+    configuration: unknown;
+    customEditors: { viewType: string; displayName: string; priority?: string; selector: { filenamePattern: string }[] }[];
+    walkthroughs: { id: string; steps: Step[] }[];
+  };
+};
+
+test("the extension id, publisher and repository are Merge Studio's", () => {
+  assert.equal(`${pkg.publisher}.${pkg.name}`, "gitstudio.merge-studio");
+  assert.match(pkg.repository.url, /GitStudioHQ\/merge-studio/);
+});
+
+test("the committed version is a release version, never a test build's", () => {
+  // The first release on the shared packages was 1.0.0 (the owner's call, not
+  // 0.4.0). Test VSIXs are packaged as 1.0.9001, 1.0.9002, … and package.json
+  // is restored after: a patch number of 9000 or more is a test build.
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(pkg.version);
+  assert.ok(m, `a plain x.y.z version (${pkg.version})`);
+  assert.ok(Number(m[1]) >= 1, `1.0.0 or later (${pkg.version})`);
+  assert.ok(Number(m[3]) < 9000, `not a test build's number (${pkg.version})`);
+});
+
+test("keywords: at most 30, and none that only name other editors (POLISH B1)", () => {
+  assert.ok(pkg.keywords.length <= 30, `${pkg.keywords.length} keywords`);
+  for (const k of ["vscode", "windsurf"]) assert.ok(!pkg.keywords.includes(k), k);
+});
+
+test("the merge editor keeps 0.3.4's view type and stays an Open With… option", () => {
+  const editor = pkg.contributes.customEditors.find((e) => e.viewType === MS_MERGE_VIEW_TYPES.mergeEditor);
+  assert.equal(editor?.priority, "option");
+  assert.equal(editor?.displayName, "Merge Studio (3-way merge)");
+});
+
+test("Reopen Editor With… offers the comparison, never an empty 3-pane merge (#110)", () => {
+  const merge = pkg.contributes.customEditors.find((e) => e.viewType === MS_MERGE_VIEW_TYPES.mergeEditor);
+  assert.ok(merge?.selector.every((s) => s.filenamePattern !== "*"), "the merge editor is opened by view type only");
+  const diff = pkg.contributes.customEditors.find((e) => e.viewType === MS_MERGE_VIEW_TYPES.diffEditor);
+  assert.equal(diff?.displayName, "Merge Studio (diff)");
+  assert.equal(diff?.priority, "option");
+});
+
+test("every editor-title button has an icon (no text buttons in the tab bar)", () => {
+  const icons = new Map(pkg.contributes.commands.map((c) => [c.command, c.icon]));
+  for (const e of pkg.contributes.menus["editor/title"]) {
+    assert.ok(icons.get(e.command ?? ""), `${e.command} has no icon`);
+  }
+});
+
+test("Continue / Skip / Abort Operation are in the palette only while something is stopped", () => {
+  // With nothing in progress each one only answered "nothing is in progress".
+  // The shared watcher sets the key (packages/merge-vscode register.ts).
+  for (const id of ["jbMerge.operation.continue", "jbMerge.operation.skip", "jbMerge.operation.abort"]) {
+    const e = pkg.contributes.menus.commandPalette.find((x) => x.command === id);
+    assert.ok(e?.when?.includes(MS_OPERATION_CONTEXT_KEY), `${id}: ${e?.when}`);
+  }
+  assert.match(read("src/msProduct.ts"), /operationContextKey: MS_OPERATION_CONTEXT_KEY/);
+});
+
+test("Restricted Mode is declared as it is: Merge Studio needs VS Code's Git extension, which Restricted Mode turns off", () => {
+  // Verified in an isolated VS Code 1.138 (review r0923b): in an untrusted
+  // folder vscode.git (untrustedWorkspaces.supported: false) is off, so Merge
+  // Studio, which depends on it, never activates — its commands are not even
+  // in the palette. 0.3.4's "limited … everything else works" was untrue.
+  const pkgFull = pkg as unknown as {
+    extensionDependencies: string[];
+    capabilities: { untrustedWorkspaces: { supported: unknown; description: string; restrictedConfigurations?: unknown } };
+  };
+  assert.deepEqual(pkgFull.extensionDependencies, ["vscode.git"]);
+  const trust = pkgFull.capabilities.untrustedWorkspaces;
+  assert.equal(trust.supported, false);
+  assert.equal(trust.restrictedConfigurations, undefined, "only meaningful with limited support");
+  assert.match(trust.description, /Git extension/);
+  assert.doesNotMatch(trust.description, /everything else works/);
+  assert.ok(!readme.includes("In Restricted Mode a workspace cannot set"), "the README says the same");
+});
+
+// ── The walkthrough (POLISH B2) ─────────────────────────────────────────────
+
+const walkthrough = pkg.contributes.walkthroughs.find((w) => w.id === MS_WALKTHROUGH_ID);
+
+test("the walkthrough keeps 0.3.4's id and the step ids that still mean the same thing", () => {
+  assert.ok(walkthrough, "mergeStudio.gettingStarted is gone");
+  const ids = walkthrough.steps.map((s) => s.id);
+  for (const id of ["mergeStudio.tryMerge", "mergeStudio.realConflicts", "mergeStudio.tryDiff"]) {
+    assert.ok(ids.includes(id), id);
+  }
+});
+
+test("six steps whichever product owns the automatic behaviour: 'Choose your merge editor' or 'Using GitStudio too?'", () => {
+  const steps = walkthrough!.steps;
+  assert.equal(steps.length, 7);
+  const shown = (defers: boolean) =>
+    steps.filter((s) => {
+      if (s.when === `!${MS_DEFERS_CONTEXT_KEY}`) return !defers;
+      if (s.when === MS_DEFERS_CONTEXT_KEY) return defers;
+      return true;
+    }).length;
+  assert.equal(shown(false), 6);
+  assert.equal(shown(true), 6);
+  assert.equal(steps.find((s) => s.id === "mergeStudio.handoff"), undefined, "the external-IDE step is gone");
+});
+
+test("every walkthrough link and completion event names a command that exists", () => {
+  const declared = new Set(pkg.contributes.commands.map((c) => c.command));
+  const builtIns = new Set(["workbench.action.openSettings"]);
+  for (const s of walkthrough!.steps) {
+    for (const [, id] of s.description.matchAll(/\(command:([\w.-]+)/g)) {
+      assert.ok(declared.has(id) || builtIns.has(id), `${s.id} links to ${id}`);
+    }
+    for (const ev of s.completionEvents ?? []) {
+      const m = /^onCommand:(.+)$/.exec(ev);
+      if (m) assert.ok(declared.has(m[1]), `${s.id} completes on ${m[1]}`);
+    }
+  }
+});
+
+test("walkthrough text renders as written: no backticks, every media file present", () => {
+  for (const s of walkthrough!.steps) {
+    assert.ok(!s.description.includes("`"), `${s.id} has a backtick`);
+    const files = [s.media.svg, s.media.markdown, ...(typeof s.media.image === "string" ? [s.media.image] : Object.values(s.media.image ?? {}))]
+      .filter((f): f is string => typeof f === "string");
+    assert.ok(files.length > 0, `${s.id} has no media`);
+    for (const f of files) assert.ok(existsSync(join(ROOT, f)), `${s.id}: ${f} is missing`);
+    assert.ok(s.media.altText && s.media.altText.length > 10, `${s.id} has no alt text`);
+  }
+});
+
+test("the walkthrough shows captures from the final build, never a placeholder", () => {
+  // A release gate (POLISH B3): every step's media is a capture.
+  for (const s of walkthrough!.steps) {
+    const files = [s.media.svg, ...(typeof s.media.image === "string" ? [s.media.image] : Object.values(s.media.image ?? {}))]
+      .filter((f): f is string => typeof f === "string");
+    assert.ok(files.length > 0, `${s.id} has no media`);
+    for (const f of files) {
+      assert.ok(existsSync(join(ROOT, f)), `${s.id}: ${f} is missing`);
+      assert.doesNotMatch(readFileSync(join(ROOT, f)).toString("latin1"), /Screenshot pending|Placeholder/, `${s.id}: ${f}`);
+    }
+  }
+});
+
+// ── Support Merge Studio… ───────────────────────────────────────────────────
+//
+// Visible, not annoying: only ever asked for. The Marketplace's ♥ Sponsor
+// button (the manifest's `sponsor` field), the command in the palette, and one
+// line at the end of the walkthrough — nothing in a menu that shows on its own
+// while you merge, no toast, no status-bar item.
+
+test("the Marketplace's Sponsor button is the same GitHub Sponsors page the command opens", () => {
+  assert.equal((pkg as unknown as { sponsor?: { url?: string } }).sponsor?.url, MS_SPONSOR_URL);
+});
+
+test("Support Merge Studio… is declared under jbMerge, listed in the palette, and in no other menu", () => {
+  assert.equal(MS_SUPPORT_COMMAND, "jbMerge.support");
+  const cmd = pkg.contributes.commands.find((c) => c.command === MS_SUPPORT_COMMAND) as unknown;
+  assert.deepEqual(cmd, { command: "jbMerge.support", title: "Support Merge Studio…", category: "Merge Studio", icon: "$(heart)" });
+  const where: string[] = [];
+  for (const [menu, entries] of Object.entries(pkg.contributes.menus)) {
+    for (const e of entries) if (e.command === MS_SUPPORT_COMMAND) where.push(`${menu}${e.when ? ` when ${e.when}` : ""}`);
+  }
+  assert.deepEqual(where, ["commandPalette"]);
+});
+
+test("the walkthrough ends on one quiet line: a link inside a sentence, not a button, not a step", () => {
+  const steps = walkthrough!.steps;
+  const last = steps[steps.length - 1];
+  assert.equal(last.id, "mergeStudio.tryDiff", "the step both variants of the walkthrough end on");
+  const lines = last.description.split("\n");
+  // A line that is ONLY a link renders as a button; text around it keeps it a link.
+  assert.equal(lines[lines.length - 1], "Merge Studio is free and open source. [Support Merge Studio…](command:jbMerge.support)");
+  assert.ok(!(last.completionEvents ?? []).some((e) => e.includes(MS_SUPPORT_COMMAND)), "supporting is never a task to tick off");
+  for (const s of steps.slice(0, -1)) assert.doesNotMatch(s.description, /jbMerge\.support/, `${s.id} does not ask`);
+});
+
+// ── README (POLISH B4) ──────────────────────────────────────────────────────
+
+const readme = read("README.md");
+const shotList = read("SHOTS.md");
+
+test("the README makes none of 0.3.4's claims that are no longer true", () => {
+  for (const phrase of ["never had", "No conflict is missed", "1.74", "vulnerabilities-0", "Cancel Merge", "magic-wand for identical"]) {
+    assert.ok(!readme.includes(phrase), phrase);
+  }
+});
+
+test("every setting is in the README's settings table", () => {
+  const props = Object.keys(configurationProperties(pkg.contributes.configuration));
+  for (const key of props) assert.ok(readme.includes(`\`${key}\``), key);
+});
+
+test("every README image is either in the package or on the shot list captured from the final build", () => {
+  const images = [...readme.matchAll(/!\[[^\]]*\]\(([^)\s]+)\)|<img[^>]+src="([^"]+)"/g)]
+    .map((m) => m[1] ?? m[2])
+    .filter((src) => !/^https?:/.test(src));
+  assert.ok(images.length > 0);
+  for (const src of images) {
+    assert.ok(existsSync(join(ROOT, src)) || shotList.includes(src), `${src} is neither present nor on SHOTS.md`);
+  }
+});
+
+test("every README image exists", () => {
+  // Markdown images AND <img src> tags: the README uses only the tags, and a
+  // markdown-only pattern found none, so this passed with every image missing.
+  const local = [...readme.matchAll(/!\[[^\]]*\]\(([^)\s]+)\)|<img[^>]+src="([^"]+)"/g)]
+    .map((m) => m[1] ?? m[2])
+    .filter((src) => !/^https?:/.test(src));
+  assert.ok(local.length >= 7, `found ${local.length} local images`);
+  for (const src of local) assert.ok(existsSync(join(ROOT, src)), src);
+});
+
+test("the dashboard captures' words are the dashboard's own, as the 1.0 build says them", () => {
+  // Re-taken when the dashboard learned to name the step (r0923): its heading
+  // is the operation's ("Rebase conflicts"), a rebase's last commit resolved
+  // reads "Last commit resolved", and a row's pill names the side's branch.
+  const alt = (file: string) => readme.match(new RegExp(`<img src="media/screenshots/${file}" alt="([^"]+)"`))?.[1] ?? "";
+  const rebase = alt("dashboard-rebase.png");
+  const done = alt("dashboard-done.png");
+  assert.match(rebase, /Rebase conflicts/, rebase);
+  assert.match(done, /Last commit resolved/, done);
+  assert.match(done, /kept yours · test/, done);
+  assert.doesNotMatch(done, /All conflicts resolved/, "the card a rebase shows at its last commit");
+  const shots = read("SHOTS.md");
+  assert.match(shots, /"Last commit resolved"/, "SHOTS.md describes the capture that exists");
+});
+
+// ── CHANGELOG (POLISH B5) ───────────────────────────────────────────────────
+
+const changelog = read("CHANGELOG.md");
+const entries = changelog.split(/\n## /).slice(1);
+// The next release's notes, gathered under "Unreleased" until it is cut.
+const released = entries.filter((e) => !/^\[?Unreleased\]?\s*\n/i.test(e));
+// Found by version: a later release's entry sits above it.
+const entry100 = entries.find((e) => /^1\.0\.0\b/.test(e)) ?? "";
+const sectionsOf = (entry: string) => entry.split(/\n### /).slice(1);
+
+test("the newest CHANGELOG entry is the version package.json ships", () => {
+  // Compared as text: the heading is "1.0.1 — 2026-09-25". An "Unreleased"
+  // section above it is the next release's.
+  const heading = (released[0] ?? "").split("\n")[0];
+  assert.ok(heading === pkg.version || heading.startsWith(`${pkg.version} `), `the first entry is ${pkg.version} (it is "${heading}")`);
+});
+
+test("the 1.0.0 entry leads with the heads-up about Yours in a rebase", () => {
+  assert.match(entry100, /^1\.0\.0\b/);
+  const firstLine = entry100.split("\n").slice(1).find((l) => l.trim() !== "") ?? "";
+  assert.match(firstLine, /^\*\*Heads-up: during a rebase, Yours is now your commit, on the left\.\*\*/);
+});
+
+test("the 1.0.0 entry is in the user's words (no internals, no invented symbols)", () => {
+  // Code spans are what the user types or sees (a setting's value, a git
+  // command), so they are not prose.
+  const prose = entry100.replace(/`[^`]*`/g, "");
+  for (const word of [/\bSVG\b/, /replaced element/, /\d+\s?px\b/, /\bwebview\b/i, /\besbuild\b/i, /\bstage [123]\b/i, /\bPOLISH\b/, /\bD\d\b/]) {
+    assert.ok(!word.test(prose), String(word));
+  }
+  // The owner's rule for the merge editor holds for its changelog too: no
+  // glyphs of our own, and no change is said to be red any more (the conflict
+  // is orange; a theme's own red, like Light Modern's Abort button, is not a
+  // merge colour).
+  for (const glyph of ["≠", "≈", "‹", "›", "✨", "⚠"]) assert.ok(!prose.includes(glyph), glyph);
+  assert.doesNotMatch(prose, /\bin red\b|\(red\)|\bred:/i);
+});
+
+test("the 1.0.0 entry says the colours in words, as the legend names them — JetBrains' four, at two strengths", () => {
+  const colours = sectionsOf(entry100).find((s) => s.startsWith("The colours")) ?? "";
+  assert.ok(colours, "a section on the colours");
+  // The owner's palette (24 Sep 2026): JetBrains' merge colours — orange you
+  // choose, green the same change on both sides, blue one side only, grey
+  // lines removed without a conflict. The legend's own words, each with its
+  // colour.
+  const pairs: Array<[string, string]> = [
+    ["Conflict — you choose", "orange"],
+    ["Same on both sides — either arrow takes it", "green"],
+    ["One side only — safe to take", "blue"],
+    ["Removed lines", "grey"],
+  ];
+  for (const [name, colour] of pairs) {
+    const line = colours.split("\n").find((l) => l.includes(`**${name}**`)) ?? "";
+    assert.match(line, new RegExp(`\\b${colour}\\b`), `${name} is said to be ${colour}`);
+  }
+  const green = colours.split("\n").find((l) => l.includes("**Same on both sides")) ?? "";
+  assert.match(green, /the same way/i, "the same change on both sides is green");
+  const blue = colours.split("\n").find((l) => l.includes("**One side only")) ?? "";
+  assert.match(blue, /added or changed/i, "a one-sided change is blue");
+  assert.doesNotMatch(colours, /\*\*(Changed|Added)\*\*/, "no colour for a change type other than removal");
+  // JetBrains' two strengths: the line numbers and the link to the result in
+  // the full colour, the lines lighter, the changed words full again.
+  assert.match(colours, /two strengths/i, "the two strengths are said");
+  assert.match(colours, /line numbers/i, "…the line numbers in the full colour");
+  assert.match(colours, /lighter shade/i, "…the lines in a lighter shade");
+  // A settled change keeps a trace of what was taken, not an empty grey line.
+  const settled = colours.split("\n").find((l) => /\btrace\b/i.test(l)) ?? "";
+  assert.match(settled, /\btook\b/i, "the trace says which side was taken");
+  assert.match(settled, /\bleft out\b/i, "…which was left out");
+  assert.match(settled, /\bboth\b/i, "…or that both went in");
+});
+
+test("the README's colour table names the legend's four entries, each with its one colour", () => {
+  const section = readme.split("## Every change, colour-coded")[1]?.split("\n## ")[0] ?? "";
+  const rows = section.split("\n").filter((l) => l.startsWith("| ") && !/^\| (Colour|---)/.test(l));
+  assert.deepEqual(
+    rows.map((r) => r.split("|").slice(1, 3).map((c) => c.trim())),
+    [
+      ["orange", "Conflict — you choose"],
+      ["green", "Same on both sides — either arrow takes it"],
+      ["blue", "One side only — safe to take"],
+      ["grey", "Removed lines"],
+    ],
+  );
+});
+
+test("the 1.0.0 entry says Close leaves the merge editor without ending the operation", () => {
+  const op = sectionsOf(entry100).find((s) => s.startsWith("Continue, Skip and Abort")) ?? "";
+  const close = op.split("\n").find((l) => l.includes("**Close**")) ?? "";
+  assert.match(close, /without (ending|cancelling)/i);
+  assert.match(close, /conflict markers/i, "and the file keeps its markers");
+});
+
+test("the listing describes the colours by decision: orange, green for the same change on both sides, blue for one side only, grey for removed lines", () => {
+  // The research's violet "Same on both sides" was the owner's no, and so,
+  // later, was colouring a change by what it did: the listing, the
+  // walkthrough and the shot list describe what the editor shows.
+  const places: Array<[string, string]> = [
+    ["CHANGELOG 1.0.0", entry100],
+    ["README", readme],
+    ["SHOTS.md", shotList],
+  ];
+  for (const s of walkthrough!.steps) {
+    places.push([`walkthrough ${s.id}`, `${s.description}\n${s.media.altText ?? ""}`]);
+    if (s.media.svg) places.push([s.media.svg, read(s.media.svg)]);
+  }
+  for (const [where, text] of places) {
+    assert.doesNotMatch(text, /\b(violet|purple|lavender)\b/i, where);
+    assert.doesNotMatch(text, /Changed \/ Added \/ Removed|Changed, Added,? and Removed|blue, green and grey|blue, green or grey|grey for lines removed/i, `${where}: a merge colour named for what a change did`);
+  }
+});
+
+test("the 1.0.0 entry covers the operation, the dashboard, what keeps your work safe, and what changed since 0.3.4", () => {
+  const headings = sectionsOf(entry100).map((s) => s.split("\n")[0].trim());
+  const want = ["The colours", "Continue, Skip and Abort", "The Conflicts dashboard", "Your work is safe", "Changed since 0.3.4", "Fixed since 0.3.4"];
+  assert.deepEqual(
+    want.filter((h) => !headings.includes(h)),
+    [],
+    `headings: ${headings.join(" | ")}`,
+  );
+});
+
+test("the 0.3.4 history is kept below it", () => {
+  assert.ok(changelog.includes("## 0.3.4 — 2026-06-24"));
+  assert.ok(changelog.includes("## 0.1.0 — 2026-06-11"));
+});
+
+// ── Licence ─────────────────────────────────────────────────────────────────
+
+test("the shell is MIT; the bundled GitStudio packages' Apache-2.0 text and NOTICE ship beside it", () => {
+  assert.match(read("LICENSE"), /^MIT License/);
+  assert.match(read("LICENSE-APACHE"), /Apache License\s+Version 2\.0/);
+  const notice = read("NOTICE");
+  assert.match(notice, /Apache License, Version 2\.0/);
+  assert.match(notice, /MIT/);
+  assert.equal(pkg.license, "MIT AND Apache-2.0");
+  const ignore = read(".vscodeignore");
+  for (const f of ["LICENSE", "LICENSE-APACHE", "NOTICE"]) {
+    assert.ok(!new RegExp(`^${f}$`, "m").test(ignore), `${f} must ship`);
+  }
+});
+
+test("NOTICE reproduces the bundled GitStudio packages' own attribution notice (Apache-2.0 section 4(d))", () => {
+  // GitStudio's NOTICE: the monorepo root, or its vendored copy in merge-studio.
+  const gsNotice = [join(ROOT, "vendor/gitstudio/NOTICE"), resolve(ROOT, "../../NOTICE")].find((p) => existsSync(p));
+  assert.ok(gsNotice, "GitStudio's NOTICE is not where the build can see it");
+  const flat = (s: string) => s.replace(/\s+/g, " ").trim();
+  const ours = flat(read("NOTICE"));
+  // Its attribution paragraphs: the name and copyright, and "This product includes …".
+  const paragraphs = readFileSync(gsNotice, "utf8").split(/\n\s*\n/).map(flat).filter(Boolean);
+  const attribution = paragraphs.filter((p, i) => i === 0 || /^This product includes/.test(p));
+  assert.equal(attribution.length, 2, JSON.stringify(paragraphs));
+  for (const p of attribution) assert.ok(ours.includes(p), `NOTICE lacks GitStudio's "${p}"`);
+});

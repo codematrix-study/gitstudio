@@ -1,0 +1,407 @@
+// A lightweight, theme-native right-click menu for a commit row in the graph.
+// Destructive actions (reset --hard, revert) are confirm-gated here in the
+// renderer (via the in-app dialog, not native confirm()) before the request
+// reaches the main process. Fully keyboard-navigable.
+
+import type { CommitActionRequest } from "../shared/ipc";
+import { confirmDialog, promptInline } from "./dialogs";
+import { refMenuItems, type RefMenuItem, type RowRef } from "./refMenuItems";
+import { registerLayer } from "./overlays";
+import { deepActiveElement } from "./focusReturn";
+import { atPoint, closeOnFocusLeave, fitMenu } from "@gitstudio/webview-ui/menuFit";
+import * as l10n from "@vscode/l10n";
+
+interface MenuItem {
+  label: string;
+  /** A commit:action verb — or "drop", which is its own flow (see DROP_ITEM). */
+  action: CommitActionRequest["action"] | "drop" | "reword";
+  /** For checkout-ref: the ref this item checks out, its kind, and its full
+   *  name when the row knew it (see RowRef.fullName). */
+  ref?: { name: string; kind: "head" | "remote" | "tag"; fullName?: string };
+  /** Rendered above the commit-scoped items, with a separator after. */
+  refItem?: boolean;
+  /** Requires a free-text name (new branch / tag). */
+  prompt?: string;
+  /** Show a confirm dialog before dispatching. */
+  confirm?: string;
+  danger?: boolean;
+}
+
+export const ITEMS: MenuItem[] = [
+  { label: l10n.t("Checkout"), action: "checkout", confirm: l10n.t("Checkout this commit (detached HEAD)?") },
+  { label: l10n.t("Create branch here…"), action: "branch", prompt: l10n.t("feature/my-branch") },
+  { label: l10n.t("Create tag here…"), action: "tag", prompt: l10n.t("v1.0.0") },
+  { label: l10n.t("Cherry-pick"), action: "cherry-pick" },
+  { label: l10n.t("Revert"), action: "revert", confirm: l10n.t("Create a revert commit for this commit?") },
+  { label: l10n.t("Reset (soft)"), action: "reset-soft", confirm: l10n.t("Move HEAD here, keep index & working tree?") },
+  {
+    label: l10n.t("Reset (mixed)"),
+    action: "reset-mixed",
+    confirm: l10n.t("Move HEAD here, reset index, keep working tree?"),
+  },
+  {
+    label: l10n.t("Reset (hard)"),
+    action: "reset-hard",
+    confirm: l10n.t("DISCARD all changes and reset HEAD here? This cannot be undone."),
+    danger: true,
+  },
+  { label: l10n.t("Copy SHA"), action: "copy-sha" },
+];
+
+/**
+ * "Drop commit…" (issue #32) — offered only where it can work, so it is not in
+ * ITEMS: the menu asks `commit:dropPlan` before it opens and adds this after
+ * Revert when the answer is yes. Its question and its run are a flow of their
+ * own (renderer/dropCommit.ts), not a commit:action verb.
+ */
+const DROP_ITEM: MenuItem = { label: l10n.t("Drop commit…"), action: "drop", danger: true };
+
+/** "Edit message…" (issue #75): offered, like Drop, only where it can work. */
+const REWORD_ITEM: MenuItem = { label: l10n.t("Edit message…"), action: "reword" };
+
+/**
+ * The rows for one commit: "Checkout <ref>" for the refs on it, then the
+ * commit actions — with "Drop commit…" beside Revert and the resets when the
+ * commit can be dropped from the current branch.
+ */
+export function commitMenuRows(refs: readonly RowRef[], opts: { drop?: boolean; reword?: boolean } = {}): MenuItem[] {
+  const rows: MenuItem[] = refMenuItems(refs).map(refRow);
+  for (const item of ITEMS) {
+    rows.push(item);
+    if (item.action === "revert" && opts.reword) rows.push(REWORD_ITEM);
+    if (item.action === "revert" && opts.drop) rows.push(DROP_ITEM);
+  }
+  return rows;
+}
+
+/**
+ * The question a commit action has to ask before it runs — the name it needs,
+ * or the confirmation it owes — resolved from ONE table.
+ *
+ * This used to live inside the context menu's own dispatch, so the identical
+ * actions on the commit-details toolbar ran with neither: "Checkout" detached
+ * HEAD with no warning, "Revert" and "Reset" rewrote or added commits in
+ * silence, and "Branch" and "Tag" dispatched with no name at all and came back
+ * as an error blaming the user for a request the app had failed to build.
+ */
+export async function askForCommitAction(
+  item: MenuItem,
+): Promise<{ ok: boolean; name?: string }> {
+  let name: string | undefined;
+  if (item.prompt) {
+    const value = (await promptInline(item.label.replace(/…$/, ""), item.prompt))?.trim();
+    if (!value) return { ok: false };
+    name = value;
+  }
+  if (item.confirm) {
+    const ok = await confirmDialog({
+      title: item.label,
+      message: item.confirm,
+      confirmLabel: item.danger ? l10n.t("Reset") : item.label.replace(/…$/, ""),
+      danger: item.danger,
+    });
+    if (!ok) return { ok: false };
+  }
+  return { ok: true, name };
+}
+
+/** The menu entry for an action id, for callers outside this menu. */
+export function commitActionItem(action: string): MenuItem | undefined {
+  return ITEMS.find((i) => i.action === action);
+}
+
+// ── Several commits at once (issue #32) ──────────────────────────────────────
+
+/** An action of the menu for a selection of several commits. */
+export type ManyAction = "cherry-pick-many" | "revert-many" | "squash-many" | "drop-many" | "compare-two" | "copy-shas" | "reword";
+
+/** One row of that menu (and one button of the "N commits selected" summary). */
+export interface ManyMenuRow {
+  action: ManyAction;
+  label: string;
+  /** For the summary's buttons: a codicon the shared details pane has. */
+  icon: string;
+  danger?: boolean;
+}
+
+/**
+ * The menu for `n` selected commits — the same words as the extension's, in
+ * this app's sentence case. Items that cannot apply are left out, as the
+ * one-commit menu leaves out Drop; `opts` is main's answer (commits:menu).
+ */
+export function manyMenuRows(n: number, opts: { apply: boolean; drop: boolean; squash: boolean }): ManyMenuRow[] {
+  return [
+    ...(opts.apply
+      ? [
+          {
+            action: "cherry-pick-many" as const,
+            label: l10n.t("Cherry-pick {0} commits", n),
+            icon: "git-pull-request",
+          },
+          { action: "revert-many" as const, label: l10n.t("Revert {0} commits", n), icon: "history" },
+        ]
+      : []),
+    ...(opts.squash
+      ? [{ action: "squash-many" as const, label: l10n.t("Squash {0} commits…", n), icon: "fold-down" }]
+      : []),
+    ...(opts.drop
+      ? [{ action: "drop-many" as const, label: l10n.t("Drop {0} commits…", n), icon: "trash", danger: true }]
+      : []),
+    ...(n === 2
+      ? [{ action: "compare-two" as const, label: l10n.t("Compare these two commits"), icon: "git-compare" }]
+      : []),
+    { action: "copy-shas" as const, label: l10n.t("Copy SHAs"), icon: "copy" },
+  ];
+}
+
+/** A "Checkout <ref>" row, from the shared builder's answer. */
+function refRow(r: RefMenuItem): MenuItem {
+  return {
+    label: r.label,
+    action: "checkout-ref" as const,
+    ref: r.ref,
+    refItem: true,
+    ...(r.confirm ? { confirm: r.confirm } : {}),
+  };
+}
+
+export class CommitContextMenu {
+  private menu?: HTMLElement;
+  private prevFocus?: HTMLElement | null;
+  private rows: HTMLElement[] = [];
+  private readonly onDocClick = (): void => this.close();
+  /** Registry handle, so a route change closes this menu with everything else. */
+  private layer?: { release: () => void };
+  private readonly onKey = (e: KeyboardEvent): void => this.handleKey(e);
+  /** Stops closing the menu when the app loses focus. */
+  private stopFocusLeave?: () => void;
+
+  constructor(
+    /** Dispatches a fully-resolved action request to the host. */
+    public readonly resolve: (req: CommitActionRequest) => void,
+    /** Runs "Drop commit…" for this sha — its own flow, not a commit:action. */
+    private readonly drop?: (sha: string) => void,
+    /** Runs an item of the menu for several commits (issue #32). */
+    private readonly many?: (action: ManyAction, shas: string[]) => void,
+  ) {}
+
+  /**
+   * The menu for a selection of several commits (issue #32), at (x, y):
+   * headed by how many, with only the items `opts` says apply (main's
+   * commits:menu). Keyboard and dismissal as for one commit's menu.
+   */
+  openMany(shas: string[], x: number, y: number, opts: { apply: boolean; drop: boolean; squash: boolean }): void {
+    this.close();
+    this.layer = registerLayer(() => this.close(false), "menu");
+    // Into the graph's shadow root: Escape gives the keyboard back to the list.
+    this.prevFocus = deepActiveElement();
+    const menu = document.createElement("div");
+    menu.className = "ctx-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", l10n.t("Actions for {0} commits", shas.length));
+    const header = document.createElement("div");
+    // Words, not a sha: the extension's menu for several says the same.
+    header.className = "ctx-menu-header is-words";
+    header.textContent = l10n.t("{0} commits selected", shas.length);
+    menu.appendChild(header);
+
+    this.rows = [];
+    for (const row of manyMenuRows(shas.length, opts)) {
+      const button = document.createElement("button");
+      button.className = `ctx-menu-item${row.danger ? " ctx-danger" : ""}`;
+      button.dataset.action = row.action;
+      button.textContent = row.label;
+      button.setAttribute("role", "menuitem");
+      button.tabIndex = -1;
+      button.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // Focus back on the list BEFORE the item runs, as ui.ts's menus do:
+        // the dialog it opens (Drop 3 commits?) returns the keyboard to what
+        // had focus when it opened — which was otherwise this removed row.
+        this.close();
+        this.many?.(row.action, shas);
+      });
+      menu.appendChild(button);
+      this.rows.push(button);
+    }
+    this.place(menu, x, y);
+  }
+
+  /** Mount a built menu at (x, y), kept on screen, first row focused. */
+  private place(menu: HTMLElement, x: number, y: number): void {
+    document.body.appendChild(menu);
+    // Down from the pointer, or up from it with no room below; never taller
+    // than the window — capped, it scrolls (issue #103: the extension's
+    // twin of this menu ran off a short panel). Measured by its layout size:
+    // the entrance animation scales it, and its bounding rect read small.
+    fitMenu(menu, atPoint(x, y), { pad: 8 });
+    this.menu = menu;
+
+    document.addEventListener("keydown", this.onKey, true);
+    // Another app clicked: the menu goes, as a native one does. A click
+    // anywhere in this window is the document listener's below.
+    this.stopFocusLeave = closeOnFocusLeave(() => this.close(false));
+    setTimeout(() => {
+      document.addEventListener("click", this.onDocClick);
+      this.rows[0]?.focus();
+    }, 0);
+  }
+
+  /**
+   * `refs` are the refs sitting ON this commit. They become "Checkout <name>"
+   * items above the commit actions (issues #12/#19) — the extension has done this
+   * since 1.5.0, and without it right-clicking a branch tip offered only a
+   * detaching checkout of the commit, which is never what you want when the
+   * branch itself is right there.
+   *
+   * `drop` adds "Drop commit…" — the caller asked `commit:dropPlan` first.
+   */
+  open(
+    sha: string,
+    x: number,
+    y: number,
+    refs: readonly RowRef[] = [],
+    opts: { drop?: boolean; reword?: boolean } = {},
+  ): void {
+    this.close();
+    this.layer = registerLayer(() => this.close(false), "menu");
+    // Into the graph's shadow root, as for several (deepActiveElement).
+    this.prevFocus = deepActiveElement();
+    const menu = document.createElement("div");
+    menu.className = "ctx-menu";
+    menu.setAttribute("role", "menu");
+    const header = document.createElement("div");
+    header.className = "ctx-menu-header";
+    // 7, like every other short SHA in the app. Ten characters here meant the
+    // menu's heading and the row it was opened on named the same commit two
+    // different ways, one directly above the other.
+    header.textContent = sha.slice(0, 7);
+    menu.appendChild(header);
+
+    this.rows = [];
+    for (const item of commitMenuRows(refs, opts)) {
+      const button = document.createElement("button");
+      button.className = `ctx-menu-item${item.danger ? " ctx-danger" : ""}`;
+      button.dataset.action = item.action;
+      button.textContent = item.label;
+      button.setAttribute("role", "menuitem");
+      button.tabIndex = -1;
+      button.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // Focus back on the list first, for the dialog the item may open.
+        this.close();
+        void this.dispatch(item, sha);
+      });
+      menu.appendChild(button);
+      this.rows.push(button);
+    }
+    this.place(menu, x, y);
+  }
+
+  private focusAt(i: number): void {
+    if (!this.rows.length) return;
+    const idx = ((i % this.rows.length) + this.rows.length) % this.rows.length;
+    this.rows[idx].focus();
+  }
+
+  private handleKey(e: KeyboardEvent): void {
+    if (!this.menu) return;
+    const cur = this.rows.indexOf(document.activeElement as HTMLElement);
+    switch (e.key) {
+      case "Escape":
+        e.preventDefault();
+        // This menu owns the keystroke — see the same note in ui.ts's openMenu.
+        e.stopPropagation();
+        this.close();
+        break;
+      case "ArrowDown":
+        e.preventDefault();
+        this.focusAt(cur < 0 ? 0 : cur + 1);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        this.focusAt(cur < 0 ? this.rows.length - 1 : cur - 1);
+        break;
+      case "Home":
+        e.preventDefault();
+        this.focusAt(0);
+        break;
+      case "End":
+        e.preventDefault();
+        this.focusAt(this.rows.length - 1);
+        break;
+      case "Enter":
+      case " ":
+        if (cur >= 0) {
+          e.preventDefault();
+          this.rows[cur].click();
+        }
+        break;
+      case "Tab":
+        this.close(false);
+        break;
+    }
+  }
+
+  /**
+   * Check out one ref from outside the menu — the chip's own menu (issue #30)
+   * offers "Checkout <ref>" too, and right-clicking a chip used to open THIS
+   * menu. The row is built by the same builder, so a tag asks the same
+   * question at either door, and a ref the builder declines (the branch you
+   * are on, a remote's HEAD pointer) is declined here too.
+   */
+  checkoutRef(sha: string, ref: RowRef): void {
+    const row = refMenuItems([ref]).map(refRow)[0];
+    if (row) void this.dispatch(row, sha);
+  }
+
+  private async dispatch(item: MenuItem, sha: string): Promise<void> {
+    if (item.action === "drop") {
+      this.drop?.(sha);
+      return;
+    }
+    if (item.action === "reword") {
+      this.many?.("reword", [sha]);
+      return;
+    }
+    let name: string | undefined;
+    // Only awaited when the table says there is something to ask. An
+    // unconditional await defers even a question-less item by a microtask, so
+    // a ref checkout stopped resolving in the same tick — which is the shape
+    // `checkoutRequest.test.ts` asserts, and the shape the graph relies on.
+    if (item.prompt || item.confirm) {
+      const asked = await askForCommitAction(item);
+      if (!asked.ok) return;
+      name = asked.name;
+    }
+    // A checkout-ref item carries the ref it is ABOUT, and the request is the
+    // only place it can travel. Left off, `name` arrived undefined and the main
+    // process — which requires it — refused every branch checkout from the
+    // graph with "unsafe ref", the exact detached-HEAD complaint of issues
+    // #12/#19 wearing a different error message.
+    if (item.ref) {
+      this.resolve({
+        action: item.action,
+        sha,
+        name: item.ref.name,
+        refKind: item.ref.kind,
+        ...(item.ref.fullName ? { fullName: item.ref.fullName } : {}),
+      });
+      return;
+    }
+    this.resolve({ action: item.action, sha, name });
+  }
+
+  private close(restoreFocus = true): void {
+    this.layer?.release();
+    this.layer = undefined;
+    document.removeEventListener("keydown", this.onKey, true);
+    document.removeEventListener("click", this.onDocClick);
+    this.stopFocusLeave?.();
+    this.stopFocusLeave = undefined;
+    this.menu?.remove();
+    this.menu = undefined;
+    this.rows = [];
+    if (restoreFocus) this.prevFocus?.focus?.();
+  }
+}

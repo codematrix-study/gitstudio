@@ -1,0 +1,563 @@
+// Clone / browse-GitHub-repos dialog — a focus-trapping modal with two paths:
+//  1. "URL" tab: paste an HTTPS or SSH git URL.
+//  2. "GitHub" tab: search + pick from the signed-in user's repositories
+//     (github:repos), with HTTPS/SSH toggle.
+// In both, "Choose…" picks the parent directory (clone:pickDir) and "Clone"
+// runs clone:start, showing live progress (clone:progress). On success it calls
+// `onCloned(root)` so the shell can open the freshly-cloned repo — and says
+// "Cloned …" once that open has landed (see runClone).
+//
+// CONTRACT (keep this signature — renderer.ts + the welcome screen call it):
+//   openCloneDialog(onCloned: (root: string) => unknown): void
+// `onCloned` returns the open's promise, so the toast waits for it.
+//
+// The focus-trap / Escape / backdrop-click / focus-restore scaffold mirrors
+// `modal()` in ./dialogs (which isn't exported), so this self-contained module
+// matches that a11y behaviour exactly.
+
+import { toast, openModal } from "./dialogs";
+import { host } from "./bridge";
+import {
+  el,
+  span,
+  glyph,
+  loadingState,
+  emptyState,
+  relTimeISO,
+  cleanErr,
+} from "./ui";
+import type { GhRepoBrief } from "../shared/ipc";
+import { deriveNameFromUrl, validateTargetName } from "../shared/cloneName";
+import * as l10n from "@vscode/l10n";
+
+type Tab = "url" | "github";
+type Scheme = "https" | "ssh";
+
+/** Open the clone modal. On a successful clone, `onCloned(root)` is called.
+ *  `opts.url` prefills the URL tab (e.g. cloning straight from an org's repo
+ *  peek) — the user still picks the destination folder. */
+export function openCloneDialog(
+  onCloned: (root: string) => unknown,
+  opts: { url?: string } = {},
+): void {
+  // ── modal scaffold: the shared openModal (focus-trap, Esc, backdrop) ──────
+  const card = el("div", "modal-card clone-card");
+  /** Bound by openModal at mount; wrapped so earlier listeners see the real one. */
+  let close = (): void => {};
+
+  // ── state ────────────────────────────────────────────────────────────────
+  let tab: Tab = "url";
+  let scheme: Scheme = "https";
+  let parentDir = "";
+  let busy = false;
+  let offProgress: (() => void) | null = null;
+  /** The repo selected on the GitHub tab (drives the SSH/HTTPS toggle). */
+  let selectedRepo: GhRepoBrief | null = null;
+  let searchSeq = 0;
+
+  // ── header: title + segmented tab switch ───────────────────────────────────
+  const h = el("div", "modal-title");
+  h.textContent = l10n.t("Clone repository");
+
+  const tabs = el("div", "gh-seg clone-tabs");
+  tabs.setAttribute("role", "tablist");
+  const urlTabBtn = el("button", "gh-seg-btn");
+  urlTabBtn.setAttribute("role", "tab");
+  urlTabBtn.append(glyph("link"), span(l10n.t("URL")));
+  const ghTabBtn = el("button", "gh-seg-btn");
+  ghTabBtn.setAttribute("role", "tab");
+  ghTabBtn.append(glyph("github"), span("GitHub"));
+  tabs.append(urlTabBtn, ghTabBtn);
+
+  // ── URL panel ──────────────────────────────────────────────────────────────
+  const urlPanel = el("div", "clone-panel");
+  urlPanel.setAttribute("role", "tabpanel");
+  const urlInput = document.createElement("input");
+  urlInput.className = "modal-input clone-url-input";
+  urlInput.placeholder =
+    "https://github.com/owner/repo.git  or  git@github.com:owner/repo.git";
+  urlInput.setAttribute("aria-label", l10n.t("Git repository URL"));
+  urlInput.spellcheck = false;
+  urlInput.autocapitalize = "off";
+  urlInput.addEventListener("input", refreshClone);
+  urlInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !primary.hasAttribute("disabled")) {
+      e.preventDefault();
+      void runClone();
+    }
+  });
+  // One field shape for the whole form. These three rows used to have three
+  // different structures — a bare placeholder-only input, a label-value-button
+  // row inside a bordered card, and a caption above an input inside a SECOND
+  // bordered card — so three consecutive fields had three left edges and three
+  // ideas of where a label goes.
+  urlPanel.append(cloneField(l10n.t("Repository URL"), urlInput, "clone-url-field"));
+
+  // ── GitHub panel ───────────────────────────────────────────────────────────
+  const ghPanel = el("div", "clone-panel clone-gh");
+  ghPanel.setAttribute("role", "tabpanel");
+  ghPanel.hidden = true;
+
+  const ghSearch = document.createElement("input");
+  ghSearch.className = "modal-input clone-search";
+  ghSearch.placeholder = l10n.t("Search your repositories…");
+  ghSearch.setAttribute("aria-label", l10n.t("Search your GitHub repositories"));
+  ghSearch.spellcheck = false;
+  ghSearch.autocapitalize = "off";
+
+  const ghList = el("div", "clone-repo-list");
+  ghList.setAttribute("role", "listbox");
+  ghList.setAttribute("aria-label", l10n.t("Your repositories"));
+
+  // HTTPS / SSH toggle for the chosen repo.
+  const schemeSeg = el("div", "gh-seg clone-scheme");
+  schemeSeg.setAttribute("role", "group");
+  schemeSeg.setAttribute("aria-label", l10n.t("Clone protocol"));
+  const httpsBtn = el("button", "gh-seg-btn");
+  httpsBtn.textContent = "HTTPS";
+  const sshBtn = el("button", "gh-seg-btn");
+  sshBtn.textContent = "SSH";
+  schemeSeg.append(httpsBtn, sshBtn);
+  schemeSeg.hidden = true;
+
+  ghPanel.append(cloneField(l10n.t("Your repositories"), ghSearch), ghList, schemeSeg);
+
+  // ── footer: destination + progress + actions ───────────────────────────────
+  const destValue = el("div", "clone-dest-path");
+  destValue.textContent = l10n.t("No folder chosen");
+  const chooseBtn = el("button", "mini-btn clone-choose");
+  chooseBtn.append(glyph("folder-opened"), span(l10n.t("Choose…")));
+  chooseBtn.addEventListener("click", () => void pickDir());
+  const destControl = el("div", "clone-dest-control");
+  destControl.append(destValue, chooseBtn);
+  const destRow = cloneField(l10n.t("Destination"), destControl);
+
+  // Folder-name override — blank means "use the name derived from the URL"
+  // (shown as the placeholder, so what will happen is never a mystery).
+  const nameInput = document.createElement("input");
+  nameInput.className = "modal-input clone-name-input";
+  nameInput.placeholder = l10n.t("Derived from the URL");
+  nameInput.spellcheck = false;
+  nameInput.autocapitalize = "off";
+  nameInput.setAttribute("aria-label", l10n.t("Folder name (optional)"));
+  nameInput.addEventListener("input", refreshClone);
+  const nameRow = cloneField(l10n.t("Folder name"), nameInput);
+  const nameError = el("div", "dest-name-error clone-name-error");
+  nameError.hidden = true;
+
+  const progress = el("div", "clone-progress");
+  progress.hidden = true;
+  const progBar = el("div", "clone-progress-bar");
+  const progFill = el("div", "clone-progress-fill");
+  progBar.appendChild(progFill);
+  const progPhase = el("div", "clone-progress-phase");
+  progress.setAttribute("role", "status");
+  progress.setAttribute("aria-live", "polite");
+  progress.append(progPhase, progBar);
+
+  const actions = el("div", "modal-actions clone-actions");
+  const cancel = el("button", "mini-btn");
+  cancel.textContent = l10n.t("Cancel");
+  cancel.addEventListener("click", () => close());
+  const primary = el("button", "btn btn-primary modal-ok clone-go");
+  const primaryLabel = span(l10n.t("Clone"));
+  // A real spinner, because the button was marked `is-loading` and that class
+  // has never had a rule: the only sign a clone had started was the label
+  // changing to "Cloning…", on a control that had also just gone disabled and
+  // therefore dimmed. A clone can take a minute; it needs to look alive.
+  const primarySpin = glyph("loading");
+  primarySpin.classList.add("spin");
+  primarySpin.hidden = true;
+  primary.append(primarySpin, primaryLabel);
+  primary.setAttribute("disabled", "true");
+  primary.addEventListener("click", () => void runClone());
+  actions.append(cancel, primary);
+
+  card.append(h, tabs, urlPanel, ghPanel, destRow, nameRow, nameError, progress, actions);
+
+  // ── tab switching ──────────────────────────────────────────────────────────
+  function setTab(next: Tab): void {
+    if (busy) return;
+    tab = next;
+    urlTabBtn.classList.toggle("active", next === "url");
+    ghTabBtn.classList.toggle("active", next === "github");
+    urlTabBtn.setAttribute("aria-selected", String(next === "url"));
+    ghTabBtn.setAttribute("aria-selected", String(next === "github"));
+    urlPanel.hidden = next !== "url";
+    ghPanel.hidden = next !== "github";
+    refreshClone();
+    if (next === "github") {
+      if (!loadedOnce) void loadRepos(ghSearch.value.trim());
+      setTimeout(() => ghSearch.focus(), 0);
+    } else {
+      setTimeout(() => urlInput.focus(), 0);
+    }
+  }
+  urlTabBtn.addEventListener("click", () => setTab("url"));
+  ghTabBtn.addEventListener("click", () => setTab("github"));
+
+  // ── GitHub repo loading + rendering ────────────────────────────────────────
+  let loadedOnce = false;
+  let searchTimer = 0;
+  ghSearch.addEventListener("input", () => {
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(
+      () => void loadRepos(ghSearch.value.trim()),
+      220,
+    );
+  });
+
+  async function loadRepos(search: string): Promise<void> {
+    loadedOnce = true;
+    const seq = ++searchSeq;
+    ghList.replaceChildren(loadingState(l10n.t("Loading your repositories…")));
+    // Don't call github:repos while signed out (it throws + spams the log) —
+    // check the connection first and prompt the user to sign in instead.
+    try {
+      const status = await host.invoke("github:status", undefined);
+      if (seq !== searchSeq) return;
+      if (!status.connected) {
+        // This used to say "sign in from the account button at the top of the
+        // window". From the welcome screen — where most people meet this
+        // dialog, because there is no repo open yet — there IS no account
+        // button and no Settings: the whole window is a hero, two buttons and
+        // a recent list. So the one instruction on the screen pointed at a
+        // control that did not exist, and the dialog dead-ended.
+        //
+        // Cloning by URL needs no account at all, and is right here.
+        ghList.replaceChildren(
+          emptyState(
+            l10n.t("Not signed in to GitHub"),
+            l10n.t(
+              "Browsing your repositories needs a GitHub account, which you can connect from Settings once a repository is open. Any repository URL works right now without one.",
+            ),
+            {
+              icon: "github",
+              action: {
+                label: l10n.t("Clone by URL"),
+                icon: "link",
+                onClick: () => setTab("url"),
+              },
+            },
+          ),
+        );
+        return;
+      }
+    } catch {
+      /* status check failed — fall through and let the repos call surface it */
+    }
+    let repos: GhRepoBrief[];
+    try {
+      repos = await host.invoke("github:repos", search ? { search } : undefined);
+    } catch (e) {
+      if (seq !== searchSeq) return;
+      ghList.replaceChildren(
+        emptyState(
+          l10n.t("Couldn't load repositories"),
+          cleanErr(e) || l10n.t("Connect your GitHub account in Settings, then try again."),
+        ),
+      );
+      return;
+    }
+    if (seq !== searchSeq) return;
+    if (!repos.length) {
+      ghList.replaceChildren(
+        emptyState(
+          search ? l10n.t("No matching repositories") : l10n.t("No repositories found"),
+          search
+            ? l10n.t("Try a different search term.")
+            : l10n.t("Sign in to GitHub in Settings to browse your repositories."),
+        ),
+      );
+      return;
+    }
+    ghList.replaceChildren(...repos.map(repoRow));
+  }
+
+  function repoRow(repo: GhRepoBrief): HTMLElement {
+    const row = el("button", "list-row clone-repo");
+    row.setAttribute("role", "option");
+
+    const main = el("div", "clone-repo-main");
+    const name = el("div", "clone-repo-name");
+    name.textContent = repo.fullName;
+    if (repo.private) name.append(badge(l10n.t("Private")));
+    if (repo.fork) name.append(badge(l10n.t("Fork")));
+    main.appendChild(name);
+    if (repo.description) {
+      const desc = el("div", "clone-repo-desc");
+      desc.textContent = repo.description;
+      main.appendChild(desc);
+    }
+
+    const meta = el("div", "clone-repo-meta");
+    if (repo.stars > 0) meta.append(metaBit("★ " + repo.stars));
+    if (repo.language) meta.append(metaBit(repo.language));
+    const rel = relTimeISO(repo.updatedAt);
+    if (rel) meta.append(metaBit(l10n.t("Updated {0}", rel)));
+    if (meta.childElementCount) main.appendChild(meta);
+
+    row.appendChild(main);
+    row.addEventListener("click", () => selectRepo(repo, row));
+    return row;
+  }
+
+  function selectRepo(repo: GhRepoBrief, row: HTMLElement): void {
+    selectedRepo = repo;
+    for (const n of ghList.querySelectorAll(".clone-repo.is-current")) {
+      n.classList.remove("is-current");
+      n.removeAttribute("aria-selected");
+    }
+    row.classList.add("is-current");
+    row.setAttribute("aria-selected", "true");
+    schemeSeg.hidden = false;
+    syncSchemeButtons();
+    refreshClone();
+  }
+
+  function syncSchemeButtons(): void {
+    httpsBtn.classList.toggle("active", scheme === "https");
+    sshBtn.classList.toggle("active", scheme === "ssh");
+    httpsBtn.setAttribute("aria-pressed", String(scheme === "https"));
+    sshBtn.setAttribute("aria-pressed", String(scheme === "ssh"));
+  }
+  httpsBtn.addEventListener("click", () => {
+    scheme = "https";
+    syncSchemeButtons();
+    refreshClone();
+  });
+  sshBtn.addEventListener("click", () => {
+    scheme = "ssh";
+    syncSchemeButtons();
+    refreshClone();
+  });
+  syncSchemeButtons();
+
+  // ── chosen clone target + folder name ──────────────────────────────────────
+  function chosenUrl(): string {
+    if (tab === "url") return urlInput.value.trim();
+    if (!selectedRepo) return "";
+    return scheme === "ssh" ? selectedRepo.sshUrl : selectedRepo.cloneUrl;
+  }
+
+  /** The folder name a clone would use: the override, else derived. */
+  function targetName(url: string): string | undefined {
+    return nameInput.value.trim() || deriveNameFromUrl(url);
+  }
+
+  async function pickDir(): Promise<void> {
+    if (busy) return;
+    try {
+      const dir = await host.invoke("clone:pickDir", parentDir ? { defaultPath: parentDir } : undefined);
+      if (dir) {
+        parentDir = dir;
+        destValue.textContent = dir;
+        destValue.title = dir;
+        refreshClone();
+      }
+    } catch (e) {
+      toast(cleanErr(e) || l10n.t("Couldn't choose a folder."), "error");
+    }
+  }
+
+  function refreshClone(): void {
+    const url = chosenUrl();
+    // On the GitHub tab there is no URL field, so "Derived from the URL" named
+    // a control the user cannot see.
+    nameInput.placeholder =
+      (url && deriveNameFromUrl(url)) ||
+      (tab === "github" ? l10n.t("Same as the repository") : l10n.t("Derived from the URL"));
+    const problem = validateTargetName(nameInput.value);
+    nameError.textContent = problem ?? "";
+    nameError.hidden = !problem;
+    nameInput.classList.toggle("is-invalid", !!problem);
+    const ready = !busy && !!url && !!parentDir && !problem;
+    if (ready) primary.removeAttribute("disabled");
+    else primary.setAttribute("disabled", "true");
+  }
+
+  // ── progress + run ─────────────────────────────────────────────────────────
+  function updateBar(percent: number | undefined, label: string): void {
+    progress.hidden = false;
+    if (typeof percent === "number" && Number.isFinite(percent)) {
+      progFill.classList.remove("indeterminate");
+      progFill.style.width = Math.max(0, Math.min(100, percent)) + "%";
+    } else {
+      progFill.classList.add("indeterminate");
+      progFill.style.width = "100%";
+    }
+    progPhase.textContent = label || l10n.t("Cloning…");
+  }
+
+  function setBusy(on: boolean): void {
+    busy = on;
+    card.classList.toggle("is-busy", on);
+    for (const ctl of [
+      urlInput,
+      ghSearch,
+      urlTabBtn,
+      ghTabBtn,
+      httpsBtn,
+      sshBtn,
+      chooseBtn,
+      nameInput,
+    ]) {
+      if (on) ctl.setAttribute("disabled", "true");
+      else ctl.removeAttribute("disabled");
+    }
+    // NOT disabled with the rest. A clone that hangs — a slow remote, a
+    // credential prompt that never arrives — left every control dead, Escape
+    // and the backdrop blocked by `canDismiss: () => !busy`, and no way out of
+    // the app short of quitting it.
+    //
+    // git is already running and there is no channel to stop it, so this does
+    // not pretend to cancel: it puts the dialog away and lets the clone finish
+    // in the background, which it does perfectly well — the success path opens
+    // the repository and toasts either way, whether this card is on screen or
+    // not.
+    cancel.textContent = on ? l10n.t("Hide") : l10n.t("Cancel");
+    cancel.title = on
+      ? l10n.t("Close this and let the clone finish — you'll be told when it's done")
+      : "";
+    ghList.classList.toggle("is-disabled", on);
+    if (on) {
+      primary.setAttribute("disabled", "true");
+      primarySpin.hidden = false;
+      primaryLabel.textContent = l10n.t("Cloning…");
+    } else {
+      primarySpin.hidden = true;
+      primaryLabel.textContent = l10n.t("Clone");
+      refreshClone();
+    }
+  }
+
+  async function runClone(): Promise<void> {
+    if (busy) return;
+    const url = chosenUrl();
+    if (!url || !parentDir) return;
+    const name = targetName(url);
+
+    setBusy(true);
+    updateBar(undefined, l10n.t("Preparing…"));
+    offProgress = host.on("clone:progress", (p) =>
+      updateBar(p.percent, p.phase || p.raw),
+    );
+
+    let res;
+    try {
+      res = await host.invoke("clone:start", { url, parentDir, name });
+    } catch (e) {
+      offProgress?.();
+      offProgress = null;
+      toast(cleanErr(e) || l10n.t("Clone failed."), "error");
+      progress.hidden = true;
+      setBusy(false);
+      return;
+    }
+    offProgress?.();
+    offProgress = null;
+
+    if (res.ok && res.root) {
+      const root = res.root;
+      close();
+      // Opened first, THEN said (issue #32): the open switches to the clone's
+      // new tab, and a switch clears the toasts of the tab you leave — said
+      // before it, "Cloned …" was cleared by the very open it announced.
+      try {
+        await onCloned(root);
+      } catch {
+        /* an open that fails says so itself */
+      }
+      toast(l10n.t("Cloned {0}", name || l10n.t("repository")), "success");
+    } else {
+      toast(res.message || l10n.t("Clone failed."), "error");
+      progress.hidden = true;
+      setBusy(false);
+      // A destination collision is fixed right here: point at the name field.
+      if (res.code === "dest-exists" || res.code === "bad-name") {
+        nameInput.focus();
+        nameInput.select();
+      }
+    }
+  }
+
+  // ── mount ──────────────────────────────────────────────────────────────────
+  openModal((c) => {
+    close = c;
+    return {
+      card,
+      focusEl: urlInput,
+      label: l10n.t("Clone repository"),
+      // While a clone is in flight, dismissing (Esc/backdrop) would orphan the
+      // clone and still fire onCloned() on completion — keep the modal up.
+      // Always. See setBusy: the clone continues without this card, so being
+      // unable to dismiss it bought nothing and cost the only way out.
+      canDismiss: () => true,
+      // A background REBUILD is not a dismissal the user asked for. Any file
+      // saved anywhere in the open repository fires the watcher, and the
+      // overlay sweep that follows takes every layer down — so a clone URL
+      // half-typed, a repository picked from the list, or a clone in flight
+      // vanished because a build touched a file. `hasUnsavedWork` is the veto
+      // for exactly that, and this spec never declared one.
+      //
+      // Compared against what the form OPENED with, not against truthiness:
+      // this form prefills its own URL field, so "non-empty" would veto every
+      // dismissal from the first frame.
+      hasUnsavedWork: () =>
+        busy ||
+        !!selectedRepo ||
+        urlInput.value.trim() !== (opts.url ?? "").trim() ||
+        nameInput.value.trim() !== "",
+      onClose: () => {
+        if (offProgress) offProgress();
+      },
+    };
+  });
+  if (opts.url) urlInput.value = opts.url;
+  setTab("url");
+
+  // Prefill the configured default clone folder so Clone is one paste away —
+  // Choose… still overrides per-clone.
+  void host
+    .invoke("settings:get", undefined)
+    .then((v) => {
+      if (!parentDir) {
+        parentDir = v.cloneDir;
+        destValue.textContent = v.cloneDirDisplay;
+        destValue.title = v.cloneDir;
+        refreshClone();
+      }
+    })
+    .catch(() => {});
+}
+
+/** A tiny inline badge appended to a repo's name (Private / Fork). */
+/**
+ * One field: a caption above its control, on the form's single left edge. The
+ * caption is a real <label> when the control can take focus, so clicking the
+ * word lands the caret in the box.
+ */
+function cloneField(label: string, control: HTMLElement, cls?: string): HTMLElement {
+  const wrap = el("div", "clone-field" + (cls ? ` ${cls}` : ""));
+  const isInput = control instanceof HTMLInputElement;
+  const cap = document.createElement(isInput ? "label" : "div");
+  cap.className = "clone-field-label";
+  cap.textContent = label;
+  if (isInput) {
+    if (!control.id) control.id = `clone-f-${++fieldSeq}`;
+    (cap as HTMLLabelElement).htmlFor = control.id;
+  }
+  wrap.append(cap, control);
+  return wrap;
+}
+let fieldSeq = 0;
+
+function badge(text: string): HTMLElement {
+  const b = span(text, "clone-repo-badge");
+  return b;
+}
+
+/** One dot-separated meta fragment (★ stars · language · updated …). */
+function metaBit(text: string): HTMLElement {
+  return span(text, "clone-meta-bit");
+}

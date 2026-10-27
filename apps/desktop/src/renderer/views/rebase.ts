@@ -1,0 +1,1286 @@
+// Interactive Rebase — a full workspace view (not a dialog), mirroring the
+// GitStudio extension's rebase panel: a commit rail with node dots, per-commit
+// action dropdowns, plain-English consequences, drag-to-reorder, and a dimmed
+// "onto" base row. Nothing touches the repository until Start Rebase is pressed,
+// and the whole run is a single git invocation driven by the shared
+// @gitstudio/git-service/RebaseRunner (the same module the extension uses).
+
+import * as l10n from "@vscode/l10n";
+import { host } from "../bridge";
+import { el, span, glyph, emptyState, cleanErr } from "../ui";
+import { toast, confirmDialog, promptInline } from "../dialogs";
+import { exclusive, outcomeLine } from "../mergeParity";
+import { whileSameRepo } from "../repoEpoch";
+import { abortConfirm, skipConfirm, willDropText } from "@gitstudio/webview-ui/conflicts/opText";
+import {
+  NO_SELECTION,
+  PLAN_ACTIONS,
+  actionForKey,
+  actionTooltip,
+  arrowRow,
+  clickRow,
+  collapseSelection,
+  dragKeys,
+  moveKeysToGap,
+  moveSelected,
+  reachRow,
+  refusalText,
+  selectAll,
+  selectOnly,
+  selectedInOrder,
+  selectionCountText,
+  setActions,
+  type PlanSelection,
+} from "@gitstudio/engine/rebase/planEdit";
+import type { OperationOutcome, OperationView } from "@gitstudio/host-bridge/conflictsProtocol";
+import type { SectionRender } from "./common";
+import type {
+  RebaseAction,
+  RebaseApplyRow,
+  RebaseCommitInfo,
+  RebasePlanState,
+} from "../../shared/ipc";
+
+interface Row extends RebaseCommitInfo {
+  action: RebaseAction;
+  /** Edited message for a `reword` row (defaults to the subject). */
+  message: string;
+}
+
+const ACTIONS: ReadonlyArray<{ id: RebaseAction; label: string; hint: string }> = [
+  { id: "pick", label: l10n.t("Pick"), hint: l10n.t("Keep this commit as it is.") },
+  { id: "reword", label: l10n.t("Reword"), hint: l10n.t("Keep the commit, rewrite its message.") },
+  {
+    id: "squash",
+    label: l10n.t("Squash"),
+    hint: l10n.t("Merge into the commit below it — keep both messages."),
+  },
+  {
+    id: "fixup",
+    label: l10n.t("Fixup"),
+    hint: l10n.t("Merge into the commit below it — drop this message."),
+  },
+  { id: "edit", label: l10n.t("Edit"), hint: l10n.t("Pause here so you can amend the commit.") },
+  { id: "drop", label: l10n.t("Drop"), hint: l10n.t("Delete this commit.") },
+];
+
+const EXPLAIN_KEY = "gitstudio.rebase.explainDismissed";
+
+/** Where the keyboard goes after the list is rebuilt (see `render`). */
+type Refocus = "row" | "select" | null;
+
+export const renderRebase: SectionRender = (wrap, nav) => {
+  void mount(wrap, nav);
+};
+
+async function mount(wrap: HTMLElement, nav: (view: string) => void): Promise<void> {
+  wrap.classList.add("rb-view");
+  wrap.replaceChildren(loadingCard());
+
+  let state: RebasePlanState;
+  try {
+    state = await host.invoke("rebase:load", {});
+    // The shape check belongs INSIDE the try: reading `state.ok` outside it
+    // meant an unexpected response threw past the error path and left the
+    // loading spinner on screen forever, with no message and no retry.
+    if (!state || typeof state.ok !== "boolean") {
+      throw new Error(l10n.t("The rebase plan came back in an unexpected shape."));
+    }
+  } catch (err) {
+    wrap.replaceChildren(
+      emptyState(l10n.t("Couldn't load the rebase plan"), cleanErr(err), {
+        icon: "warning",
+        action: {
+          label: l10n.t("Try again"),
+          icon: "refresh",
+          onClick: () => void mount(wrap, nav),
+        },
+      }),
+    );
+    return;
+  }
+
+  if (!state.ok) {
+    wrap.replaceChildren(
+      emptyState(
+        l10n.t("Interactive rebase unavailable"),
+        state.message ?? l10n.t("Open a repository first."),
+        { icon: "repo" },
+      ),
+    );
+    return;
+  }
+
+  // A rebase already in flight owns the repo — offer continue/abort only.
+  if (state.inProgress) {
+    wrap.replaceChildren(inProgressCard(() => mount(wrap, nav), wrap));
+    return;
+  }
+
+  if (!state.commits.length) {
+    // The host's note, when it has one, is the REASON the list is empty — most
+    // often "a merge commit in this range isn't listed", because a range made
+    // only of merges leaves nothing to pick. Printing the hardcoded sentence
+    // over it stated a falsehood: there ARE commits between those two refs.
+    wrap.replaceChildren(
+      emptyState(
+        l10n.t("Nothing to rebase"),
+        state.message ??
+          l10n.t(
+            "No commits between {0} and {1}. Pick a different base to reach further back.",
+            short(state.base),
+            state.branch,
+          ),
+        { icon: "git-commit" },
+      ),
+      baseBar(state, wrap, nav),
+    );
+    return;
+  }
+
+  build(wrap, nav, state);
+}
+
+// ── the workspace ────────────────────────────────────────────────────────────
+
+function build(wrap: HTMLElement, nav: (view: string) => void, state: RebasePlanState): void {
+  // Seed the reword box from the FULL message, not the subject. Seeding from
+  // the subject meant choosing Reword and changing nothing still deleted the
+  // body and every trailer under it.
+  const original: Row[] = state.commits.map((c) => ({
+    ...c,
+    action: "pick",
+    message: c.body ?? c.subject,
+  }));
+  let rows: Row[] = original.map((r) => ({ ...r }));
+  let busy = false;
+  /**
+   * Which commits the toolbar and the action keys act on (#32: "select
+   * multiple and set the action at once"). The rules — clicks, arrows, Shift,
+   * ⌘, Escape, what a squash across a selection means — are the shared
+   * engine's (engine/rebase/planEdit), the same ones the extension's two
+   * rebase surfaces run. Rows are named by sha, so the selection moves with
+   * them. The newest commit starts selected, so the keys work from the first
+   * Tab into the list.
+   */
+  let selection: PlanSelection = rows.length ? selectOnly(rows[0].sha) : NO_SELECTION;
+  /** The rows a drag picked up, by sha (the selection, or just the row). */
+  let dragging: string[] = [];
+
+  const head = el("div", "rb-head");
+  const title = el("div", "rb-title");
+  title.append(glyph("list-ordered"), span(l10n.t("Interactive rebase")));
+  const sub = el("div", "rb-sub");
+  const branchB = el("b", "rb-branch");
+  branchB.textContent = state.branch;
+  const baseB = document.createElement("b");
+  baseB.textContent = short(state.base);
+  const count = span("", "rb-count");
+  sub.append(glyph("git-branch"), branchB, span(l10n.t(" onto ")), baseB, span(" · "), count);
+
+  // The toolbar: how many are selected, and the six actions as words. It
+  // lives in the sticky header, so it is still there ten commits down.
+  const tools = el("div", "rb-tools");
+  tools.setAttribute("role", "group");
+  tools.setAttribute("aria-label", l10n.t("Set the action of the selected commits"));
+  const selCount = span("", "rb-selcount");
+  selCount.setAttribute("aria-live", "polite");
+  const setBtns = new Map<RebaseAction, HTMLButtonElement>();
+  const setGroup = el("div", "rb-setgroup");
+  for (const a of PLAN_ACTIONS) {
+    const b = el("button", `rb-set a-${a.id}`) as HTMLButtonElement;
+    b.type = "button";
+    b.textContent = a.label;
+    b.dataset.action = a.id;
+    b.title = actionTooltip(a.id);
+    b.setAttribute("aria-keyshortcuts", a.key);
+    b.addEventListener("click", () => bulkSet(a.id));
+    setBtns.set(a.id, b);
+    setGroup.appendChild(b);
+  }
+  tools.append(selCount, span(l10n.t("Set action"), "rb-tools-label"), setGroup);
+  head.append(title, sub, el("span", "rb-spacer"), baseBar(state, wrap, nav), tools);
+
+  const explain = buildExplainer();
+  const list = el("div", "rb-list");
+  // A grid of rows, several selectable at once: the arrows walk it, Shift and
+  // ⌘/Ctrl extend it, and each row still owns its dropdown and message box.
+  list.setAttribute("role", "grid");
+  list.setAttribute("aria-multiselectable", "true");
+  list.setAttribute("aria-label", l10n.t("Commits to rebase, newest first"));
+  const banner = el("div", "rb-banner");
+  banner.hidden = true;
+
+  // Footer
+  const foot = el("div", "rb-foot");
+  const resetBtn = el("button", "rb-btn ghost") as HTMLButtonElement;
+  resetBtn.append(glyph("discard"), span(l10n.t("Reset plan")));
+  const preview = span("", "rb-preview");
+  const applyBtn = el("button", "rb-btn primary") as HTMLButtonElement;
+  const applyLabel = span(l10n.t("Start rebase"));
+  applyBtn.append(glyph("play"), applyLabel);
+
+  /**
+   * Carry other local branches through the rewrite.
+   *
+   * Every commit gets a NEW sha, so a branch pointing at an old one is not left
+   * alone by the rebase — it is left on a parallel line nothing references. The
+   * plan builder emits `update-ref` for these, and the desktop never asked it
+   * to, so a stack of branches inside the range was silently orphaned. Defaults
+   * to the repo's own `rebase.updateRefs`, which is what the user's git would
+   * have done; the control only appears when there is actually something to
+   * carry.
+   */
+  const carried = [...new Set(rows.flatMap((r) => r.branches ?? []))];
+  let carryBranches = state.updateRefs ?? false;
+  if (carried.length) {
+    const wrapEl = el("label", "rb-carry");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = carryBranches;
+    box.addEventListener("change", () => {
+      carryBranches = box.checked;
+    });
+    const names =
+      carried.length <= 3 ? carried.join(", ") : l10n.t("{0} other branches", carried.length);
+    wrapEl.append(box, span(l10n.t("Move {0} with the rewrite", names)));
+    wrapEl.title = l10n.t(
+      "These branches point at commits in this range: {0}. Rewriting gives those commits new ids, so unless they are moved too they will point at commits that are no longer in {1}.",
+      carried.join(", "),
+      state.branch,
+    );
+    foot.appendChild(wrapEl);
+  }
+  foot.append(resetBtn, el("span", "rb-spacer"), preview, applyBtn);
+
+  // The banner rides in the sticky footer, above Start rebase. Under the list
+  // it was below the fold of any plan long enough to want a selection (#32) —
+  // "squash these twelve" answered with a reason nobody could see.
+  foot.prepend(banner);
+  wrap.replaceChildren(head, explain, hintBar(), list, foot);
+
+  /**
+   * The rows the keyboard reaches scroll clear of BOTH sticky bars. Focus
+   * scrolls only as far as the view's edge, which is under the header or the
+   * footer (and the dock under that) — so End put the oldest commit behind
+   * Start rebase. Kept in step with the bars' heights, which the toolbar's
+   * wrapping and the banner change.
+   */
+  const syncBars = (): void => {
+    const dock = parseFloat(getComputedStyle(foot).bottom) || 0;
+    wrap.style.scrollPaddingTop = `${head.offsetHeight + 8}px`;
+    wrap.style.scrollPaddingBottom = `${foot.offsetHeight + dock + 8}px`;
+  };
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => {
+      if (!head.isConnected) return ro.disconnect();
+      syncBars();
+    });
+    ro.observe(head);
+    ro.observe(foot);
+  }
+
+  // A note from the host (base fell back, or the list was capped) is worth
+  // showing — otherwise the range silently isn't what the user asked for.
+  /** The host's own note — the base fell back, or the list was capped. It is
+   *  the only thing telling the reader the range is not what they asked for,
+   *  and it is PERSISTENT: it belongs on screen for as long as the plan does. */
+  const showHostNote = (): void => {
+    if (!state.message) {
+      banner.hidden = true;
+      syncBars();
+      return;
+    }
+    banner.textContent = state.message;
+    banner.className = "rb-banner warn";
+    banner.hidden = false;
+    syncBars();
+  };
+  showHostNote();
+
+  // ── model helpers ──
+
+  /**
+   * The commit a squash/fixup folds INTO. git melds into the entry BEFORE it in
+   * the todo file, and the list is newest-first (issue #18), so on screen that is
+   * the nearest kept commit BELOW. Scanning upward was right only while the list
+   * ran oldest-first.
+   */
+  const foldTargetSubject = (i: number): string | null => {
+    for (let j = i + 1; j < rows.length; j++) {
+      const a = rows[j].action;
+      if (a === "drop" || a === "squash" || a === "fixup") continue;
+      return rows[j].subject;
+    }
+    return null;
+  };
+
+  /**
+   * A squash/fixup whose fold target has GONE — the plan `buildRebasePlan` will
+   * refuse ("the oldest commit can't be squash").
+   *
+   * `setAction` refuses to create that state, but nothing re-checked it after,
+   * and two ordinary gestures walk straight into it: drop the commit the squash
+   * folds into (`foldTargetSubject` skips drops, so the target vanishes), or
+   * drag the squash row to the bottom, which is this view's headline feature.
+   * The row kept saying "Folds down into the commit below it" about a commit
+   * that does not exist — and with the row at the bottom the thing physically
+   * below it is the dimmed `onto` base, so it read as "folds into the base" —
+   * while the footer counted the fold and Start rebase walked the user through
+   * the force-push confirm for a plan the view could already see was dead.
+   *
+   * Above the display cap this is NOT an error: apply() appends the older
+   * commits below the cap as plain picks, so the bottom row really does have
+   * something below it to fold into and the rebase runs correctly.
+   */
+  const hiddenTail = (): boolean => (state.replayCount ?? rows.length) > rows.length;
+  const foldOrphan = (i: number): boolean =>
+    (rows[i].action === "squash" || rows[i].action === "fixup") &&
+    foldTargetSubject(i) === null &&
+    !hiddenTail();
+
+  /** Transient messages share the banner with the host's note — so a flash has
+   *  to give it BACK. It used to hide the banner outright after four seconds,
+   *  which permanently destroyed the note saying the range had been capped or
+   *  the base substituted: one refused squash, and the reader lost the only
+   *  statement that their plan was not the whole story, for the rest of the
+   *  session. Sequenced, so an interrupted flash cannot restore over a newer
+   *  one. */
+  let flashSeq = 0;
+  const flashBanner = (msg: string, kind: "warn" | "error" = "warn"): void => {
+    const mine = ++flashSeq;
+    banner.textContent = msg;
+    banner.className = `rb-banner ${kind}`;
+    banner.hidden = false;
+    syncBars();
+    window.setTimeout(() => {
+      if (mine !== flashSeq) return;
+      showHostNote();
+    }, 4200);
+  };
+
+  const order = (): string[] => rows.map((r) => r.sha);
+  const indexOfSha = (sha: string): number => rows.findIndex((r) => r.sha === sha);
+  const rowEls = (): HTMLElement[] => [...list.querySelectorAll<HTMLElement>(".rb-row:not(.rb-base)")];
+  const rowEl = (sha: string | null | undefined): HTMLElement | undefined =>
+    sha ? rowEls().find((r) => r.dataset.sha === sha) : undefined;
+  const isMac = navigator.platform.toLowerCase().includes("mac");
+
+  /**
+   * Set `action` on the rows at `idx` — one row from its dropdown, or the
+   * selection from the toolbar and the keys. The same rule either way (the
+   * shared `setActions`): a squash or fixup is refused, row by row, where it
+   * would have nothing below it to fold into, which git refuses outright.
+   * Across a selection every row folds into the kept commit below it (for a
+   * block, the one under the block); only when none is kept below does the
+   * oldest selected row stay as it was, for the rest to fold into — and the
+   * banner says so.
+   *
+   * The dropdown used to refuse on the TOP row (HEAD) — the most ordinary
+   * squash there is — while accepting one on the oldest, which git cannot
+   * run; the rule is now asked in one place, the right way round.
+   */
+  const applyActions = (idx: number[], action: RebaseAction, refocus: Refocus, sha?: string): void => {
+    const before = rows.map((r) => r.action);
+    // Above the display cap the older commits are replayed below the list as
+    // plain picks (apply() does that), so the bottom row DOES have something
+    // to fold into — the same exception `foldOrphan` makes.
+    const plan: RebaseAction[] = hiddenTail() ? [...before, "pick"] : before;
+    const r = setActions(plan, idx, action, "newest-first");
+    rows.forEach((row, i) => {
+      row.action = r.actions[i];
+    });
+    const said = refusalText(
+      action,
+      r,
+      "newest-first",
+      r.refused.length === 1 ? before[r.refused[0]] : undefined,
+    );
+    if (said) flashBanner(said);
+    render(refocus, sha);
+  };
+
+  /** One row's dropdown. The keyboard goes back to that dropdown afterwards:
+   *  the generic focus rescue once left it on a DIFFERENT commit's, one
+   *  keystroke from setting an action nobody chose. */
+  const setAction = (i: number, action: RebaseAction): void => {
+    applyActions([i], action, "select", rows[i]?.sha);
+  };
+
+  /** The toolbar and the keys: every selected row. */
+  function bulkSet(action: RebaseAction, refocus: Refocus = null): void {
+    if (busy) return;
+    const idx = selectedInOrder(selection, order()).map(indexOfSha).filter((i) => i >= 0);
+    if (!idx.length) return;
+    applyActions(idx, action, refocus);
+  }
+
+  /** Put the rows in this sha order, if it is a different one. */
+  const reorder = (keys: string[], refocus: Refocus): void => {
+    if (keys.join("\n") === order().join("\n")) return;
+    const bySha = new Map(rows.map((r) => [r.sha, r] as const));
+    rows = keys.map((k) => bySha.get(k)).filter((r): r is Row => !!r);
+    render(refocus);
+  };
+
+  /** Alt+↑ / Alt+↓: the selection, one step, as a block. */
+  const moveSelection = (delta: -1 | 1): void => {
+    const next = moveSelected(order(), selection.selected, delta);
+    if (next) reorder(next, "row");
+  };
+
+  /** Point the selection somewhere and paint it; the keyboard follows it. */
+  const select = (next: PlanSelection, focusRow = true): void => {
+    selection = next;
+    paintSelection();
+    if (focusRow) rowEl(selection.focus)?.focus();
+  };
+
+  /** Selected / focused on every row, and the toolbar's count and state. */
+  function paintSelection(): void {
+    const on = new Set(selection.selected);
+    // One tab stop into the list: the row the keyboard is on.
+    const tabStop = selection.focus && indexOfSha(selection.focus) >= 0 ? selection.focus : rows[0]?.sha;
+    // A selection lands at once, as it does in every list; only the pointer's
+    // hover fades. (The rows' background transition would otherwise ease the
+    // selection in and out as well — and a paused compositor, an occluded
+    // window's, leaves it half-painted.)
+    list.classList.add("is-painting");
+    for (const r of rowEls()) {
+      const k = r.dataset.sha ?? "";
+      r.classList.toggle("is-selected", on.has(k));
+      r.setAttribute("aria-selected", String(on.has(k)));
+      r.tabIndex = k === tabStop ? 0 : -1;
+    }
+    void list.offsetHeight; // the new backgrounds are computed with no transition…
+    list.classList.remove("is-painting"); // …and the hover's comes back
+    const n = selection.selected.length;
+    selCount.textContent = selectionCountText(n);
+    // The action every selected row shares, if they share one, reads as the
+    // current one — a look at the toolbar says what the selection is set to.
+    const acts = new Set(rows.filter((r) => on.has(r.sha)).map((r) => r.action));
+    for (const [id, b] of setBtns) {
+      b.disabled = n === 0 || busy;
+      b.classList.toggle("is-current", n > 0 && acts.size === 1 && acts.has(id));
+    }
+  }
+
+  const updatePreview = (): void => {
+    const kept = rows.filter((r) => r.action !== "drop" && r.action !== "squash" && r.action !== "fixup").length;
+    const dropped = rows.filter((r) => r.action === "drop").length;
+    const folded = rows.filter((r) => r.action === "squash" || r.action === "fixup").length;
+    // The TOTAL the rebase will replay, not the number of rows on screen.
+    //
+    // The list is capped, and `state.replayCount` is how many commits the
+    // rebase actually covers — which is what the confirm dialog beside this
+    // preview was fixed to use. The preview went on counting rows, so on a
+    // range longer than the cap it read "50 → 50 commits" for a rebase the
+    // dialog one line down correctly called 214, and the reader was told a
+    // smaller, safer number by the more prominent of the two.
+    const total = Math.max(state.replayCount ?? rows.length, rows.length);
+    const hidden = total - rows.length;
+    const kept2 = total - dropped - folded;
+    const bits = [
+      kept2 === 1 ? l10n.t("{0} → 1 commit", total) : l10n.t("{0} → {1} commits", total, kept2),
+    ];
+    if (hidden) bits.push(l10n.t("{0} not shown", hidden));
+    if (folded) bits.push(l10n.t("{0} folded", folded));
+    if (dropped) bits.push(l10n.t("{0} dropped", dropped));
+    preview.textContent = bits.join(" · ");
+    count.textContent = total === 1 ? l10n.t("1 commit") : l10n.t("{0} commits", total);
+    // Re-validate the WHOLE plan on every render, not just the action being
+    // set. A fold target can disappear long after the squash was chosen.
+    const orphan = rows.some((_, i) => foldOrphan(i));
+    // A plan that keeps NOTHING is not a rebase. Dropping every commit and
+    // pressing Apply erases the whole range and then offers to force-push it,
+    // which is `git reset --hard` wearing a rebase's clothes — and the preview
+    // said "N → 0 commits" while the button beside it stayed lit. Nothing in
+    // the flow named the consequence, and the force-push confirm downstream
+    // talks about rewriting history, not about deleting all of it.
+    // …and only when the list IS the plan. `kept` counts the rows on screen,
+    // and the list is capped: above the cap the rebase replays commits this
+    // view never drew, so "every visible commit is dropped" is not "the plan
+    // keeps nothing". `total` four lines up was taught to use `replayCount`
+    // and this was not — two fixes from the same batch, in the same function,
+    // disagreeing. `foldOrphan` already applies `hiddenTail()` for this reason.
+    const emptyPlan = rows.length > 0 && kept === 0 && !hiddenTail();
+    applyBtn.disabled = orphan || emptyPlan || busy;
+    applyBtn.title = orphan
+      ? l10n.t("A squash or fixup has nothing below it to fold into — git can't run this plan.")
+      : emptyPlan
+        ? l10n.t(
+            "This plan keeps no commits at all. To move the branch back to {0} instead, use Reset — a rebase that drops everything does the same thing with no way to tell that is what happened.",
+            short(state.base),
+          )
+        : "";
+  };
+
+  // ── rendering ──
+  function makeRow(r: Row, i: number): HTMLElement {
+    const row = el("div", "rb-row");
+    row.dataset.action = r.action;
+    row.dataset.sha = r.sha;
+    row.setAttribute("role", "row");
+    row.setAttribute(
+      "aria-label",
+      l10n.t(
+        "{0} {1} {2}",
+        ACTIONS.find((a) => a.id === r.action)?.label ?? r.action,
+        r.shortSha,
+        r.subject,
+      ),
+    );
+    row.tabIndex = -1;
+    row.draggable = true;
+    if (r.action === "drop") row.classList.add("dropped");
+
+    const rail = el("div", "rb-rail");
+    rail.setAttribute("aria-hidden", "true");
+    rail.appendChild(el("span", "rb-node"));
+    row.appendChild(rail);
+
+    const grip = el("span", "rb-grip");
+    grip.setAttribute("aria-hidden", "true");
+    grip.appendChild(glyph("gripper"));
+    grip.title = l10n.t("Drag to reorder — the selected commits move together (or press Alt+↑ / Alt+↓)");
+    row.appendChild(grip);
+
+    const sel = document.createElement("select");
+    sel.className = `rb-action a-${r.action}`;
+    // Which commit this control belongs to. Changing an action rebuilds the
+    // list, and the focus rescue then matched on `title` — which is derived
+    // from the action, so it changes at exactly the moment the rescue needs it
+    // stable, and every other "Pick" row matched instead. Focus landed on a
+    // DIFFERENT commit's dropdown, where the next keystroke set an action on a
+    // commit the user never selected. `sameThing` checks dataset.num first.
+    sel.dataset.num = r.sha;
+    for (const a of ACTIONS) {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = a.label;
+      if (a.id === r.action) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.title = ACTIONS.find((a) => a.id === r.action)?.hint ?? "";
+    sel.addEventListener("change", () => setAction(i, sel.value as RebaseAction));
+    row.appendChild(sel);
+
+    const main = el("div", "rb-main");
+    main.setAttribute("role", "gridcell");
+    const line = el("div", "rb-line");
+    const subj = span(r.subject, "rb-subj");
+    subj.title = r.subject;
+    const av = span(initials(r.author), "rb-avatar");
+    av.style.setProperty("--h", String(hue(r.author)));
+    av.title = r.author;
+    const sha = el("span", "rb-sha");
+    sha.append(glyph("git-commit"), span(r.shortSha));
+    // The consequence rides the SUBJECT line, not a line of its own. Revealing a
+    // second line under the row grew it by 17px the instant you chose an action,
+    // which shoved every row below — including the next row's action dropdown,
+    // the very control you reach for next. Choosing "squash" moved the thing you
+    // were about to click before your hand got there.
+    const orphan = foldOrphan(i);
+    const cons = el("span", `rb-consequence${orphan ? " bad" : ""}`);
+    const c = consequence(r.action, foldTargetSubject(i), orphan);
+    if (c) cons.append(glyph(c.icon), span(c.text));
+    line.append(subj, cons, av, span(r.rel, "rb-meta"), sha);
+    main.appendChild(line);
+
+    // Reword editor — only visible for `reword` (CSS-driven off data-action).
+    const rw = el("div", "rb-reword");
+    const ta = document.createElement("textarea");
+    ta.value = r.message || r.subject;
+    ta.placeholder = l10n.t("New commit message…");
+    ta.rows = 2;
+    ta.addEventListener("input", () => {
+      r.message = ta.value;
+    });
+    rw.appendChild(ta);
+    main.appendChild(rw);
+
+    row.appendChild(main);
+
+    wireDrag(row);
+    return row;
+  }
+
+  /**
+   * Drag to reorder. Picking up a SELECTED row carries the whole selection,
+   * in its list order, the way a file manager drags; picking up any other row
+   * selects it and carries it alone.
+   */
+  function wireDrag(row: HTMLElement): void {
+    const sha = row.dataset.sha ?? "";
+    row.addEventListener("dragstart", (e) => {
+      if (!selection.selected.includes(sha)) select(selectOnly(sha), false);
+      dragging = dragKeys(selection, order(), sha);
+      e.dataTransfer?.setData("text/plain", sha);
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      for (const r of rowEls()) r.classList.toggle("dragging", dragging.includes(r.dataset.sha ?? ""));
+    });
+    row.addEventListener("dragend", () => {
+      dragging = [];
+      for (const r of rowEls()) r.classList.remove("dragging");
+    });
+    /** Which half of the row the pointer is in — the drop lands on that side.
+     *
+     *  The indicator was a fixed line under the row and the insert was always
+     *  `move(from, i)`, and those two only agree when you drag DOWN. Dragging
+     *  UP, `splice(i, 0, …)` puts the commit ABOVE the row while the line
+     *  underneath it promised below — so every upward drag landed one row off
+     *  from where the app said it would, on the view whose whole job is to say
+     *  where commits will land. It also made position 0 unreachable by pointer.
+     */
+    const half = (e: DragEvent): "before" | "after" => {
+      const r = row.getBoundingClientRect();
+      return e.clientY < r.top + r.height / 2 ? "before" : "after";
+    };
+    const paint = (side: "before" | "after" | null): void => {
+      row.classList.toggle("drag-over-top", side === "before");
+      row.classList.toggle("drag-over", side === "after");
+    };
+    row.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      paint(half(e));
+    });
+    row.addEventListener("dragleave", () => paint(null));
+    row.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const side = half(e);
+      paint(null);
+      const moving = dragging;
+      dragging = [];
+      const i = indexOfSha(sha);
+      if (!moving.length || i < 0) return;
+      // The gap the line was drawn at: above this row, or below it. Every
+      // dragged row goes into it, in its list order.
+      reorder(moveKeysToGap(order(), moving, side === "before" ? i : i + 1), "row");
+    });
+  }
+
+  function makeBaseRow(): HTMLElement {
+    const row = el("div", "rb-row rb-base");
+    row.setAttribute("role", "row");
+    row.setAttribute(
+      "aria-label",
+      l10n
+        .t(
+          "Onto {0} {1}",
+          state.baseCommit?.shortSha ?? short(state.base),
+          state.baseCommit?.subject ?? "",
+        )
+        .trim(),
+    );
+    const rail = el("div", "rb-rail");
+    rail.appendChild(el("span", "rb-node"));
+    // The anchor row occupies the SAME columns as a commit row — an invisible
+    // grip, then the ONTO badge in the action slot — so its subject starts on
+    // the same left edge as every subject above it instead of 80px earlier.
+    const grip = el("span", "rb-grip is-spacer");
+    grip.appendChild(glyph("gripper"));
+    row.append(rail, grip, span(l10n.t("onto"), "rb-onto"));
+    const main = el("div", "rb-main");
+    const line = el("div", "rb-line");
+    const subj = span(state.baseCommit?.subject ?? short(state.base), "rb-subj");
+    const sha = el("span", "rb-sha");
+    sha.append(glyph("git-commit"), span(state.baseCommit?.shortSha ?? short(state.base)));
+    line.append(subj, sha);
+    main.appendChild(line);
+    row.appendChild(main);
+    return row;
+  }
+
+  /**
+   * Rebuild the list. `refocus` puts the keyboard back where it was working:
+   * "row" on the row it is on, "select" on a row's dropdown (`sha`'s, else
+   * the focused row's). Without one, the keyboard only follows when it was in
+   * the list already — a toolbar button keeps it.
+   */
+  function render(refocus: Refocus = null, sha?: string): void {
+    const hadFocus = list.contains(document.activeElement);
+    list.replaceChildren(...rows.map((r, i) => makeRow(r, i)));
+    if (state.baseCommit) list.appendChild(makeBaseRow());
+    paintSelection();
+    updatePreview();
+    syncBars();
+    const target = rowEl(sha ?? selection.focus);
+    if (refocus === "select") target?.querySelector<HTMLSelectElement>(".rb-action")?.focus();
+    else if (refocus === "row" || hadFocus) target?.focus();
+  }
+
+  // ── selecting, from the mouse and the keyboard ──
+
+  list.addEventListener("mousedown", (e) => {
+    // A Shift-click selects rows, not the text between two clicks.
+    if (e.shiftKey && (e.target as HTMLElement).closest(".rb-row:not(.rb-base)")) e.preventDefault();
+  });
+  list.addEventListener("click", (e) => {
+    const t = e.target as HTMLElement;
+    const row = t.closest<HTMLElement>(".rb-row:not(.rb-base)");
+    // A row's own controls keep their clicks: the dropdown opens, the message
+    // box takes the caret. Focusing one selects its row (focusin, below).
+    if (!row || t.closest("select, textarea, button, input, a")) return;
+    select(
+      clickRow(selection, order(), row.dataset.sha ?? "", {
+        range: e.shiftKey,
+        toggle: isMac ? e.metaKey : e.ctrlKey,
+      }),
+    );
+  });
+  list.addEventListener("focusin", (e) => {
+    // Tabbing (or clicking) into a row's dropdown or message box makes that
+    // row the one the keys act on, as a click on the row would. The row's
+    // own focus is the click handler's business: a ⌘-click must not collapse
+    // the selection on its way in.
+    const t = e.target as HTMLElement;
+    const row = t.closest<HTMLElement>(".rb-row:not(.rb-base)");
+    if (!row || t === row) return;
+    const sha = row.dataset.sha ?? "";
+    if (!selection.selected.includes(sha)) select(selectOnly(sha), false);
+    else if (selection.focus !== sha) select({ ...selection, focus: sha }, false);
+  });
+  list.addEventListener("keydown", (e) => {
+    const t = e.target as HTMLElement;
+    const row = t.closest<HTMLElement>(".rb-row:not(.rb-base)");
+    if (!row || busy) return;
+    // Alt+↑/↓ moves the selection from anywhere in a row, as it always has.
+    if (e.altKey && !e.metaKey && !e.ctrlKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      moveSelection(e.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
+    // Everything else only on the row itself: a dropdown's arrows and a
+    // message box's letters are theirs.
+    if (t !== row) return;
+    const mod = isMac ? e.metaKey : e.ctrlKey;
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !mod && !e.altKey) {
+      e.preventDefault();
+      select(arrowRow(selection, order(), e.key === "ArrowUp" ? -1 : 1, e.shiftKey));
+    } else if ((e.key === "Home" || e.key === "End") && !mod && !e.altKey) {
+      e.preventDefault();
+      select(reachRow(selection, order(), e.key === "Home" ? 0 : rows.length - 1, e.shiftKey));
+    } else if (e.key === "Escape") {
+      const next = collapseSelection(selection);
+      if (next === selection) return; // nothing to collapse: Escape is not ours
+      e.preventDefault();
+      e.stopPropagation();
+      select(next);
+    } else if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      select(selectAll(selection, order()));
+    } else if (!mod && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      // git's own todo letters: p r s f e d.
+      const action = actionForKey(e.key);
+      if (!action) return;
+      e.preventDefault();
+      bulkSet(action, "row");
+    }
+  });
+
+  // ── actions ──
+  resetBtn.addEventListener("click", () => {
+    void (async () => {
+      // Only ask when there is something to lose. A plan you have not touched
+      // has nothing to discard, and a confirm on a no-op is just noise — but a
+      // plan with reorders, drops and reworded messages is typing that exists
+      // nowhere else, and this button threw all of it away on one click.
+      const changed = JSON.stringify(rows) !== JSON.stringify(original);
+      if (changed) {
+        const ok = await confirmDialog({
+          title: l10n.t("Reset the plan?"),
+          message: l10n.t(
+            "Every action, reorder and reworded message goes back to how the plan started. Nothing has been written to the repository yet, so this is the only copy of that work.",
+          ),
+          confirmLabel: l10n.t("Reset plan"),
+          danger: true,
+        });
+        if (!ok) return;
+      }
+      rows = original.map((r) => ({ ...r }));
+      render();
+      toast(l10n.t("Plan reset."), "info");
+    })();
+  });
+
+  applyBtn.addEventListener("click", () => {
+    void (async () => {
+      if (busy) return;
+      const dropped = rows.filter((r) => r.action === "drop").length;
+      // What the rebase REWRITES, not what is on screen. Above the display cap
+      // the commits below it are replayed too — that is what stops them being
+      // deleted — and a replay gives every one of them a new id as soon as the
+      // base has moved. "This rewrites 200 commits" on a range of 260 was the
+      // dialog understating the blast radius of the one irreversible button.
+      const rewritten = Math.max(state.replayCount ?? rows.length, rows.length);
+      const ok = await confirmDialog({
+        title: l10n.t("Start interactive rebase?"),
+        message: dropped
+          ? rewritten === 1
+            ? l10n.t(
+                "This rewrites 1 commit on {0}, deleting {1}. If the branch is already pushed you'll need to force-push afterwards.",
+                state.branch,
+                dropped,
+              )
+            : l10n.t(
+                "This rewrites {0} commits on {1}, deleting {2}. If the branch is already pushed you'll need to force-push afterwards.",
+                rewritten,
+                state.branch,
+                dropped,
+              )
+          : rewritten === 1
+            ? l10n.t(
+                "This rewrites 1 commit on {0}. If the branch is already pushed you'll need to force-push afterwards.",
+                state.branch,
+              )
+            : l10n.t(
+                "This rewrites {0} commits on {1}. If the branch is already pushed you'll need to force-push afterwards.",
+                rewritten,
+                state.branch,
+              ),
+        confirmLabel: l10n.t("Start rebase"),
+      });
+      if (!ok) return;
+
+      busy = true;
+      applyBtn.classList.add("busy");
+      applyBtn.disabled = true;
+      applyLabel.textContent = l10n.t("Rebasing…");
+      paintSelection(); // nothing sets an action while the plan is running
+      try {
+        const payload: RebaseApplyRow[] = rows.map((r) => ({
+          action: r.action,
+          sha: r.sha,
+          subject: r.subject,
+          message: r.action === "reword" ? r.message : undefined,
+          // The branches sitting on this commit. Without them the plan builder
+          // has nothing to emit `update-ref` for, and every branch inside the
+          // rewritten range is left pointing at a commit that is no longer in
+          // this branch's history.
+          branches: r.branches,
+        }));
+        const outcome = await host.invoke("rebase:apply", {
+          base: state.base,
+          rows: payload,
+          updateRefs: carryBranches,
+          // The tip this plan was built against. The host refuses if it has
+          // moved since — otherwise a commit made in a terminal while the
+          // workspace was open is silently replayed as the OLDEST commit on the
+          // branch.
+          headSha: state.headSha,
+        });
+        if (outcome.status === "done") {
+          toast(l10n.t("Rebase complete."), "success");
+          void mount(wrap, nav); // reload the (now shorter) plan
+        } else if (outcome.status === "stopped") {
+          toast(outcome.message || l10n.t("Rebase paused — resolve, then Continue."), "info", 6000);
+          void mount(wrap, nav); // re-enters the in-progress card
+        } else {
+          // A refusal that is the user's state (uncommitted changes, a rebase
+          // already under way) is said in the warning tone, like every other
+          // `expected` result; anything else failed.
+          flashBanner(outcome.message || l10n.t("Rebase failed."), outcome.expected ? "warn" : "error");
+        }
+      } catch (err) {
+        flashBanner(cleanErr(err), "error");
+      } finally {
+        busy = false;
+        applyBtn.classList.remove("busy");
+        applyBtn.disabled = false;
+        applyLabel.textContent = l10n.t("Start rebase");
+        paintSelection();
+      }
+    })();
+  });
+
+  render();
+}
+
+// ── pieces ───────────────────────────────────────────────────────────────────
+
+function loadingCard(): HTMLElement {
+  const w = el("div", "rb-loading");
+  w.append(glyph("loading"), span(l10n.t("Loading commits…")));
+  return w;
+}
+
+/**
+ * How to read the list, and the keys that work on it — the ones the toolbar's
+ * tooltips name, said once where they can be found without hovering.
+ */
+function hintBar(): HTMLElement {
+  const h = el("div", "rb-hint");
+  const mod = navigator.platform.toLowerCase().includes("mac") ? "⌘" : "Ctrl";
+  const keys = el("span", "rb-hint-keys");
+  keys.append(
+    span(l10n.t("Shift- or {0}-click selects several;", mod)),
+    ...PLAN_ACTIONS.map((a) => {
+      const k = el("kbd", "rb-kbd");
+      k.textContent = a.key;
+      k.title = a.label;
+      return k;
+    }),
+    span(l10n.t("set their action; drag or Alt+↑ / Alt+↓ moves them.")),
+  );
+  h.append(
+    glyph("info"),
+    span(l10n.t("Newest first, as in Commits; git replays them bottom → top.")),
+    keys,
+  );
+  return h;
+}
+
+/** The dismissible explainer + glossary — the same wording as the extension. */
+function buildExplainer(): HTMLElement {
+  const box = el("div", "rb-explain");
+  if (localStorage.getItem(EXPLAIN_KEY) === "1") {
+    box.hidden = true;
+  }
+  const x = el("button", "rb-explain-x") as HTMLButtonElement;
+  x.textContent = "×";
+  x.title = l10n.t("Dismiss");
+  x.addEventListener("click", () => {
+    box.hidden = true;
+    localStorage.setItem(EXPLAIN_KEY, "1");
+  });
+  const lead = el("div", "rb-explain-lead");
+  const strong = document.createElement("b");
+  strong.textContent = l10n.t("Tidy up your recent commits before you push.");
+  lead.append(
+    glyph("lightbulb"),
+    strong,
+    span(
+      l10n.t(
+        " Reorder by dragging, or pick what happens to each commit below. Nothing changes until you press Start rebase.",
+      ),
+    ),
+  );
+  const gloss = el("div", "rb-gloss");
+  for (const a of ACTIONS) {
+    const item = document.createElement("span");
+    const b = document.createElement("b");
+    b.className = `g-${a.id}`;
+    b.textContent = a.label;
+    item.append(b, span(" " + a.hint.replace(/\.$/, "")));
+    gloss.appendChild(item);
+  }
+  box.append(x, lead, gloss);
+  return box;
+}
+
+/**
+ * Base picker. One-click presets cover the common cases so a rebase can be
+ * started without typing anything; "Change base…" takes an arbitrary ref.
+ *
+ * NOTE: this must never use window.prompt — Electron renderers don't implement
+ * it, so the old prompt silently did nothing and the view looked dead.
+ */
+function baseBar(state: RebasePlanState, wrap: HTMLElement, nav: (v: string) => void): HTMLElement {
+  const bar = el("div", "rb-basebar");
+
+  /**
+   * Load a new base.
+   *
+   * The composed plan — every action, the reordering, any message typed into a
+   * reword — lives in the DOM this builds. So it must not be torn down until
+   * there is something to replace it WITH. It used to blank the view to a
+   * loading card first and, on any failure, "fall back" by rebuilding from the
+   * original `state`: same commits, every action reset to pick, every edit
+   * gone. Trying a base and finding it empty silently threw away the plan.
+   *
+   * The in-flight state goes on the control you pressed, not on the workspace.
+   */
+  const load = (base: string, btn?: HTMLButtonElement): void => {
+    void (async () => {
+      if (btn) {
+        btn.disabled = true;
+        btn.classList.add("is-busy");
+      }
+      try {
+        const re = await host.invoke("rebase:load", { base });
+        // A rebase already running owns this view. Building the Start-rebase
+        // workspace over a live rebase offers a plan that cannot be applied —
+        // `runRebasePlan` refuses while one is in progress — so the user is
+        // handed a screen whose only button is dead. Checked BEFORE the
+        // commits test, because a mid-rebase load legitimately has rows.
+        if (re.ok && re.inProgress) {
+          void mount(wrap, nav);
+          return;
+        }
+        if (re.ok && re.commits.length) {
+          build(wrap, nav, re);
+          return;
+        }
+        toast(re.message || l10n.t("No commits between {0} and HEAD.", short(base)), "error");
+      } catch (err) {
+        toast(cleanErr(err), "error");
+      } finally {
+        if (btn?.isConnected) {
+          btn.disabled = false;
+          btn.classList.remove("is-busy");
+        }
+      }
+      // Nothing to show for the new base — so show what is still on screen.
+      // There is no rebuild here on purpose: the live plan is untouched.
+      if (!state.commits.length) void mount(wrap, nav);
+    })();
+  };
+
+  const preset = (label: string, base: string, title: string): void => {
+    const b = el("button", "rb-chip") as HTMLButtonElement;
+    b.textContent = label;
+    b.title = title;
+    if (base === state.base) b.classList.add("is-active");
+    b.addEventListener("click", () => load(base, b));
+    bar.appendChild(b);
+  };
+
+  preset(l10n.t("Last 5"), "HEAD~5", l10n.t("Rebase the last 5 commits"));
+  preset(l10n.t("Last 10"), "HEAD~10", l10n.t("Rebase the last 10 commits"));
+  preset(l10n.t("Last 20"), "HEAD~20", l10n.t("Rebase the last 20 commits"));
+  preset(l10n.t("Upstream"), "@{upstream}", l10n.t("Rebase everything not yet pushed"));
+
+  const btn = el("button", "rb-btn ghost") as HTMLButtonElement;
+  btn.append(glyph("edit"), span(l10n.t("Change base…")));
+  btn.title = l10n.t("Rebase onto a specific commit or branch");
+  btn.addEventListener("click", () => {
+    void (async () => {
+      const next = await promptInline(
+        l10n.t("Rebase onto…"),
+        "e.g. HEAD~5, main, origin/main, or a commit SHA",
+        state.base === "--root" ? "" : state.base,
+        l10n.t("Load commits"),
+      );
+      if (next && next.trim()) load(next.trim(), btn as HTMLButtonElement);
+    })();
+  });
+  bar.appendChild(btn);
+  return bar;
+}
+
+/**
+ * After a verb the view is rebuilt under the button that ran it, and the
+ * keyboard fell to the page (Tab started again from the top bar). It goes
+ * back to the same verb when the rebase is still stopped, else to the first
+ * control of whatever the view shows now — only if it is still nowhere.
+ */
+function returnKeyboard(wrap: HTMLElement, verb: "continue" | "skip" | "abort"): void {
+  const active = document.activeElement;
+  if (active && active !== document.body && active.isConnected) return;
+  const again = wrap.querySelector<HTMLButtonElement>(`.rb-inprogress button[data-verb="${verb}"]`);
+  const target =
+    again && !again.hidden && !again.disabled
+      ? again
+      : wrap.querySelector<HTMLElement>("button:not([disabled]):not([hidden]), input:not([disabled]), [tabindex='0']");
+  target?.focus();
+}
+
+/** Shown when git is mid-rebase: continue, abort — and skip, where git itself names it as the way out. */
+function inProgressCard(reload: () => Promise<void>, wrap: HTMLElement): HTMLElement {
+  const card = el("div", "rb-inprogress");
+  const head = el("div", "rb-inprogress-head");
+  head.append(glyph("debug-pause"), span(l10n.t("A rebase is in progress")));
+  const body = span(
+    // Not "resolve any conflicts": a rebase can stop with a perfectly clean tree —
+    // git refusing a todo it cannot execute is one way — and telling someone to
+    // resolve conflicts that do not exist sends them looking for nothing.
+    l10n.t(
+      "Git stopped part-way. If there are conflicts, resolve them in the Changes view first, then continue. Aborting restores the branch to exactly where it started.",
+    ),
+    "rb-inprogress-body",
+  );
+  const btns = el("div", "rb-inprogress-btns");
+  // The operation's own verbs, as the dashboard and the merge editor say them
+  // (a bare "Continue" here, "Continue Rebase" everywhere else).
+  const cont = el("button", "rb-btn primary") as HTMLButtonElement;
+  cont.append(glyph("debug-continue"), span(l10n.t("Continue Rebase")));
+  cont.dataset.verb = "continue";
+  const abort = el("button", "rb-btn danger") as HTMLButtonElement;
+  abort.append(glyph("circle-slash"), span(l10n.t("Abort Rebase")));
+  abort.dataset.verb = "abort";
+  // Skip, ONLY where git offers it. The Changes view's banner had it; this
+  // view, which says "a rebase is in progress" in so many words, did not — so
+  // an apply-backend rebase stopped on an emptied patch had no way forward
+  // from here: Continue is refused on an empty patch, and Skip was not on
+  // screen. The main process decides whether it is safe (`canSkip`): on the
+  // merge backend `rebase --skip` hard-resets a deliberate pause, so it is not
+  // offered there.
+  const skip = el("button", "rb-btn") as HTMLButtonElement;
+  skip.append(glyph("debug-step-over"), span(l10n.t("Skip this commit")));
+  skip.title = l10n.t("Leave out the commit git is stuck on and carry on with the rest");
+  skip.hidden = true;
+  skip.dataset.verb = "skip";
+
+  // The operation as the main process describes it NOW (names, willDrop,
+  // canSkip) — read when a button is pressed, never from a view built earlier.
+  const currentOp = async (): Promise<OperationView | undefined> =>
+    host
+      .invoke("conflict:state", undefined)
+      .then((s) => s?.op)
+      .catch(() => undefined);
+
+  /**
+   * Every verb goes through the SHARED operation core (op:continue / op:skip /
+   * op:abort), the one the dashboard and the merge editor use — not the legacy
+   * rebase:* verbs, which never asked before dropping an emptied commit,
+   * finished a --rebase-merges merge step without recording the merge, and
+   * decided "not rewinding" from git's English. And through `exclusive()`, the
+   * renderer's one verb lock: the main process queues a second call rather
+   * than dropping it, so a double click would run two Continues. Every button
+   * is dead while one runs.
+   */
+  const run = async (
+    verb: "continue" | "skip" | "abort",
+    fn: () => Promise<OperationOutcome | undefined>,
+    before: OperationView | undefined,
+  ): Promise<void> => {
+    for (const b of [cont, skip, abort]) b.disabled = true;
+    try {
+      const o = await fn();
+      if (!o) return; // another verb is running (exclusive() dropped this one)
+      const line = outcomeLine(o, before ?? o.view, verb);
+      toast(line.text, line.kind === "done" ? "success" : line.kind === "stopped" ? "info" : o.expected ? "info" : "error", 6000);
+      await reload();
+      returnKeyboard(wrap, verb);
+    } catch (e) {
+      const fallback =
+        verb === "continue"
+          ? l10n.t("Couldn't continue the rebase.")
+          : verb === "skip"
+            ? l10n.t("Couldn't skip the rebase.")
+            : l10n.t("Couldn't abort the rebase.");
+      toast(cleanErr(e) || fallback, "error", 6000);
+    } finally {
+      for (const b of [cont, skip, abort]) {
+        if (b.isConnected) b.disabled = false;
+      }
+    }
+  };
+
+  cont.addEventListener("click", () => {
+    void (async () => {
+      if (cont.disabled) return;
+      const before = await currentOp();
+      // Continuing would DROP an emptied commit: say so first (the shared
+      // words), and only a yes sends confirmDrop. The main process refuses
+      // without it either way.
+      let confirmDrop = false;
+      if (before?.willDrop) {
+        confirmDrop = await confirmDialog({
+          title: l10n.t("Drop the emptied commit?"),
+          message: willDropText(before),
+          confirmLabel: l10n.t("Drop it and continue"),
+          danger: true,
+          holdWhile: whileSameRepo(),
+        });
+        if (!confirmDrop) return;
+      }
+      await run("continue", () => exclusive(() => host.invoke("op:continue", confirmDrop ? { confirmDrop: true } : {})), before);
+    })();
+  });
+  abort.addEventListener("click", () => {
+    void (async () => {
+      if (abort.disabled) return;
+      const before = await currentOp();
+      const words = before
+        ? abortConfirm(before)
+        : {
+            question: l10n.t("Abort the rebase?"),
+            detail: l10n.t("The branch returns to where it was before the rebase started."),
+            confirm: l10n.t("Abort Rebase"),
+          };
+      const ok = await confirmDialog({
+        title: words.question,
+        message: words.detail,
+        confirmLabel: words.confirm,
+        danger: true,
+        holdWhile: whileSameRepo(),
+      });
+      if (!ok) return;
+      await run("abort", () => exclusive(() => host.invoke("op:abort", undefined)), before);
+    })();
+  });
+  skip.addEventListener("click", () => {
+    void (async () => {
+      if (skip.disabled) return;
+      const before = await currentOp();
+      const words = before
+        ? skipConfirm(before)
+        : {
+            question: l10n.t("Skip this commit?"),
+            detail: l10n.t("The commit git is stuck on is left out and the rest carries on."),
+            confirm: l10n.t("Skip this commit"),
+          };
+      const ok = await confirmDialog({
+        title: words.question,
+        message: words.detail,
+        confirmLabel: words.confirm,
+        danger: true,
+        holdWhile: whileSameRepo(),
+      });
+      if (!ok) return;
+      await run("skip", () => exclusive(() => host.invoke("op:skip", undefined)), before);
+    })();
+  });
+  void host
+    .invoke("git:opState", undefined)
+    .then((op) => {
+      skip.hidden = !(op && op.kind === "rebase" && op.canSkip);
+    })
+    .catch(() => {
+      /* no state: offer nothing git might refuse */
+    });
+  btns.append(cont, skip, abort);
+  card.append(head, body, btns);
+  return card;
+}
+
+function consequence(
+  action: RebaseAction,
+  target: string | null,
+  orphan = false,
+): { icon: string; text: string } | null {
+  if (orphan && (action === "squash" || action === "fixup")) {
+    return {
+      icon: "warning",
+      text: l10n.t("Nothing below it to fold into — pick a different action or move it up"),
+    };
+  }
+  const into = target ? `“${clip(target, 44)}”` : l10n.t("the commit below it");
+  switch (action) {
+    case "squash":
+      return { icon: "fold-down", text: l10n.t("Folds down into {0} — keeps both messages", into) };
+    case "fixup":
+      return { icon: "fold-down", text: l10n.t("Folds down into {0} — drops this message", into) };
+    case "edit":
+      return {
+        icon: "debug-pause",
+        text: l10n.t("The rebase pauses here so you can amend this commit, then Continue"),
+      };
+    case "drop":
+      return { icon: "trash", text: l10n.t("This commit will be deleted") };
+    default:
+      return null;
+  }
+}
+
+function initials(name: string): string {
+  const p = (name || "?").trim().split(/\s+/);
+  return ((p[0] || "?")[0] + (p[1] ? p[1][0] : "")).toUpperCase();
+}
+
+function hue(name: string): number {
+  let h = 7;
+  for (const c of name || "") h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+
+function clip(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function short(ref: string): string {
+  if (ref === "--root") return l10n.t("the root commit");
+  // A full object name, SHA-1 or SHA-256.
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(ref) ? ref.slice(0, 7) : ref;
+}

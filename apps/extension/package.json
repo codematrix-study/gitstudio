@@ -1,0 +1,2598 @@
+{
+  "name": "gitstudio",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "version": "1.22.0",
+  "publisher": "gitstudio",
+  "license": "Apache-2.0",
+  "icon": "media/icon.png",
+  "homepage": "https://gitstudio.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GitStudioHQ/gitstudio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/GitStudioHQ/gitstudio/issues"
+  },
+  "galleryBanner": {
+    "color": "#1A1726",
+    "theme": "dark"
+  },
+  "sponsor": {
+    "url": "https://github.com/sponsors/antonarnaudov"
+  },
+  "qna": "https://github.com/GitStudioHQ/gitstudio/issues",
+  "badges": [
+    {
+      "url": "https://img.shields.io/open-vsx/v/gitstudio/gitstudio?label=Open%20VSX&logo=eclipseide&logoColor=white&color=C36BF0",
+      "href": "https://open-vsx.org/extension/gitstudio/gitstudio",
+      "description": "Also on Open VSX \u2014 Cursor, VSCodium, Windsurf, Gitpod"
+    },
+    {
+      "url": "https://img.shields.io/github/actions/workflow/status/GitStudioHQ/gitstudio/ci.yml?branch=main&label=build&logo=githubactions&logoColor=white",
+      "href": "https://github.com/GitStudioHQ/gitstudio/actions/workflows/ci.yml",
+      "description": "CI build status"
+    },
+    {
+      "url": "https://img.shields.io/badge/license-Apache--2.0-44a248",
+      "href": "https://github.com/GitStudioHQ/gitstudio/blob/main/LICENSE",
+      "description": "Apache-2.0 licensed \u2014 free on public and private repos"
+    },
+    {
+      "url": "https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=white",
+      "href": "https://github.com/sponsors/antonarnaudov",
+      "description": "Sponsor GitStudio on GitHub"
+    }
+  ],
+  "engines": {
+    "vscode": "^1.78.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Visualization",
+    "AI"
+  ],
+  "keywords": [
+    "gitstudio",
+    "git-studio",
+    "gitlens alternative",
+    "jetbrains",
+    "intellij",
+    "pycharm",
+    "git gui",
+    "git client",
+    "commit graph",
+    "git graph",
+    "interactive rebase",
+    "merge conflict",
+    "merge editor",
+    "worktree",
+    "cherry-pick",
+    "reflog",
+    "stash",
+    "shelf",
+    "git blame",
+    "file history",
+    "staging",
+    "branch manager",
+    "branch compare",
+    "pull request",
+    "github",
+    "ai commit message",
+    "source control",
+    "scm",
+    "git",
+    "cursor"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "gitstudio",
+          "title": "%viewContainer.gitstudio.title%",
+          "icon": "media/activitybar.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "gitstudioPanel",
+          "title": "%viewContainer.gitstudioPanel.title%",
+          "icon": "media/activitybar.svg"
+        }
+      ]
+    },
+    "views": {
+      "gitstudio": [
+        {
+          "id": "gitstudio.commit",
+          "name": "%view.gitstudio.commit.name%",
+          "type": "webview",
+          "initialSize": 7,
+          "visibility": "visible"
+        },
+        {
+          "id": "gitstudio.commits",
+          "name": "%view.gitstudio.commits.name%",
+          "type": "webview",
+          "initialSize": 3,
+          "visibility": "visible"
+        },
+        {
+          "id": "gitstudio.worktrees",
+          "name": "%view.gitstudio.worktrees.name%",
+          "type": "webview",
+          "initialSize": 1,
+          "visibility": "collapsed"
+        },
+        {
+          "id": "gitstudio.pullRequests",
+          "name": "%view.gitstudio.pullRequests.name%",
+          "type": "webview",
+          "initialSize": 1,
+          "visibility": "collapsed"
+        }
+      ],
+      "gitstudioPanel": [
+        {
+          "id": "gitstudio.commitPanel",
+          "name": "%view.gitstudio.commitPanel.name%",
+          "type": "webview",
+          "contextualTitle": "GitStudio Commit Graph"
+        }
+      ]
+    },
+    "customEditors": [
+      {
+        "viewType": "gitstudio.mergeEditor",
+        "displayName": "%customEditor.gitstudio.mergeEditor.displayName%",
+        "selector": [
+          {
+            "filenamePattern": "*.gitstudio-merge"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "gitstudio.diffEditor",
+        "displayName": "%customEditor.gitstudio.diffEditor.displayName%",
+        "selector": [
+          {
+            "filenamePattern": "*"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "gitstudio.rebaseTodoEditor",
+        "displayName": "%customEditor.gitstudio.rebaseTodoEditor.displayName%",
+        "selector": [
+          {
+            "filenamePattern": "**/git-rebase-todo"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "gitstudio.debug.showProcessAudit",
+        "title": "%command.gitstudio.debug.showProcessAudit.title%",
+        "category": "GitStudio"
+      },
+      {
+        "command": "gitstudio.showWelcome",
+        "title": "%command.gitstudio.showWelcome.title%",
+        "category": "GitStudio",
+        "icon": "$(home)"
+      },
+      {
+        "command": "gitstudio.openWalkthrough",
+        "title": "%command.gitstudio.openWalkthrough.title%",
+        "category": "GitStudio",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "gitstudio.support",
+        "title": "%command.gitstudio.support.title%",
+        "category": "GitStudio",
+        "icon": "$(heart)"
+      },
+      {
+        "command": "gitstudio.refreshCommits",
+        "title": "%command.gitstudio.refreshCommits.title%",
+        "category": "GitStudio",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "gitstudio.refreshBranches",
+        "title": "%command.gitstudio.refreshBranches.title%",
+        "category": "GitStudio",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "gitstudio.copyCommitSha",
+        "title": "%command.gitstudio.copyCommitSha.title%",
+        "category": "GitStudio",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "gitstudio.toggleFileBlame",
+        "title": "%command.gitstudio.toggleFileBlame.title%",
+        "category": "GitStudio",
+        "icon": "$(eye)",
+        "toggled": "gitstudio.blameAnnotated"
+      },
+      {
+        "command": "gitstudio.blame.showLineActions",
+        "title": "%command.gitstudio.blame.showLineActions.title%",
+        "category": "GitStudio",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "gitstudio.showCommitGraph",
+        "title": "%command.gitstudio.showCommitGraph.title%",
+        "category": "GitStudio",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "gitstudio.showLineHistory",
+        "title": "%command.gitstudio.showLineHistory.title%",
+        "category": "GitStudio",
+        "icon": "$(history)"
+      },
+      {
+        "command": "gitstudio.openChanges",
+        "title": "%command.gitstudio.openChanges.title%",
+        "category": "GitStudio",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "gitstudio.openFileAtRevision",
+        "title": "%command.gitstudio.openFileAtRevision.title%",
+        "category": "GitStudio",
+        "icon": "$(history)"
+      },
+      {
+        "command": "gitstudio.revisionNavigateBack",
+        "title": "%command.gitstudio.revisionNavigateBack.title%",
+        "category": "GitStudio",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "gitstudio.revisionNavigateForward",
+        "title": "%command.gitstudio.revisionNavigateForward.title%",
+        "category": "GitStudio",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "gitstudio.showReflog",
+        "title": "%command.gitstudio.showReflog.title%",
+        "category": "GitStudio",
+        "icon": "$(history)"
+      },
+      {
+        "command": "gitstudio.switchRepository",
+        "title": "%command.gitstudio.switchRepository.title%",
+        "category": "GitStudio",
+        "icon": "$(repo)"
+      },
+      {
+        "command": "gitstudio.branches.open",
+        "title": "%command.gitstudio.branches.open.title%",
+        "category": "GitStudio",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "gitstudio.resolveInMergeEditor",
+        "title": "%command.gitstudio.resolveInMergeEditor.title%",
+        "category": "GitStudio",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "gitstudio.compare",
+        "title": "%command.gitstudio.compare.title%",
+        "category": "GitStudio",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "gitstudio.showConflicts",
+        "title": "%command.gitstudio.showConflicts.title%",
+        "category": "GitStudio",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "gitstudio.openDiff",
+        "title": "%command.gitstudio.openDiff.title%",
+        "category": "GitStudio",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "gitstudio.merge.openDemo",
+        "title": "%command.gitstudio.merge.openDemo.title%",
+        "category": "GitStudio"
+      },
+      {
+        "command": "gitstudio.merge.openDemoDiff",
+        "title": "%command.gitstudio.merge.openDemoDiff.title%",
+        "category": "GitStudio"
+      },
+      {
+        "command": "gitstudio.operation.continue",
+        "title": "%command.gitstudio.operation.continue.title%",
+        "category": "GitStudio",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "gitstudio.operation.skip",
+        "title": "%command.gitstudio.operation.skip.title%",
+        "category": "GitStudio",
+        "icon": "$(debug-step-over)"
+      },
+      {
+        "command": "gitstudio.operation.abort",
+        "title": "%command.gitstudio.operation.abort.title%",
+        "category": "GitStudio",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "gitstudio.merge.restoreBuiltInMergeEditor",
+        "title": "%command.gitstudio.merge.restoreBuiltInMergeEditor.title%",
+        "category": "GitStudio",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "gitstudio.stageSelectedLines",
+        "title": "%command.gitstudio.stageSelectedLines.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.unstageSelectedLines",
+        "title": "%command.gitstudio.unstageSelectedLines.title%",
+        "category": "GitStudio",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "gitstudio.stageHunk",
+        "title": "%command.gitstudio.stageHunk.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.unstageHunk",
+        "title": "%command.gitstudio.unstageHunk.title%",
+        "category": "GitStudio",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "gitstudio.startInteractiveRebase",
+        "title": "%command.gitstudio.startInteractiveRebase.title%",
+        "category": "GitStudio",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "gitstudio.abortRebase",
+        "title": "%command.gitstudio.abortRebase.title%",
+        "category": "GitStudio",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "gitstudio.undo",
+        "title": "%command.gitstudio.undo.title%",
+        "category": "GitStudio",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "gitstudio.showUndoHistory",
+        "title": "%command.gitstudio.showUndoHistory.title%",
+        "category": "GitStudio",
+        "icon": "$(history)"
+      },
+      {
+        "command": "gitstudio.resetToCommit",
+        "title": "%command.gitstudio.resetToCommit.title%",
+        "category": "GitStudio",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "gitstudio.stashes.refresh",
+        "title": "%command.gitstudio.stashes.refresh.title%",
+        "category": "GitStudio",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "gitstudio.stash.save",
+        "title": "%command.gitstudio.stash.save.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.stash.apply",
+        "title": "%command.gitstudio.stash.apply.title%",
+        "category": "GitStudio",
+        "icon": "$(git-stash-apply)"
+      },
+      {
+        "command": "gitstudio.stash.pop",
+        "title": "%command.gitstudio.stash.pop.title%",
+        "category": "GitStudio",
+        "icon": "$(git-stash-pop)"
+      },
+      {
+        "command": "gitstudio.stash.drop",
+        "title": "%command.gitstudio.stash.drop.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.stash.branch",
+        "title": "%command.gitstudio.stash.branch.title%",
+        "category": "GitStudio",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "gitstudio.worktrees.refresh",
+        "title": "%command.gitstudio.worktrees.refresh.title%",
+        "category": "GitStudio",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "gitstudio.worktree.open",
+        "title": "%command.gitstudio.worktree.open.title%",
+        "category": "GitStudio",
+        "icon": "$(empty-window)"
+      },
+      {
+        "command": "gitstudio.worktree.openInNewWindow",
+        "title": "%command.gitstudio.worktree.openInNewWindow.title%",
+        "category": "GitStudio",
+        "icon": "$(empty-window)"
+      },
+      {
+        "command": "gitstudio.worktree.openHere",
+        "title": "%command.gitstudio.worktree.openHere.title%",
+        "category": "GitStudio",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "gitstudio.worktree.add",
+        "title": "%command.gitstudio.worktree.add.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.worktree.remove",
+        "title": "%command.gitstudio.worktree.remove.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.worktree.forget",
+        "title": "%command.gitstudio.worktree.forget.title%",
+        "category": "GitStudio",
+        "icon": "$(close)"
+      },
+      {
+        "command": "gitstudio.worktree.lock",
+        "title": "%command.gitstudio.worktree.lock.title%",
+        "category": "GitStudio",
+        "icon": "$(lock)"
+      },
+      {
+        "command": "gitstudio.worktree.unlock",
+        "title": "%command.gitstudio.worktree.unlock.title%",
+        "category": "GitStudio",
+        "icon": "$(unlock)"
+      },
+      {
+        "command": "gitstudio.worktree.prune",
+        "title": "%command.gitstudio.worktree.prune.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.compareRefs",
+        "title": "%command.gitstudio.compareRefs.title%",
+        "category": "GitStudio",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "gitstudio.branch.checkout",
+        "title": "%command.gitstudio.branch.checkout.title%",
+        "category": "GitStudio",
+        "icon": "$(check)"
+      },
+      {
+        "command": "gitstudio.branch.merge",
+        "title": "%command.gitstudio.branch.merge.title%",
+        "category": "GitStudio",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "gitstudio.branch.rebase",
+        "title": "%command.gitstudio.branch.rebase.title%",
+        "category": "GitStudio",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "gitstudio.branch.rename",
+        "title": "%command.gitstudio.branch.rename.title%",
+        "category": "GitStudio",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "gitstudio.branch.delete",
+        "title": "%command.gitstudio.branch.delete.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.branch.push",
+        "title": "%command.gitstudio.branch.push.title%",
+        "category": "GitStudio",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "gitstudio.branch.setUpstream",
+        "title": "%command.gitstudio.branch.setUpstream.title%",
+        "category": "GitStudio",
+        "icon": "$(cloud)"
+      },
+      {
+        "command": "gitstudio.branch.resetToUpstream",
+        "title": "%command.gitstudio.branch.resetToUpstream.title%",
+        "category": "GitStudio",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "gitstudio.branch.new",
+        "title": "%command.gitstudio.branch.new.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.branch.createWorktree",
+        "title": "%command.gitstudio.branch.createWorktree.title%",
+        "category": "GitStudio",
+        "icon": "$(repo-clone)"
+      },
+      {
+        "command": "gitstudio.branch.compare",
+        "title": "%command.gitstudio.branch.compare.title%",
+        "category": "GitStudio",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "gitstudio.remoteBranch.checkout",
+        "title": "%command.gitstudio.remoteBranch.checkout.title%",
+        "category": "GitStudio",
+        "icon": "$(check)"
+      },
+      {
+        "command": "gitstudio.remoteBranch.delete",
+        "title": "%command.gitstudio.remoteBranch.delete.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.tag.checkout",
+        "title": "%command.gitstudio.tag.checkout.title%",
+        "category": "GitStudio",
+        "icon": "$(check)"
+      },
+      {
+        "command": "gitstudio.tag.delete",
+        "title": "%command.gitstudio.tag.delete.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.tag.push",
+        "title": "%command.gitstudio.tag.push.title%",
+        "category": "GitStudio",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "gitstudio.fetch",
+        "title": "%command.gitstudio.fetch.title%",
+        "category": "GitStudio",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "gitstudio.addRemote",
+        "title": "%command.gitstudio.addRemote.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.manageRemotes",
+        "title": "%command.gitstudio.manageRemotes.title%",
+        "category": "GitStudio",
+        "icon": "$(cloud)"
+      },
+      {
+        "command": "gitstudio.ai.setApiKey",
+        "title": "%command.gitstudio.ai.setApiKey.title%",
+        "category": "GitStudio",
+        "icon": "$(key)"
+      },
+      {
+        "command": "gitstudio.ai.clearApiKey",
+        "title": "%command.gitstudio.ai.clearApiKey.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.ai.setOpenAIKey",
+        "title": "%command.gitstudio.ai.setOpenAIKey.title%",
+        "category": "GitStudio",
+        "icon": "$(key)"
+      },
+      {
+        "command": "gitstudio.ai.clearOpenAIKey",
+        "title": "%command.gitstudio.ai.clearOpenAIKey.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.ai.selectModel",
+        "title": "%command.gitstudio.ai.selectModel.title%",
+        "category": "GitStudio",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "gitstudio.ai.generateCommitMessage",
+        "title": "%command.gitstudio.ai.generateCommitMessage.title%",
+        "category": "GitStudio",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "gitstudio.ai.explainDiff",
+        "title": "%command.gitstudio.ai.explainDiff.title%",
+        "category": "GitStudio",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "gitstudio.ai.summarizeChanges",
+        "title": "%command.gitstudio.ai.summarizeChanges.title%",
+        "category": "GitStudio",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "gitstudio.ai.reviewChanges",
+        "title": "%command.gitstudio.ai.reviewChanges.title%",
+        "category": "GitStudio",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "gitstudio.ai.connect",
+        "title": "%command.gitstudio.ai.connect.title%",
+        "category": "GitStudio",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "gitstudio.ai.disable",
+        "title": "%command.gitstudio.ai.disable.title%",
+        "category": "GitStudio"
+      },
+      {
+        "command": "gitstudio.pr.create",
+        "title": "%command.gitstudio.pr.create.title%",
+        "category": "GitStudio",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "gitstudio.pr.refresh",
+        "title": "%command.gitstudio.pr.refresh.title%",
+        "category": "GitStudio",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "gitstudio.pr.signIn",
+        "title": "%command.gitstudio.pr.signIn.title%",
+        "category": "GitStudio",
+        "icon": "$(github)"
+      },
+      {
+        "command": "gitstudio.pr.openDescription",
+        "title": "%command.gitstudio.pr.openDescription.title%",
+        "category": "GitStudio",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "gitstudio.pr.checkout",
+        "title": "%command.gitstudio.pr.checkout.title%",
+        "category": "GitStudio",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "gitstudio.pr.startReview",
+        "title": "%command.gitstudio.pr.startReview.title%",
+        "category": "GitStudio",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "gitstudio.pr.submitReview",
+        "title": "%command.gitstudio.pr.submitReview.title%",
+        "category": "GitStudio",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "gitstudio.pr.cancelReview",
+        "title": "%command.gitstudio.pr.cancelReview.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.pr.replyThread",
+        "title": "%command.gitstudio.pr.replyThread.title%",
+        "category": "GitStudio",
+        "icon": "$(reply)"
+      },
+      {
+        "command": "gitstudio.pr.resolveThread",
+        "title": "%command.gitstudio.pr.resolveThread.title%",
+        "category": "GitStudio",
+        "icon": "$(check)"
+      },
+      {
+        "command": "gitstudio.pr.unresolveThread",
+        "title": "%command.gitstudio.pr.unresolveThread.title%",
+        "category": "GitStudio",
+        "icon": "$(issue-reopened)"
+      },
+      {
+        "command": "gitstudio.pr.addReviewComment",
+        "title": "%command.gitstudio.pr.addReviewComment.title%",
+        "category": "GitStudio",
+        "icon": "$(add)"
+      },
+      {
+        "command": "gitstudio.pr.addSingleComment",
+        "title": "%command.gitstudio.pr.addSingleComment.title%",
+        "category": "GitStudio",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "gitstudio.pr.deleteReviewComment",
+        "title": "%command.gitstudio.pr.deleteReviewComment.title%",
+        "category": "GitStudio",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "gitstudio.pr.merge",
+        "title": "%command.gitstudio.pr.merge.title%",
+        "category": "GitStudio",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "gitstudio.pr.openOnGitHub",
+        "title": "%command.gitstudio.pr.openOnGitHub.title%",
+        "category": "GitStudio",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "gitstudio.pr.copyUrl",
+        "title": "%command.gitstudio.pr.copyUrl.title%",
+        "category": "GitStudio",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "gitstudio.blame.field.revision.on",
+        "title": "%command.gitstudio.blame.field.revision.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.revision.off",
+        "title": "%command.gitstudio.blame.field.revision.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.date.on",
+        "title": "%command.gitstudio.blame.field.date.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.date.off",
+        "title": "%command.gitstudio.blame.field.date.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.author.on",
+        "title": "%command.gitstudio.blame.field.author.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.author.off",
+        "title": "%command.gitstudio.blame.field.author.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.commitNumber.on",
+        "title": "%command.gitstudio.blame.field.commitNumber.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.field.commitNumber.off",
+        "title": "%command.gitstudio.blame.field.commitNumber.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.colors.author.on",
+        "title": "%command.gitstudio.blame.colors.author.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.colors.author.off",
+        "title": "%command.gitstudio.blame.colors.author.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.colors.order.on",
+        "title": "%command.gitstudio.blame.colors.order.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.colors.order.off",
+        "title": "%command.gitstudio.blame.colors.order.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.colors.hide.on",
+        "title": "%command.gitstudio.blame.colors.hide.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.colors.hide.off",
+        "title": "%command.gitstudio.blame.colors.hide.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.initials.on",
+        "title": "%command.gitstudio.blame.names.initials.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.initials.off",
+        "title": "%command.gitstudio.blame.names.initials.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.lastName.on",
+        "title": "%command.gitstudio.blame.names.lastName.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.lastName.off",
+        "title": "%command.gitstudio.blame.names.lastName.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.firstName.on",
+        "title": "%command.gitstudio.blame.names.firstName.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.firstName.off",
+        "title": "%command.gitstudio.blame.names.firstName.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.fullName.on",
+        "title": "%command.gitstudio.blame.names.fullName.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.fullName.off",
+        "title": "%command.gitstudio.blame.names.fullName.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.email.on",
+        "title": "%command.gitstudio.blame.names.email.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.names.email.off",
+        "title": "%command.gitstudio.blame.names.email.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.hover.on",
+        "title": "%command.gitstudio.blame.hover.on.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.hover.off",
+        "title": "%command.gitstudio.blame.hover.off.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.revealCommitInGraph",
+        "title": "%command.gitstudio.revealCommitInGraph.title%",
+        "category": "GitStudio",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "gitstudio.blame.copyRevision",
+        "title": "%command.gitstudio.blame.copyRevision.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.showDiff",
+        "title": "%command.gitstudio.blame.showDiff.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.showCommit",
+        "title": "%command.gitstudio.blame.showCommit.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.openPreviousRevision",
+        "title": "%command.gitstudio.blame.openPreviousRevision.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.viewInBrowser",
+        "title": "%command.gitstudio.blame.viewInBrowser.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.blame.closeAnnotations",
+        "title": "%command.gitstudio.blame.closeAnnotations.title%",
+        "category": "GitStudio Blame"
+      },
+      {
+        "command": "gitstudio.showCommitPanel",
+        "title": "%command.gitstudio.showCommitPanel.title%",
+        "category": "GitStudio",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "gitstudio.stageWithTicks",
+        "title": "%command.gitstudio.stageWithTicks.title%",
+        "category": "GitStudio",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "gitstudio.toggleStageAtLine",
+        "title": "%command.gitstudio.toggleStageAtLine.title%",
+        "category": "GitStudio"
+      },
+      {
+        "command": "gitstudio.openTerminal",
+        "title": "%command.gitstudio.openTerminal.title%",
+        "category": "GitStudio",
+        "icon": "$(terminal)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "gitstudio.branches.open",
+        "key": "ctrl+alt+g g",
+        "mac": "cmd+alt+g g",
+        "when": "gitstudio.hasRepo"
+      },
+      {
+        "command": "gitstudio.toggleFileBlame",
+        "key": "ctrl+alt+g b",
+        "mac": "cmd+alt+g b",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "gitstudio.showLineHistory",
+        "key": "ctrl+alt+g h",
+        "mac": "cmd+alt+g h",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "gitstudio.openChanges",
+        "key": "ctrl+alt+g d",
+        "mac": "cmd+alt+g d",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "gitstudio.stageSelectedLines",
+        "key": "ctrl+alt+g s",
+        "mac": "cmd+alt+g s",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "gitstudio.unstageSelectedLines",
+        "key": "ctrl+alt+g u",
+        "mac": "cmd+alt+g u",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "gitstudio.undo",
+        "key": "ctrl+alt+g z",
+        "mac": "cmd+alt+g z"
+      },
+      {
+        "command": "gitstudio.toggleStageAtLine",
+        "key": "ctrl+alt+g t",
+        "mac": "cmd+alt+g t",
+        "when": "editorTextFocus && gitstudio.hasRepo"
+      }
+    ],
+    "configuration": [
+      {
+        "id": "gitstudio.general",
+        "title": "%config.gitstudio.general.title%",
+        "order": 1,
+        "properties": {
+          "gitstudio.statusBar.showGraph": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.statusBar.showGraph.description%",
+            "order": 1
+          },
+          "gitstudio.statusBar.showTerminal": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.statusBar.showTerminal.description%",
+            "order": 2
+          },
+          "gitstudio.worktrees.prefixWithProjectName": {
+            "type": "boolean",
+            "default": false,
+            "description": "%config.gitstudio.worktrees.prefixWithProjectName.description%",
+            "markdownDeprecationMessage": "No longer used: **New Worktree** now suggests the folder `<project>-<branch>` beside the main worktree, and you can edit it before it is created.",
+            "order": 3
+          },
+          "gitstudio.pr.defaultMergeMethod": {
+            "type": "string",
+            "enum": [
+              "merge",
+              "squash",
+              "rebase"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.pr.defaultMergeMethod.enumDescriptions.0%",
+              "%config.gitstudio.pr.defaultMergeMethod.enumDescriptions.1%",
+              "%config.gitstudio.pr.defaultMergeMethod.enumDescriptions.2%"
+            ],
+            "default": "squash",
+            "description": "%config.gitstudio.pr.defaultMergeMethod.description%",
+            "order": 4
+          },
+          "gitstudio.avatars.gravatar": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "%config.gitstudio.avatars.gravatar.markdownDescription%",
+            "order": 5
+          }
+        }
+      },
+      {
+        "id": "gitstudio.changes",
+        "title": "%config.gitstudio.changes.title%",
+        "order": 2,
+        "properties": {
+          "gitstudio.changes.stagingModel": {
+            "type": "string",
+            "enum": [
+              "split",
+              "checkboxes"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.changes.stagingModel.enumDescriptions.0%",
+              "%config.gitstudio.changes.stagingModel.enumDescriptions.1%"
+            ],
+            "default": "split",
+            "description": "%config.gitstudio.changes.stagingModel.description%",
+            "order": 1
+          },
+          "gitstudio.changes.autoRefresh": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.changes.autoRefresh.description%",
+            "order": 2
+          },
+          "gitstudio.changesBadge": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.changesBadge.description%",
+            "order": 3
+          },
+          "gitstudio.staging.showGutterState": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.staging.showGutterState.description%",
+            "order": 4
+          },
+          "gitstudio.staging.clickGutterToggles": {
+            "type": "boolean",
+            "default": false,
+            "description": "%config.gitstudio.staging.clickGutterToggles.description%",
+            "order": 5
+          },
+          "gitstudio.staging.hoverActions": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.staging.hoverActions.description%",
+            "order": 6
+          },
+          "gitstudio.staging.codeLens": {
+            "type": "boolean",
+            "default": false,
+            "description": "%config.gitstudio.staging.codeLens.description%",
+            "order": 7
+          }
+        }
+      },
+      {
+        "id": "gitstudio.commit",
+        "title": "%config.gitstudio.commit.title%",
+        "order": 3,
+        "properties": {
+          "gitstudio.commit.signoffByDefault": {
+            "type": "boolean",
+            "default": false,
+            "description": "%config.gitstudio.commit.signoffByDefault.description%",
+            "order": 1
+          },
+          "gitstudio.fetch.prune": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.fetch.prune.description%",
+            "order": 2
+          }
+        }
+      },
+      {
+        "id": "gitstudio.blame",
+        "title": "%config.gitstudio.blame.title%",
+        "order": 4,
+        "properties": {
+          "gitstudio.blame.inlineEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.blame.inlineEnabled.description%",
+            "order": 1
+          },
+          "gitstudio.blame.statusBarEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.blame.statusBarEnabled.description%",
+            "order": 2
+          },
+          "gitstudio.blame.showDiffOnHover": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.blame.showDiffOnHover.description%",
+            "order": 3
+          },
+          "gitstudio.blame.clickOpensCommit": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.blame.clickOpensCommit.description%",
+            "order": 4
+          },
+          "gitstudio.blame.heatmap": {
+            "type": "boolean",
+            "default": true,
+            "description": "%config.gitstudio.blame.heatmap.description%",
+            "order": 5
+          },
+          "gitstudio.blame.gutter.fields": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "revision",
+                "date",
+                "author",
+                "commitNumber"
+              ],
+              "enumDescriptions": [
+                "The short commit hash.",
+                "The author date (YYYY-MM-DD).",
+                "The author name (see gitstudio.blame.gutter.nameStyle).",
+                "The commit's ordinal within this file's history (1 = oldest)."
+              ]
+            },
+            "default": [
+              "date",
+              "author"
+            ],
+            "description": "%config.gitstudio.blame.gutter.fields.description%",
+            "order": 6
+          },
+          "gitstudio.blame.gutter.nameStyle": {
+            "type": "string",
+            "enum": [
+              "initials",
+              "lastName",
+              "firstName",
+              "fullName",
+              "email"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.blame.gutter.nameStyle.enumDescriptions.0%",
+              "%config.gitstudio.blame.gutter.nameStyle.enumDescriptions.1%",
+              "%config.gitstudio.blame.gutter.nameStyle.enumDescriptions.2%",
+              "%config.gitstudio.blame.gutter.nameStyle.enumDescriptions.3%",
+              "%config.gitstudio.blame.gutter.nameStyle.enumDescriptions.4%"
+            ],
+            "default": "fullName",
+            "description": "%config.gitstudio.blame.gutter.nameStyle.description%",
+            "order": 7
+          },
+          "gitstudio.blame.gutter.colors": {
+            "type": "string",
+            "enum": [
+              "order",
+              "author",
+              "hide"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.blame.gutter.colors.enumDescriptions.0%",
+              "%config.gitstudio.blame.gutter.colors.enumDescriptions.1%",
+              "%config.gitstudio.blame.gutter.colors.enumDescriptions.2%"
+            ],
+            "default": "order",
+            "description": "%config.gitstudio.blame.gutter.colors.description%",
+            "order": 8
+          }
+        }
+      },
+      {
+        "id": "gitstudio.merge",
+        "title": "%config.gitstudio.merge.title%",
+        "order": 5,
+        "properties": {
+          "gitstudio.merge.autoOpen": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "%config.gitstudio.merge.autoOpen.markdownDescription%",
+            "order": 1
+          },
+          "gitstudio.merge.useAsDefaultDiffViewer": {
+            "type": "boolean",
+            "default": false,
+            "scope": "window",
+            "order": 3,
+            "markdownDescription": "%config.gitstudio.merge.useAsDefaultDiffViewer.markdownDescription%"
+          },
+          "gitstudio.diff.comparisonIn": {
+            "type": "object",
+            "scope": "window",
+            "order": 4,
+            "markdownDescription": "%config.gitstudio.diff.comparisonIn.markdownDescription%",
+            "properties": {
+              "vscode": {
+                "type": "boolean",
+                "default": true
+              },
+              "changes": {
+                "type": "boolean",
+                "default": true
+              },
+              "graph": {
+                "type": "boolean",
+                "default": true
+              },
+              "stashes": {
+                "type": "boolean",
+                "default": true
+              },
+              "history": {
+                "type": "boolean",
+                "default": true
+              },
+              "blame": {
+                "type": "boolean",
+                "default": true
+              },
+              "compare": {
+                "type": "boolean",
+                "default": true
+              },
+              "worktrees": {
+                "type": "boolean",
+                "default": true
+              },
+              "push": {
+                "type": "boolean",
+                "default": true
+              }
+            },
+            "additionalProperties": false,
+            "default": {
+              "vscode": true,
+              "changes": true,
+              "graph": true,
+              "stashes": true,
+              "history": true,
+              "blame": true,
+              "compare": true,
+              "worktrees": true,
+              "push": true
+            }
+          },
+          "gitstudio.merge.autoApplyNonConflicting": {
+            "type": "boolean",
+            "default": false,
+            "description": "%config.gitstudio.merge.autoApplyNonConflicting.description%",
+            "order": 5
+          }
+        }
+      },
+      {
+        "id": "gitstudio.ai",
+        "title": "%config.gitstudio.ai.title%",
+        "order": 6,
+        "properties": {
+          "gitstudio.ai.provider": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "copilot",
+              "anthropic",
+              "openai",
+              "cli",
+              "off"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.ai.provider.enumDescriptions.0%",
+              "%config.gitstudio.ai.provider.enumDescriptions.1%",
+              "%config.gitstudio.ai.provider.enumDescriptions.2%",
+              "%config.gitstudio.ai.provider.enumDescriptions.3%",
+              "%config.gitstudio.ai.provider.enumDescriptions.4%",
+              "%config.gitstudio.ai.provider.enumDescriptions.5%"
+            ],
+            "default": "auto",
+            "markdownDescription": "%config.gitstudio.ai.provider.markdownDescription%",
+            "order": 1
+          },
+          "gitstudio.ai.commitStyle": {
+            "type": "string",
+            "enum": [
+              "conventional",
+              "concise",
+              "descriptive"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.ai.commitStyle.enumDescriptions.0%",
+              "%config.gitstudio.ai.commitStyle.enumDescriptions.1%",
+              "%config.gitstudio.ai.commitStyle.enumDescriptions.2%"
+            ],
+            "default": "conventional",
+            "description": "%config.gitstudio.ai.commitStyle.description%",
+            "order": 2
+          },
+          "gitstudio.ai.reviewPrompt": {
+            "type": "string",
+            "editPresentation": "multilineText",
+            "default": "",
+            "markdownDescription": "%config.gitstudio.ai.reviewPrompt.markdownDescription%",
+            "order": 3
+          },
+          "gitstudio.ai.cliAgent": {
+            "type": "string",
+            "enum": [
+              "",
+              "claude-code",
+              "codex",
+              "gemini-cli"
+            ],
+            "enumDescriptions": [
+              "%config.gitstudio.ai.cliAgent.enumDescriptions.0%",
+              "%config.gitstudio.ai.cliAgent.enumDescriptions.1%",
+              "%config.gitstudio.ai.cliAgent.enumDescriptions.2%",
+              "%config.gitstudio.ai.cliAgent.enumDescriptions.3%"
+            ],
+            "default": "",
+            "description": "%config.gitstudio.ai.cliAgent.description%",
+            "order": 4
+          },
+          "gitstudio.ai.cliModel": {
+            "type": "string",
+            "default": "",
+            "description": "%config.gitstudio.ai.cliModel.description%",
+            "order": 5
+          },
+          "gitstudio.ai.anthropicModelFast": {
+            "type": "string",
+            "default": "claude-haiku-4-5",
+            "description": "%config.gitstudio.ai.anthropicModelFast.description%",
+            "order": 6
+          },
+          "gitstudio.ai.anthropicModelMid": {
+            "type": "string",
+            "default": "claude-sonnet-4-6",
+            "description": "%config.gitstudio.ai.anthropicModelMid.description%",
+            "order": 7
+          },
+          "gitstudio.ai.anthropicModelDeep": {
+            "type": "string",
+            "default": "claude-opus-4-8",
+            "description": "%config.gitstudio.ai.anthropicModelDeep.description%",
+            "order": 8
+          },
+          "gitstudio.ai.openai.baseUrl": {
+            "type": "string",
+            "default": "https://api.openai.com/v1",
+            "markdownDescription": "%config.gitstudio.ai.openai.baseUrl.markdownDescription%",
+            "order": 9
+          },
+          "gitstudio.ai.openai.modelFast": {
+            "type": "string",
+            "default": "gpt-4o-mini",
+            "description": "%config.gitstudio.ai.openai.modelFast.description%",
+            "order": 10
+          },
+          "gitstudio.ai.openai.modelMid": {
+            "type": "string",
+            "default": "gpt-4o-mini",
+            "description": "%config.gitstudio.ai.openai.modelMid.description%",
+            "order": 11
+          },
+          "gitstudio.ai.openai.modelDeep": {
+            "type": "string",
+            "default": "gpt-4o",
+            "description": "%config.gitstudio.ai.openai.modelDeep.description%",
+            "order": 12
+          }
+        }
+      },
+      {
+        "id": "gitstudio.advanced",
+        "title": "%config.gitstudio.advanced.title%",
+        "order": 7,
+        "properties": {
+          "gitstudio.errorReporting.enabled": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "%config.gitstudio.errorReporting.enabled.markdownDescription%",
+            "order": 1
+          },
+          "gitstudio.errorReporting.endpoint": {
+            "type": "string",
+            "default": "https://gitstudio.dev/api/errors",
+            "markdownDescription": "%config.gitstudio.errorReporting.endpoint.markdownDescription%",
+            "order": 2
+          },
+          "gitstudio.debug.logChildProcesses": {
+            "type": "boolean",
+            "default": false,
+            "description": "%config.gitstudio.debug.logChildProcesses.description%",
+            "order": 3
+          }
+        }
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "gitstudio.gettingStarted",
+        "title": "%walkthrough.gitstudio.gettingStarted.title%",
+        "description": "%walkthrough.gitstudio.gettingStarted.description%",
+        "when": "true",
+        "steps": [
+          {
+            "id": "gitstudio.walkthrough.graph",
+            "title": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.graph.title%",
+            "description": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.graph.description%",
+            "media": {
+              "image": {
+                "light": "media/walkthrough/graph-light.png",
+                "dark": "media/walkthrough/graph-dark.png",
+                "hc": "media/walkthrough/graph-hc-dark.png",
+                "hcLight": "media/walkthrough/graph-hc-light.png"
+              },
+              "altText": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.graph.altText%"
+            },
+            "completionEvents": [
+              "onCommand:gitstudio.showCommitGraph"
+            ]
+          },
+          {
+            "id": "gitstudio.walkthrough.blame",
+            "title": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.blame.title%",
+            "description": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.blame.description%",
+            "media": {
+              "image": {
+                "light": "media/walkthrough/blame-light.png",
+                "dark": "media/walkthrough/blame-dark.png",
+                "hc": "media/walkthrough/blame-hc-dark.png",
+                "hcLight": "media/walkthrough/blame-hc-light.png"
+              },
+              "altText": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.blame.altText%"
+            },
+            "completionEvents": [
+              "onCommand:gitstudio.toggleFileBlame"
+            ]
+          },
+          {
+            "id": "gitstudio.walkthrough.stage",
+            "title": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.stage.title%",
+            "description": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.stage.description%",
+            "media": {
+              "image": {
+                "light": "media/walkthrough/stage-light.png",
+                "dark": "media/walkthrough/stage-dark.png",
+                "hc": "media/walkthrough/stage-hc-dark.png",
+                "hcLight": "media/walkthrough/stage-hc-light.png"
+              },
+              "altText": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.stage.altText%"
+            },
+            "completionEvents": [
+              "onCommand:gitstudio.stageHunk",
+              "onCommand:gitstudio.stageSelectedLines",
+              "onContext:gitstudio.walkthrough.staged",
+              "onContext:gitstudio.walkthrough.committed"
+            ]
+          },
+          {
+            "id": "gitstudio.walkthrough.history",
+            "title": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.history.title%",
+            "description": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.history.description%",
+            "media": {
+              "image": {
+                "light": "media/walkthrough/history-light.png",
+                "dark": "media/walkthrough/history-dark.png",
+                "hc": "media/walkthrough/history-hc-dark.png",
+                "hcLight": "media/walkthrough/history-hc-light.png"
+              },
+              "altText": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.history.altText%"
+            },
+            "completionEvents": [
+              "onCommand:gitstudio.showLineHistory",
+              "onCommand:gitstudio.showReflog"
+            ]
+          },
+          {
+            "id": "gitstudio.walkthrough.merge",
+            "title": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.merge.title%",
+            "description": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.merge.description%",
+            "media": {
+              "image": {
+                "light": "media/walkthrough/merge-light.png",
+                "dark": "media/walkthrough/merge-dark.png",
+                "hc": "media/walkthrough/merge-hc-dark.png",
+                "hcLight": "media/walkthrough/merge-hc-light.png"
+              },
+              "altText": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.merge.altText%"
+            },
+            "completionEvents": [
+              "onCommand:gitstudio.startInteractiveRebase",
+              "onCommand:gitstudio.resolveInMergeEditor"
+            ]
+          },
+          {
+            "id": "gitstudio.walkthrough.connect",
+            "title": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.connect.title%",
+            "description": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.connect.description%",
+            "media": {
+              "image": {
+                "light": "media/walkthrough/connect-light.png",
+                "dark": "media/walkthrough/connect-dark.png",
+                "hc": "media/walkthrough/connect-hc-dark.png",
+                "hcLight": "media/walkthrough/connect-hc-light.png"
+              },
+              "altText": "%walkthrough.gitstudio.gettingStarted.gitstudio.walkthrough.connect.altText%"
+            },
+            "completionEvents": [
+              "onCommand:gitstudio.pr.signIn",
+              "onCommand:gitstudio.ai.connect"
+            ]
+          }
+        ]
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "gitstudio.showCommitGraph",
+          "when": "view == gitstudio.commit",
+          "group": "navigation@1"
+        },
+        {
+          "command": "gitstudio.ai.connect",
+          "when": "view == gitstudio.commit",
+          "group": "navigation@2"
+        },
+        {
+          "command": "gitstudio.openWalkthrough",
+          "when": "view == gitstudio.commit",
+          "group": "9_help@1"
+        },
+        {
+          "command": "gitstudio.support",
+          "when": "view == gitstudio.commit",
+          "group": "z_support@1"
+        },
+        {
+          "command": "gitstudio.worktree.add",
+          "when": "view == gitstudio.worktrees",
+          "group": "navigation@1"
+        },
+        {
+          "command": "gitstudio.worktrees.refresh",
+          "when": "view == gitstudio.worktrees",
+          "group": "navigation@2"
+        },
+        {
+          "command": "gitstudio.worktree.prune",
+          "when": "view == gitstudio.worktrees",
+          "group": "worktrees@1"
+        },
+        {
+          "command": "gitstudio.pr.create",
+          "when": "view == gitstudio.pullRequests && gitstudio.github.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "gitstudio.pr.submitReview",
+          "when": "view == gitstudio.pullRequests && gitstudio.pr.reviewing",
+          "group": "navigation@2"
+        },
+        {
+          "command": "gitstudio.pr.signIn",
+          "when": "view == gitstudio.pullRequests && !gitstudio.github.connected",
+          "group": "navigation@3"
+        },
+        {
+          "command": "gitstudio.pr.refresh",
+          "when": "view == gitstudio.pullRequests",
+          "group": "navigation@4"
+        },
+        {
+          "command": "gitstudio.showCommitGraph",
+          "when": "view == gitstudio.commits",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "gitstudio.openChanges",
+          "when": "gitstudio.hasRepo && resourceScheme == file && scmActiveResourceHasChanges && !isInDiffEditor && activeCustomEditorId != 'gitstudio.mergeEditor'",
+          "group": "navigation@-1"
+        },
+        {
+          "command": "gitstudio.resolveInMergeEditor",
+          "when": "config.git.enabled && !git.missing && resource in git.mergeChanges && git.activeResourceHasMergeConflicts",
+          "group": "navigation@-2"
+        },
+        {
+          "command": "gitstudio.toggleFileBlame",
+          "when": "gitstudio.hasRepo && resourceScheme == file",
+          "group": "navigation@-3"
+        },
+        {
+          "command": "gitstudio.stageWithTicks",
+          "when": "gitstudio.hasRepo && resourceScheme == file && scmActiveResourceHasChanges && !isInDiffEditor && activeCustomEditorId != 'gitstudio.mergeEditor'",
+          "group": "navigation@9"
+        },
+        {
+          "command": "gitstudio.revealCommitInGraph",
+          "when": "gitstudio.hasRepo && resourceScheme == gitstudio-rev",
+          "group": "navigation@-1"
+        }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "gitstudio.showConflicts",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "inline"
+        },
+        {
+          "command": "gitstudio.showConflicts",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "1_modification@1"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "gitstudio.resolveInMergeEditor",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "navigation@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "gitstudio.compare",
+          "when": "resourceScheme == file && !explorerResourceIsFolder",
+          "group": "3_compare@10"
+        },
+        {
+          "command": "gitstudio.stageWithTicks",
+          "when": "gitstudio.hasRepo && resourceScheme == file",
+          "group": "gitstudio@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "gitstudio.editorMenu",
+          "when": "editorTextFocus && gitstudio.hasRepo",
+          "group": "1_gitstudio@0"
+        },
+        {
+          "submenu": "gitstudio.blame.annotationsMenu",
+          "when": "gitstudio.blameAnnotated",
+          "group": "1_gitstudio@1"
+        }
+      ],
+      "gitstudio.editorMenu": [
+        {
+          "command": "gitstudio.showLineHistory",
+          "group": "1_history@1"
+        },
+        {
+          "command": "gitstudio.openFileAtRevision",
+          "group": "1_history@2"
+        },
+        {
+          "command": "gitstudio.revealCommitInGraph",
+          "when": "resourceScheme == gitstudio-rev",
+          "group": "1_history@3"
+        },
+        {
+          "command": "gitstudio.stageSelectedLines",
+          "when": "resourceScheme == file && (scmActiveResourceHasChanges || isInDiffEditor && !editorReadonly && !isEmbeddedDiffEditor && diffEditorOriginalUri =~ /^(gitstudio-rev|git):/)",
+          "group": "2_staging@1"
+        },
+        {
+          "command": "gitstudio.unstageSelectedLines",
+          "when": "resourceScheme == file && (scmActiveResourceHasChanges || isInDiffEditor && !editorReadonly && !isEmbeddedDiffEditor && diffEditorOriginalUri =~ /^(gitstudio-rev|git):/)",
+          "group": "2_staging@2"
+        },
+        {
+          "command": "gitstudio.stageHunk",
+          "when": "resourceScheme == file && (scmActiveResourceHasChanges || isInDiffEditor && !editorReadonly && !isEmbeddedDiffEditor && diffEditorOriginalUri =~ /^(gitstudio-rev|git):/)",
+          "group": "2_staging@3"
+        },
+        {
+          "command": "gitstudio.unstageHunk",
+          "when": "resourceScheme == file && (scmActiveResourceHasChanges || isInDiffEditor && !editorReadonly && !isEmbeddedDiffEditor && diffEditorOriginalUri =~ /^(gitstudio-rev|git):/)",
+          "group": "2_staging@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "gitstudio.openWalkthrough",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.showWelcome",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.showCommitGraph",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.refreshCommits",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.refreshBranches",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.debug.showProcessAudit",
+          "when": "config.gitstudio.debug.logChildProcesses"
+        },
+        {
+          "command": "gitstudio.ai.selectModel",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.ai.setApiKey",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.ai.clearApiKey",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.ai.setOpenAIKey",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.ai.clearOpenAIKey",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.ai.generateCommitMessage",
+          "when": "gitstudio.ai.enabled && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.ai.explainDiff",
+          "when": "gitstudio.ai.enabled && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.ai.summarizeChanges",
+          "when": "gitstudio.ai.enabled && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.ai.reviewChanges",
+          "when": "gitstudio.ai.enabled && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.toggleFileBlame",
+          "when": "editorTextFocus && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.blame.showLineActions",
+          "when": "editorTextFocus && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.showLineHistory",
+          "when": "editorTextFocus && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.openChanges",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.openFileAtRevision",
+          "when": "editorTextFocus && gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.revisionNavigateBack",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.revisionNavigateForward",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.showReflog",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.switchRepository",
+          "when": "gitstudio.multiRepo"
+        },
+        {
+          "command": "gitstudio.resolveInMergeEditor",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.compare",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.showConflicts",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.openDiff",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.merge.openDemo",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.merge.openDemoDiff",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.operation.continue",
+          "when": "gitstudio.hasRepo && gitstudio.operationInProgress"
+        },
+        {
+          "command": "gitstudio.operation.skip",
+          "when": "gitstudio.hasRepo && gitstudio.operationInProgress"
+        },
+        {
+          "command": "gitstudio.operation.abort",
+          "when": "gitstudio.hasRepo && gitstudio.operationInProgress"
+        },
+        {
+          "command": "gitstudio.stageSelectedLines",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.unstageSelectedLines",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.stageHunk",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.unstageHunk",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.startInteractiveRebase",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.abortRebase",
+          "when": "gitstudio.hasRepo && gitstudio.operationInProgress"
+        },
+        {
+          "command": "gitstudio.undo",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.showUndoHistory",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.resetToCommit",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.stash.save",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.stash.apply",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.stash.pop",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.stash.drop",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.stash.branch",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.stashes.refresh",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.add",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.prune",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktrees.refresh",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.open",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.worktree.openInNewWindow",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.openHere",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.remove",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.forget",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.lock",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.worktree.unlock",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.compareRefs",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.branches.open",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.fetch",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.addRemote",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.manageRemotes",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.branch.new",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.branch.checkout",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.merge",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.rebase",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.rename",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.delete",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.push",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.branch.setUpstream",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.branch.resetToUpstream",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.createWorktree",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.branch.compare",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.remoteBranch.checkout",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.remoteBranch.delete",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.tag.checkout",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.tag.delete",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.tag.push",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.create",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.refresh",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.signIn",
+          "when": "true"
+        },
+        {
+          "command": "gitstudio.pr.checkout",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.startReview",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.submitReview",
+          "when": "gitstudio.pr.reviewing"
+        },
+        {
+          "command": "gitstudio.pr.cancelReview",
+          "when": "gitstudio.pr.reviewing"
+        },
+        {
+          "command": "gitstudio.pr.merge",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.openDescription",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.openOnGitHub",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.copyUrl",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.pr.addReviewComment",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.pr.addSingleComment",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.pr.deleteReviewComment",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.pr.replyThread",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.pr.resolveThread",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.pr.unresolveThread",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.revision.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.revision.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.date.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.date.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.author.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.author.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.commitNumber.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.field.commitNumber.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.colors.author.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.colors.author.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.colors.order.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.colors.order.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.colors.hide.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.colors.hide.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.initials.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.initials.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.lastName.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.lastName.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.firstName.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.firstName.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.fullName.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.fullName.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.email.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.names.email.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.hover.on",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.hover.off",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.closeAnnotations",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.blame.copyRevision",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.blame.showDiff",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.blame.showCommit",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.blame.openPreviousRevision",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.blame.viewInBrowser",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.revealCommitInGraph",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.copyCommitSha",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.showCommitPanel",
+          "when": "false"
+        },
+        {
+          "command": "gitstudio.stageWithTicks",
+          "when": "gitstudio.hasRepo"
+        },
+        {
+          "command": "gitstudio.toggleStageAtLine",
+          "when": "gitstudio.hasRepo && resourceScheme == file"
+        },
+        {
+          "command": "gitstudio.openTerminal",
+          "when": "gitstudio.hasRepo"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "gitstudio.pr.addReviewComment",
+          "when": "commentController == gitstudio.prReview && commentThread != gitstudio.prThread.open && commentThread != gitstudio.prThread.resolved",
+          "group": "inline@1"
+        },
+        {
+          "command": "gitstudio.pr.addSingleComment",
+          "when": "commentController == gitstudio.prReview && commentThread != gitstudio.prThread.open && commentThread != gitstudio.prThread.resolved",
+          "group": "inline@2"
+        },
+        {
+          "command": "gitstudio.pr.replyThread",
+          "when": "commentController == gitstudio.prReview && commentThread =~ /^gitstudio\\.prThread\\./",
+          "group": "inline@1"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "gitstudio.pr.submitReview",
+          "when": "commentController == gitstudio.prReview && commentThread == gitstudio.prPendingThread",
+          "group": "navigation@1"
+        },
+        {
+          "command": "gitstudio.pr.resolveThread",
+          "when": "commentController == gitstudio.prReview && commentThread == gitstudio.prThread.open",
+          "group": "navigation@1"
+        },
+        {
+          "command": "gitstudio.pr.unresolveThread",
+          "when": "commentController == gitstudio.prReview && commentThread == gitstudio.prThread.resolved",
+          "group": "navigation@1"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "gitstudio.pr.deleteReviewComment",
+          "when": "commentController == gitstudio.prReview && comment == gitstudio.prReviewComment",
+          "group": "group@1"
+        }
+      ],
+      "editor/lineNumber/context": [
+        {
+          "command": "gitstudio.toggleFileBlame",
+          "when": "gitstudio.hasRepo && resourceScheme == file",
+          "group": "1_gitstudio@1"
+        },
+        {
+          "submenu": "gitstudio.blame.annotationsMenu",
+          "when": "gitstudio.blameAnnotated",
+          "group": "1_gitstudio@3"
+        },
+        {
+          "command": "gitstudio.toggleStageAtLine",
+          "when": "gitstudio.hasRepo && resourceScheme == file && (scmActiveResourceHasChanges || isInDiffEditor && !editorReadonly && !isEmbeddedDiffEditor && diffEditorOriginalUri =~ /^(gitstudio-rev|git):/)",
+          "group": "1_gitstudio@2"
+        }
+      ],
+      "gitstudio.blame.annotationsMenu": [
+        {
+          "command": "gitstudio.blame.closeAnnotations",
+          "group": "1_annotate@1"
+        },
+        {
+          "command": "gitstudio.blame.showDiff",
+          "group": "2_inspect@1"
+        },
+        {
+          "command": "gitstudio.blame.showCommit",
+          "group": "2_inspect@2"
+        },
+        {
+          "command": "gitstudio.blame.copyRevision",
+          "group": "2_inspect@3"
+        },
+        {
+          "command": "gitstudio.blame.openPreviousRevision",
+          "group": "3_revision@1"
+        },
+        {
+          "command": "gitstudio.showLineHistory",
+          "group": "3_revision@2"
+        },
+        {
+          "command": "gitstudio.blame.viewInBrowser",
+          "group": "4_external@1"
+        },
+        {
+          "submenu": "gitstudio.blame.optionsMenu",
+          "group": "5_options@1"
+        }
+      ],
+      "gitstudio.blame.colorsMenu": [
+        {
+          "command": "gitstudio.blame.colors.author.on",
+          "when": "gitstudio.blame.c == author",
+          "group": "1@0"
+        },
+        {
+          "command": "gitstudio.blame.colors.author.off",
+          "when": "!(gitstudio.blame.c == author)",
+          "group": "1@0"
+        },
+        {
+          "command": "gitstudio.blame.colors.order.on",
+          "when": "gitstudio.blame.c == order",
+          "group": "1@1"
+        },
+        {
+          "command": "gitstudio.blame.colors.order.off",
+          "when": "!(gitstudio.blame.c == order)",
+          "group": "1@1"
+        },
+        {
+          "command": "gitstudio.blame.colors.hide.on",
+          "when": "gitstudio.blame.c == hide",
+          "group": "1@2"
+        },
+        {
+          "command": "gitstudio.blame.colors.hide.off",
+          "when": "!(gitstudio.blame.c == hide)",
+          "group": "1@2"
+        }
+      ],
+      "gitstudio.blame.namesMenu": [
+        {
+          "command": "gitstudio.blame.names.initials.on",
+          "when": "gitstudio.blame.n == initials",
+          "group": "1@0"
+        },
+        {
+          "command": "gitstudio.blame.names.initials.off",
+          "when": "!(gitstudio.blame.n == initials)",
+          "group": "1@0"
+        },
+        {
+          "command": "gitstudio.blame.names.lastName.on",
+          "when": "gitstudio.blame.n == lastName",
+          "group": "1@1"
+        },
+        {
+          "command": "gitstudio.blame.names.lastName.off",
+          "when": "!(gitstudio.blame.n == lastName)",
+          "group": "1@1"
+        },
+        {
+          "command": "gitstudio.blame.names.firstName.on",
+          "when": "gitstudio.blame.n == firstName",
+          "group": "1@2"
+        },
+        {
+          "command": "gitstudio.blame.names.firstName.off",
+          "when": "!(gitstudio.blame.n == firstName)",
+          "group": "1@2"
+        },
+        {
+          "command": "gitstudio.blame.names.fullName.on",
+          "when": "gitstudio.blame.n == fullName",
+          "group": "1@3"
+        },
+        {
+          "command": "gitstudio.blame.names.fullName.off",
+          "when": "!(gitstudio.blame.n == fullName)",
+          "group": "1@3"
+        },
+        {
+          "command": "gitstudio.blame.names.email.on",
+          "when": "gitstudio.blame.n == email",
+          "group": "1@4"
+        },
+        {
+          "command": "gitstudio.blame.names.email.off",
+          "when": "!(gitstudio.blame.n == email)",
+          "group": "1@4"
+        }
+      ],
+      "gitstudio.blame.optionsMenu": [
+        {
+          "command": "gitstudio.blame.field.revision.on",
+          "when": "gitstudio.blame.f.revision",
+          "group": "1_fields@0"
+        },
+        {
+          "command": "gitstudio.blame.field.revision.off",
+          "when": "!gitstudio.blame.f.revision",
+          "group": "1_fields@0"
+        },
+        {
+          "command": "gitstudio.blame.field.date.on",
+          "when": "gitstudio.blame.f.date",
+          "group": "1_fields@1"
+        },
+        {
+          "command": "gitstudio.blame.field.date.off",
+          "when": "!gitstudio.blame.f.date",
+          "group": "1_fields@1"
+        },
+        {
+          "command": "gitstudio.blame.field.author.on",
+          "when": "gitstudio.blame.f.author",
+          "group": "1_fields@2"
+        },
+        {
+          "command": "gitstudio.blame.field.author.off",
+          "when": "!gitstudio.blame.f.author",
+          "group": "1_fields@2"
+        },
+        {
+          "command": "gitstudio.blame.field.commitNumber.on",
+          "when": "gitstudio.blame.f.commitNumber",
+          "group": "1_fields@3"
+        },
+        {
+          "command": "gitstudio.blame.field.commitNumber.off",
+          "when": "!gitstudio.blame.f.commitNumber",
+          "group": "1_fields@3"
+        },
+        {
+          "submenu": "gitstudio.blame.colorsMenu",
+          "group": "2_style@1"
+        },
+        {
+          "submenu": "gitstudio.blame.namesMenu",
+          "group": "2_style@2"
+        },
+        {
+          "command": "gitstudio.blame.hover.on",
+          "when": "gitstudio.blame.h",
+          "group": "3_hover@1"
+        },
+        {
+          "command": "gitstudio.blame.hover.off",
+          "when": "!gitstudio.blame.h",
+          "group": "3_hover@1"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "gitstudio.editorMenu",
+        "label": "%submenu.gitstudio.editorMenu.label%"
+      },
+      {
+        "id": "gitstudio.blame.annotationsMenu",
+        "label": "%submenu.gitstudio.blame.annotationsMenu.label%"
+      },
+      {
+        "id": "gitstudio.blame.colorsMenu",
+        "label": "%submenu.gitstudio.blame.colorsMenu.label%"
+      },
+      {
+        "id": "gitstudio.blame.namesMenu",
+        "label": "%submenu.gitstudio.blame.namesMenu.label%"
+      },
+      {
+        "id": "gitstudio.blame.optionsMenu",
+        "label": "%submenu.gitstudio.blame.optionsMenu.label%"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production",
+    "check-types": "tsc --noEmit",
+    "test": "tsx --import ../../scripts/test/hermetic-git.mjs --test \"test/**/*.test.ts\"",
+    "vscode:prepublish": "npm run package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.42",
+    "@types/vscode": "1.78.0",
+    "@vscode/codicons": "^0.0.45",
+    "esbuild": "^0.28.1",
+    "monaco-editor": "^0.55.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vscode-diff": "^3.0.1"
+  },
+  "dependencies": {
+    "@gitstudio/engine": "*",
+    "@gitstudio/git-service": "*",
+    "@gitstudio/host-bridge": "*",
+    "@gitstudio/l10n": "*",
+    "@gitstudio/merge-vscode": "*",
+    "@gitstudio/secret-store": "*",
+    "@gitstudio/webview-ui": "*",
+    "@vscode/l10n": "^0.0.18"
+  },
+  "pricing": "Free",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.virtualWorkspaces.description%"
+    }
+  },
+  "preview": false,
+  "l10n": "./l10n"
+}

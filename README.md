@@ -1,0 +1,273 @@
+<p align="center">
+  <img alt="GitStudio" src="brand/gitstudio-icon.svg" width="116">
+</p>
+
+<h1 align="center">GitStudio</h1>
+
+<p align="center">
+  <b>A free, open-source, JetBrains-grade Git suite for VS Code, Cursor, and desktop.</b>
+</p>
+
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=gitstudio.gitstudio"><img alt="VS Code Marketplace" src="https://img.shields.io/visual-studio-marketplace/v/gitstudio.gitstudio?label=VS%20Marketplace&color=6f5bd7"></a>
+  <a href="https://open-vsx.org/extension/gitstudio/gitstudio"><img alt="Open VSX" src="https://img.shields.io/open-vsx/v/gitstudio/gitstudio?label=Open%20VSX&color=6f5bd7"></a>
+  <a href="https://github.com/GitStudioHQ/gitstudio/releases/latest"><img alt="Desktop app" src="https://img.shields.io/github/v/release/GitStudioHQ/gitstudio?filter=app-v*&label=Desktop&color=6f5bd7"></a>
+  <a href="https://github.com/GitStudioHQ/gitstudio/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/GitStudioHQ/gitstudio/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://codecov.io/gh/GitStudioHQ/gitstudio"><img alt="Code coverage" src="https://img.shields.io/codecov/c/github/GitStudioHQ/gitstudio?label=coverage"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <a href="https://github.com/sponsors/antonarnaudov"><img alt="Sponsor on GitHub" src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=white"></a>
+  <a href="https://checkout.revolut.com/pay/7a6070ab-99ba-4170-a125-c5911b1a5c1d"><img alt="Buy me a coffee" src="https://img.shields.io/badge/Buy_me_a_coffee-FF813F?logo=buymeacoffee&logoColor=white"></a>
+</p>
+
+<p align="center"><sub>Logo &amp; brand assets live in <a href="brand/">brand/</a>.</sub></p>
+
+<p align="center">
+  <img src="docs/media/desktop-commits.png" width="1200" alt="GitStudio Desktop on its own repository: three repositories open in tabs, the commit graph with Anton Arnaudov's recent commits, three of them selected, and the details pane offering Cherry-pick, Revert, Squash and Drop for all three.">
+</p>
+
+<p align="center"><b>In VS Code and Cursor</b> — the same engine, as an extension:</p>
+
+<p align="center">
+  <img src="apps/extension/media/shots/hero.gif" width="1200" alt="GitStudio in VS Code: three commits picked in the Commit Graph with Cherry-Pick, Revert, Squash and Drop offered for all three; a stash opened in the Changes view; one of two changes in a file ticked so it shows as partly staged; a commit message typed and committed to the top of the graph.">
+</p>
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/media/desktop-merge.png" alt="The three-pane merge editor mid-rebase: yours on the left, the result in the middle, theirs on the right, each change coloured by kind with an arrow and a cross to take or ignore it."><br><sub><b>A three-pane merge editor</b> — yours, the result, theirs.</sub></td>
+    <td width="50%" valign="top"><img src="docs/media/desktop-prs.png" alt="A merged pull request open in GitStudio Desktop: its conversation, reviewers, checks, branches and labels."><br><sub><b>Pull requests and issues</b> — read, review and merge.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="docs/media/desktop-assistant.png" alt="The Assistant answering What did the last three commits change, after reading the log and three commits with read-only git tools, running on a local model in LM Studio."><br><sub><b>An optional assistant</b> — your own key or a local model.</sub></td>
+    <td width="50%" valign="top"><img src="docs/media/desktop-terminal.png" alt="The commit graph above a real terminal, open in the repository's folder."><br><sub><b>A real terminal</b>, in every repository tab.</sub></td>
+  </tr>
+</table>
+
+
+---
+
+## Get GitStudio
+
+### VS Code / Cursor extension
+
+Install **GitStudio** from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=gitstudio.gitstudio) or [Open VSX](https://open-vsx.org/extension/gitstudio/gitstudio) (VSCodium, Gitpod, …), or from the command line:
+
+```bash
+code   --install-extension gitstudio.gitstudio    # VS Code
+cursor --install-extension gitstudio.gitstudio    # Cursor
+```
+
+To use GitStudio's compare viewer for VS Code text diffs (Source Control,
+Explorer comparisons, history and `vscode.diff`), enable
+`gitstudio.merge.useAsDefaultDiffViewer` in Settings. It is off by default and
+independent of conflict auto-open. With the standalone Merge Studio extension,
+use `jbMerge.useAsDefaultDiffViewer` instead. If both are enabled, GitStudio
+handles diffs. Once it is on, the comparison opens everywhere: for the diffs
+VS Code and other extensions open, and for GitStudio's own Changes list, Commit
+Graph, stashes, history, blame, compare, worktrees and push review. To use it
+only in some of those places, untick the others in
+`gitstudio.diff.comparisonIn`: for instance untick `changes` to keep VS Code's
+diff editor, with its selective-staging menu, for the Changes list. Pull
+request diffs always open in VS Code's diff editor, where their review threads
+are. So do binary and custom-editor diffs, diffs of other extensions' own
+documents (pull request reviews, AI edits), and a comparison that cannot be
+loaded. This uses VS Code's stable tab API,
+so the native diff may briefly appear before the comparison opens. Unsaved
+source tabs are kept; editing the comparison opens the writable document in
+a background text tab for normal saving and close prompts. Disable the setting
+to restore VS Code for future diffs.
+
+### Desktop app
+
+**One line:**
+
+```bash
+# macOS and Linux
+curl -fsSL https://raw.githubusercontent.com/GitStudioHQ/gitstudio/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/GitStudioHQ/gitstudio/main/scripts/install.ps1 | iex
+```
+
+**Homebrew** (macOS):
+
+```bash
+brew install --cask gitstudiohq/gitstudio/gitstudio   # add --force if you already have GitStudio.app
+```
+
+**winget** (Windows) — once the first submission
+([microsoft/winget-pkgs#437547](https://github.com/microsoft/winget-pkgs/pull/437547))
+is merged:
+
+```powershell
+winget install GitStudioHQ.GitStudio
+```
+
+**Or download it** from the [latest GitHub Release](https://github.com/GitStudioHQ/gitstudio/releases/latest) or [gitstudio.dev](https://gitstudio.dev):
+
+| Platform | Installer |
+|---|---|
+| **macOS — Apple Silicon** | `GitStudio-<version>-arm64.dmg` |
+| **macOS — Intel** | `GitStudio-<version>-x64.dmg` |
+| **Windows** | `GitStudio-Setup-<version>.exe` (NSIS — choose your install dir) |
+| **Linux** | `GitStudio-<version>-x86_64.AppImage` (universal) · `GitStudio-<version>-amd64.deb` (Debian/Ubuntu) · `GitStudio-<version>-x86_64.rpm` (Fedora/RHEL) · `GitStudio-<version>-x64.tar.gz` (portable) |
+
+Every release carries a `SHA256SUMS.txt`; the one-line installers verify against
+it and refuse to install on a mismatch.
+
+The builds are not code-signed yet. Homebrew and `install.sh` clear macOS's
+quarantine flag for you; if you took the `.dmg` and macOS says the app is
+damaged, run `xattr -d -r -s com.apple.quarantine /Applications/GitStudio.app` once.
+On Windows, SmartScreen: **More info → Run anyway**.
+
+Every build checks GitHub Releases for a newer version and asks before
+downloading. Windows and Linux (AppImage) then update in place; macOS downloads
+the new `.dmg` to your Downloads folder and opens it — one drag to Applications
+(unsigned builds cannot apply a Squirrel.Mac update).
+
+## The idea
+
+VS Code's built-in Git is functional but flat. GitLens is great at *information* (blame, history, lenses) but doesn't own the *interaction* (merging, staging, resolving). JetBrains IDEs nail the interaction — three-pane merges, a real commit graph, hunk-level staging, inline blame that feels native — but you only get them if you live in IntelliJ.
+
+**GitStudio brings the JetBrains-grade Git *workflow* to VS Code, Cursor, and a native desktop app, and adds an intelligence layer on top.** The polish of a native IDE, the depth of a power-user tool, and AI that actually understands your history — all free, on public *and* private repos.
+
+## What's inside — the six pillars
+
+Everything ships in one extension (`gitstudio.gitstudio`) and one desktop app, both built on the same shared engine:
+
+| Pillar | What's in |
+|---|---|
+| **Visualize** | A sidebar-native Commits view (true branch topology at sidebar scale, mini author avatars on the nodes, scoped search) plus a full-screen virtualized commit graph; inline + full-file blame with a code-age heatmap; file & line history; revision navigation; reflog time-machine. |
+| **Change** | Instant hunk- & line-level staging; guided commit box (amend, sign-off, author, Commit & Push); side-by-side / unified diff with word-level highlighting; 3-pane merge editor with accept ribbons — conflicts auto-open as they appear. |
+| **Rewrite** | Drag-to-reorder interactive rebase (pick · reword · edit · squash · fixup · drop); a universal, reflog-powered **Undo** safety net (never hijacks `Ctrl/Cmd+Z`). |
+| **Manage** | Branches (live ↑/↓ badges, fetch-in-place, pull without checkout), remotes, tags, first-class stashes, worktrees; GitHub-style branch compare; status-bar sync with in-view Push/Pull. |
+| **Collaborate** | In-editor GitHub pull-request review — list, check out, diff, comment inline, submit, merge, create. |
+| **Assist** | AI features — optional, bring-your-own-key (Anthropic or any OpenAI-compatible endpoint, including local Ollama / LM Studio) or zero-key (Copilot): AI commit messages, explain-diff, summaries. With Copilot it works with nothing to set up, otherwise it is off until you connect a provider; keys stay on your machine in GitStudio's own encrypted store; AI never gates a Git operation. |
+
+## The desktop app
+
+A standalone, cross-platform Git client (macOS / Windows / Linux) built on the exact same core — not a rewrite. On top of the shared graph, diff/merge, staging, rebase, and undo it adds:
+
+- **A GitHub home for your repo** — sign in with a token and get pull requests (diffs + inline review), issues, Actions runs with logs, releases, notifications, gists, orgs, and projects, all local-first.
+- **An integrated terminal** (node-pty + xterm.js) that opens in your repo.
+- **An AI Assistant** panel wired to `@gitstudio/ai` — connect Anthropic or any OpenAI-compatible model, including local ones.
+- **Auto-update** from GitHub Releases.
+
+## MCP server
+
+`gitstudio-mcp` (in [`apps/mcp`](apps/mcp)) exposes a repository's Git capabilities to any MCP-compatible agent (Claude Desktop, Cursor, Copilot, Windsurf) over stdio. Read tools are always available; write/destructive tools are opt-in via environment variables.
+
+## Monorepo layout
+
+npm workspaces (`packages/*` + `apps/*`):
+
+```
+packages/
+  engine/        Pure, unit-tested diff/merge + graph-layout model (no vscode/electron imports).
+  git-service/   Thin git layer: log, blame, status, staging, refs, stashes, worktrees, sync…
+  host-bridge/   Protocols shared between the hosts (extension / desktop) and their webviews.
+  webview-ui/    Shared webview front-ends: commit graph, diff/merge (Monaco), conflicts
+                 dashboard, rebase.
+  merge-vscode/  The VS Code side of the merge experience, shared by the extension and
+                 Merge Studio: merge editor, conflicts dashboard, routing, diff panel.
+  ai/            Host-agnostic AI layer: multi-provider model registry, git AI tasks, agent
+                 loop, and the shared git tool catalog that also backs the MCP server.
+apps/
+  extension/     The VS Code / Cursor extension.
+  desktop/       The Electron desktop app.
+  mcp/           gitstudio-mcp — the Model Context Protocol server.
+  merge-studio/  Merge Studio — the merge-only extension, exported to GitStudioHQ/merge-studio.
+scripts/
+  merge-studio/  Export to and import from the merge-studio repository (docs/merge-studio.md).
+  merge-e2e/     The all-cases conflict matrix the merge code is tested against.
+```
+
+`engine`, `host-bridge`, and `ai` are kept **pure** (no `vscode`/`electron` imports) so they stay portable and testable — enforced by `npm run check-purity`.
+
+## Development
+
+Requires **Node 22+**.
+
+```bash
+npm ci               # install all workspaces
+npm test             # run every workspace's tests (tsx --test)
+npm run check-types  # tsc --noEmit across all workspaces
+npm run check-purity # assert the pure packages stay host-free
+```
+
+**Extension** — open the repo in VS Code and press <kbd>F5</kbd> to launch an Extension Development Host with GitStudio loaded. Package a sideloadable VSIX with:
+
+```bash
+cd apps/extension
+npm run package
+npx @vscode/vsce package --no-dependencies
+```
+
+**Desktop** — build and launch Electron:
+
+```bash
+npm start --workspace apps/desktop   # dev build + launch
+npm run dist --workspace apps/desktop  # installers for the host OS -> apps/desktop/release/
+```
+
+## Releasing
+
+Both products release from tags — `ext-v*` for the extension (→ Marketplace, Open VSX, GitHub Release) and `app-v*` for the desktop app (→ per-OS installers on a GitHub Release, built natively on a 4-way matrix). CI runs typecheck + the full test suite before anything publishes. See [`RELEASING.md`](RELEASING.md) for the full playbook, including the optional signing/notarization secrets.
+
+## Contributing
+
+Issues and pull requests are welcome at [GitStudioHQ/gitstudio](https://github.com/GitStudioHQ/gitstudio). Before opening a PR, please run the three gates locally:
+
+```bash
+npm test && npm run check-types && npm run check-purity
+```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rest (and the [code of conduct](CODE_OF_CONDUCT.md); report security problems privately, as [SECURITY.md](SECURITY.md) says), and [`docs/merge-studio.md`](docs/merge-studio.md) explains how the merge code is shared with Merge Studio and how a pull request opened on its repository comes back here.
+
+## Facts
+
+| | |
+|---|---|
+| **Extension** | `gitstudio.gitstudio` (publisher `gitstudio`) — [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=gitstudio.gitstudio) + [Open VSX](https://open-vsx.org/extension/gitstudio/gitstudio) |
+| **Desktop** | [GitHub Releases](https://github.com/GitStudioHQ/gitstudio/releases) — `.dmg` (arm64 + x64), `.exe`, `.AppImage`, `.deb`, `.rpm`, `.tar.gz` |
+| **Website** | [gitstudio.dev](https://gitstudio.dev) |
+| **License** | **Apache-2.0** |
+| **Privacy** | What each product sends, and how to turn it off: [desktop](apps/desktop/PRIVACY.md) · [extension](apps/extension/PRIVACY.md) · [Merge Studio](apps/merge-studio/PRIVACY.md) |
+| **Security** | [SECURITY.md](SECURITY.md) — report privately, through the repository's Security tab |
+| **Sibling product** | [Merge Studio](https://marketplace.visualstudio.com/items?itemName=gitstudio.merge-studio) — `gitstudio.merge-studio`, the merge-only extension. Built from `apps/merge-studio` and the shared packages here, exported to [GitStudioHQ/merge-studio](https://github.com/GitStudioHQ/merge-studio). Shares its merge editor, not a listing. |
+
+## Architecture notes
+
+- **One flagship extension, not a swarm** (the GitLens model). It grows pillar by pillar; Merge Studio stays a separate, focused product, built from the same merge code (see [`docs/merge-studio.md`](docs/merge-studio.md)).
+- **Webview custom editors** for rich UI (merge, graph, rebase), **providers + decorations** for ambient features (blame, history), and a **thin git service** with its own repo discovery (`git rev-parse`, symlink-safe) plus direct `.git` reads where speed matters — the views paint from local git instead of blocking on `vscode.git` activation.
+- **Strict CSP + per-load nonces** on every webview; AI keys live in SecretStorage (extension) / safeStorage (desktop) and never reach a webview.
+- **One core, two hosts.** The desktop app runs `@gitstudio/git-service` unchanged in Electron's main process and renders the same `@gitstudio/webview-ui` components the extension uses — behind the same `@gitstudio/host-bridge` protocol.
+
+## 💚 Sponsors & Supporters
+
+GitStudio is free and open source. The AI tokens, hosting and tooling behind it come out of my own pocket — sponsoring covers those costs and moves your issues and feature requests up the queue.
+
+**[Become a sponsor →](https://github.com/sponsors/antonarnaudov)**
+
+### 🏢 Company sponsors
+
+<!-- $100/mo and $250 one-time sponsors: company logo + link -->
+
+_Your company's logo could be here._
+
+### ⭐ Sponsors
+
+<!-- $50+ sponsors: avatar + link -->
+
+_Be the first._
+
+### 📜 Supporters
+
+<!-- $10+ sponsors: name -->
+
+_Be the first._
+
+## License
+
+**Apache-2.0** (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)). Brand assets in [`brand/`](brand/) identify the project; don't use the GitStudio name/logo in a way that implies official endorsement.

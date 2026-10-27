@@ -1,0 +1,655 @@
+// The desktop's GitHub layer: PAT-based auth (encrypted at rest, without the OS
+// keyring — see @gitstudio/secret-store), owner/repo resolution from the active
+// repo's `origin` remote, and thin wrappers over GitHubClient for the PRs /
+// Issues / Projects views. OAuth device flow can be layered on later behind the
+// same `status/connect` surface; the renderer only knows about connect/disconnect
+// plus the data calls.
+
+import { app } from "electron";
+import * as l10n from "@vscode/l10n";
+import { githubStatus } from "./githubStatus";
+import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
+import { join } from "node:path";
+import { SecretStore } from "@gitstudio/secret-store/secretStore";
+
+/** Secret name for the GitHub PAT inside the keychain-free store. */
+const TOKEN_SECRET = "github.token";
+/**
+ * The account name last seen for that token, kept beside it so a launch can
+ * say who you are before GitHub has answered. Not a secret, but it lives and
+ * dies with the token.
+ */
+const LOGIN_SECRET = "github.login";
+import { GitHubClient } from "./githubClient";
+import { prCheckState } from "./github/checkState";
+import { requestDeviceCode, pollForToken } from "./githubAuth";
+import type { RepoStore } from "./repoStore";
+import { ExpectedError } from "./expectedError";
+import { githubRepoOfRemote } from "./githubRemote";
+
+// Re-exported so existing importers (and their tests) keep their seam.
+export { parseGitHubRemote } from "./githubRemote";
+import { errorFields } from "./githubErrors";
+import { applyForDoor, checkoutOp } from "./inTheWay";
+import { checkedOutElsewhere, checkedOutElsewhereMessage } from "@gitstudio/git-service/branchElsewhere";
+import type { ApplyOp } from "@gitstudio/git-service/changesInTheWay";
+import {
+  divergedMessage,
+  fetchPrHead,
+  movePrBranch,
+  planPrHead,
+} from "@gitstudio/git-service/prCheckout";
+import type {
+  CheckRun,
+  CommitActionResult,
+  DeviceCodeInfo,
+  DevicePollResult,
+  ExternalItemDetail,
+  GitHubStatus,
+  IssueInfo,
+  MergeMethod,
+  PrComment,
+  PrCommitInfo,
+  PrDetail,
+  PullRequest,
+  WorkflowRun,
+  OkResult,
+} from "../shared/ipc";
+
+
+export class GitHubBridge {
+  private token: string | undefined;
+  private login: string | undefined;
+  /** The one read of the stored token (and its remembered login). */
+  private loading: Promise<void> | undefined;
+  /** Bumped by every sign-in and sign-out, so a read that started before one never undoes it. */
+  private authGen = 0;
+  /** GitHub has confirmed `login` for this token in this session. */
+  private loginConfirmed = false;
+  /** The one `/user` request in flight. */
+  private loginAsk: Promise<string | undefined> | undefined;
+  private readonly client = new GitHubClient(() => this.token);
+
+  /**
+   * The raw token, for ONE caller: the webRequest hook that authenticates
+   * issue/PR attachment images. GitHub serves a private repository's
+   * `user-attachments` URL only to an authenticated request, and an <img> tag
+   * carries no headers of its own — so without this, every screenshot in a
+   * private repo's issues is a broken glyph while the public ones load.
+   * Nothing else should touch this; API calls go through `client`.
+   */
+  peekToken(): string | undefined {
+    return this.token;
+  }
+  private ownerRepoRoot: string | undefined;
+  private cachedOwnerRepo: { owner: string; repo: string } | undefined;
+  /** The remote `cachedOwnerRepo` was read from: a PR's head is fetched there. */
+  private cachedRemoteName: string | undefined;
+  /** Lazily built: `app.getPath` is only valid once Electron is ready. */
+  private store: SecretStore | undefined;
+
+  constructor(private readonly repos: RepoStore) {}
+
+  /** Pre-1.4 location: a safeStorage blob, i.e. the OS keyring. */
+  private legacyTokenPath(): string {
+    return join(app.getPath("userData"), "github-token.bin");
+  }
+
+  private secrets(): SecretStore {
+    this.store ??= new SecretStore(join(app.getPath("userData"), "secrets"));
+    return this.store;
+  }
+
+  /**
+   * Read the stored token once. Every caller waits for the same read: a flag
+   * set before the read finished let a second caller through with no token
+   * (the store is keychain-free, so reading it never prompts — see
+   * @gitstudio/secret-store).
+   */
+  private ensureLoaded(): Promise<void> {
+    this.loading ??= this.load().catch((e: unknown) => {
+      this.loading = undefined; // a failed read is tried again, not remembered
+      throw e;
+    });
+    return this.loading;
+  }
+
+  private async load(): Promise<void> {
+    const gen = this.authGen;
+    const token = await this.secrets().get(TOKEN_SECRET);
+    const login = token === undefined ? undefined : await this.secrets().get(LOGIN_SECRET).catch(() => undefined);
+    if (gen !== this.authGen) return; // signed in or out meanwhile: that wins
+    this.token = token;
+    this.login = login;
+    if (this.token === undefined) {
+      // NO KEYRING, EVER. A pre-1.4 safeStorage blob could only be read
+      // through the OS keychain, whose ACL is bound to the app's code
+      // signature -- so every rebuilt/re-signed binary raised the macOS
+      // password prompt again, and declining it made sign-in look broken.
+      // That migration is gone: any leftover blob is deleted unread, and the
+      // user signs in once more through the (now prompt-free) device flow.
+      // read-failure-reviewed: deleting a legacy token file that may not exist.
+      // Nothing is READ here and nothing downstream renders the result — a
+      // failure to remove it is not news.
+      await unlink(this.legacyTokenPath()).catch(() => {});
+    }
+  }
+
+
+  /** Resolve owner/repo from the repo's remotes (positive result cached per
+   *  root). Tries `origin`, then `upstream`, then every other remote — a fork
+   *  checked out with only an `upstream` remote used to be refused outright.
+   *  A miss is NOT cached: adding a remote after opening the repo starts
+   *  working on the very next call instead of after a repo switch. */
+  private async resolveOwnerRepo(): Promise<{ owner: string; repo: string } | undefined> {
+    const ctx = this.repos.getContext();
+    if (!ctx) {
+      return undefined;
+    }
+    if (this.ownerRepoRoot === ctx.root && this.cachedOwnerRepo) {
+      return this.cachedOwnerRepo;
+    }
+    let from: string | undefined;
+    const tryRemote = async (name: string): Promise<{ owner: string; repo: string } | undefined> => {
+      try {
+        const r = await ctx.process.run(["remote", "get-url", name]);
+        // Through ~/.ssh/config's aliases too, as the extension reads it.
+        const got = r.code === 0 ? await githubRepoOfRemote(r.stdout.trim()) : undefined;
+        if (got) from = name;
+        return got;
+      } catch {
+        return undefined;
+      }
+    };
+    let hit = (await tryRemote("origin")) ?? (await tryRemote("upstream"));
+    if (!hit) {
+      try {
+        const r = await ctx.process.run(["remote"]);
+        for (const name of r.stdout.split("\n").map((s) => s.trim()).filter(Boolean)) {
+          if (name === "origin" || name === "upstream") continue;
+          hit = await tryRemote(name);
+          if (hit) break;
+        }
+      } catch {
+        // no remotes at all
+      }
+    }
+    this.ownerRepoRoot = ctx.root;
+    this.cachedOwnerRepo = hit;
+    this.cachedRemoteName = hit ? from : undefined;
+    return hit;
+  }
+
+  async status(): Promise<GitHubStatus> {
+    const repo = await this.resolveOwnerRepo();
+    // The token is read here. It used to be left locked until some other
+    // GitHub call needed it (reading it once meant the OS keychain prompt), so
+    // every launch showed "you" / "Signed in" for an account the app had on
+    // disk, and Settings kept "you" until it was reopened. The store has been
+    // keychain-free since 1.4; nothing prompts.
+    // read-failure-reviewed: an unreadable token file leaves the name unknown,
+    // not the answer — `connected` still comes from whether the file exists
+    // (hasStoredToken, which does reject), and the next status reads again.
+    await this.ensureLoaded().catch(() => {});
+    if (this.token && !this.login) {
+      // Best effort. `currentLogin` swallows its own failures and answers
+      // undefined, and THAT used to decide `connected` — so one flaky request
+      // signed the user out of the top bar while Settings, holding the same
+      // account, went on showing them signed in.
+      await this.askLogin();
+    } else if (this.token && !this.loginConfirmed) {
+      // The remembered name answers now; GitHub confirms it (or a rename)
+      // behind it, once a session.
+      void this.askLogin();
+    }
+    return githubStatus({
+      hasToken: !!this.token,
+      hasStoredToken: await this.hasStoredToken(),
+      login: this.login,
+      repo,
+    });
+  }
+
+  /** Ask GitHub who the token belongs to, once at a time, and remember the answer. */
+  private askLogin(): Promise<string | undefined> {
+    if (this.loginAsk) return this.loginAsk;
+    const gen = this.authGen;
+    const ask = this.client.currentLogin().then(async (login) => {
+      if (this.loginAsk === ask) this.loginAsk = undefined;
+      if (!login || gen !== this.authGen || !this.token) return login;
+      this.loginConfirmed = true;
+      if (login !== this.login) {
+        this.login = login;
+        await this.rememberLogin(login);
+      }
+      return login;
+    });
+    this.loginAsk = ask;
+    return ask;
+  }
+
+  /** Keep the account name beside the token (best effort: it is only a head start). */
+  private async rememberLogin(login: string): Promise<void> {
+    // read-failure-reviewed: a WRITE, and nothing renders its result — a name
+    // not remembered is asked of GitHub again at the next launch.
+    await this.secrets()
+      .set(LOGIN_SECRET, login)
+      .catch(() => {});
+  }
+
+  /** A sign-in or sign-out: whatever was being read or asked for the old token is stale. */
+  private newAuth(): void {
+    this.authGen++;
+    this.loading = Promise.resolve();
+    this.loginAsk = undefined;
+    this.loginConfirmed = false;
+  }
+
+  /** Is there a stored token, WITHOUT decrypting it? Only the keychain-free
+   *  store counts — a leftover pre-1.4 keyring blob is unreadable by design
+   *  (see ensureLoaded), so treating it as "connected" showed a signed-in UI
+   *  whose every real request then failed. */
+  private async hasStoredToken(): Promise<boolean> {
+    return this.secrets().has(TOKEN_SECRET);
+  }
+
+  async connect(pat: string): Promise<OkResult & { login?: string }> {
+    this.newAuth();
+    this.token = pat.trim();
+    this.login = await this.client.currentLogin();
+    if (!this.login) {
+      this.token = undefined;
+      this.loading = undefined; // the account already stored (if any) is still the one
+      // A token the user pasted that GitHub will not accept is an auth state,
+      // not a defect (see main/expectedError.ts) — the sign-in panel already
+      // says so, and this filed a report for every mistyped paste.
+      return {
+        ok: false,
+        expected: true,
+        message: l10n.t("That token didn't work — make sure it has 'repo' scope."),
+      };
+    }
+    await this.persistToken(this.token);
+    this.loginConfirmed = true;
+    await this.rememberLogin(this.login);
+    return { ok: true, login: this.login };
+  }
+
+  /** Encrypt + persist the user token at rest (best-effort). */
+  private async persistToken(token: string): Promise<void> {
+    try {
+      await this.secrets().set(TOKEN_SECRET, token);
+      // A freshly entered token supersedes any pre-1.4 blob; drop it so
+      // `hasStoredToken` can't be satisfied by a file we will never read again.
+      // read-failure-reviewed: deleting a legacy token file that may not exist.
+      // Nothing is READ here and nothing downstream renders the result — a
+      // failure to remove it is not news.
+      await unlink(this.legacyTokenPath()).catch(() => {});
+    } catch {
+      // best-effort persistence; the in-memory token still works this session
+    }
+  }
+
+  /** Device Flow step 1: request a user code to show in the sign-in panel. */
+  async deviceStart(): Promise<DeviceCodeInfo> {
+    try {
+      const dc = await requestDeviceCode();
+      return {
+        ok: true,
+        userCode: dc.userCode,
+        verificationUri: dc.verificationUri,
+        verificationUriComplete: dc.verificationUriComplete,
+        deviceCode: dc.deviceCode,
+        interval: dc.interval,
+        expiresIn: dc.expiresIn,
+      };
+    } catch (err) {
+      // `expected` keeps sign-in out of the crash reporter. The IPC wrapper
+      // reports any returned ok:false down a separate branch from a throw, so
+      // marking the throw in githubAuth.ts is not enough on its own — this
+      // result is what that branch actually sees.
+      //
+      // Nothing that can fail here is our defect: the user is offline, or
+      // github.com refused to issue a device code. Both are conditions the
+      // sign-in panel already shows the user a message for.
+      return {
+        ok: false,
+        expected: true,
+        ...errorFields(err),
+      };
+    }
+  }
+
+  /** Device Flow step 2: poll once; on authorization, store the token + login. */
+  async devicePoll(req: { deviceCode: string }): Promise<DevicePollResult> {
+    let r;
+    try {
+      r = await pollForToken(req.deviceCode);
+    } catch (err) {
+      return { state: "error", ...errorFields(err) };
+    }
+    if (r.state !== "authorized") {
+      return { state: r.state, message: r.message };
+    }
+    this.newAuth();
+    this.token = r.accessToken;
+    this.login = await this.client.currentLogin();
+    if (!this.login) {
+      this.token = undefined;
+      this.loading = undefined; // the account already stored (if any) is still the one
+      return { state: "error", message: l10n.t("Signed in, but GitHub didn't return a user.") };
+    }
+    await this.persistToken(r.accessToken);
+    this.loginConfirmed = true;
+    await this.rememberLogin(this.login);
+    return { state: "authorized", login: this.login };
+  }
+
+  async disconnect(): Promise<void> {
+    this.newAuth();
+    this.token = undefined;
+    this.login = undefined;
+    await this.secrets().delete(TOKEN_SECRET);
+    // read-failure-reviewed: deleting a remembered name that may not exist;
+    // with the token gone it is never read again.
+    await this.secrets()
+      .delete(LOGIN_SECRET)
+      .catch(() => {});
+    try {
+      await unlink(this.legacyTokenPath());
+    } catch {
+      // already gone
+    }
+  }
+
+  async prList(state: "open" | "closed" | "all" = "open"): Promise<PullRequest[]> {
+    await this.ensureLoaded();
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) {
+      return [];
+    }
+    // Let API errors (rate limit / auth / network) propagate so the renderer can
+    // show a real error state instead of a misleading "no pull requests".
+    return this.client.listPulls(r.owner, r.repo, state);
+  }
+
+  /**
+   * Run `fn` with the resolved owner/repo + the client, for the per-section
+   * modules under ./github. Throws a clean error (→ renderer errorState) when
+   * not connected or the repo isn't on github.com.
+   */
+  async withRepo<T>(
+    fn: (client: GitHubClient, owner: string, repo: string) => Promise<T>,
+  ): Promise<T> {
+    // Unlock on demand: the user asked for GitHub data, so a keychain prompt
+    // here is expected and explicable — unlike one at launch.
+    await this.ensureLoaded();
+    if (!this.token) {
+      throw new ExpectedError(l10n.t("Not connected to GitHub."));
+    }
+    const r = await this.resolveOwnerRepo();
+    if (!r) {
+      throw new ExpectedError(l10n.t("This repository isn't on github.com."));
+    }
+    return fn(this.client, r.owner, r.repo);
+  }
+
+  /** Run `fn` with just the client (user-level endpoints: orgs, gists, notifications). */
+  async withClient<T>(fn: (client: GitHubClient) => Promise<T>): Promise<T> {
+    await this.ensureLoaded();
+    if (!this.token) {
+      throw new ExpectedError(l10n.t("Not connected to GitHub."));
+    }
+    return fn(this.client);
+  }
+
+  /**
+   * Like `withClient`, but NEVER unlocks the token.
+   *
+   * For ambient, unprompted reads — the notification badge polls on launch, and
+   * unlocking for it meant a macOS keychain password prompt every single start,
+   * for something the user never asked for. If the token is already unlocked
+   * (because a real GitHub action happened this session) the call proceeds;
+   * otherwise it yields `undefined` and the caller degrades quietly.
+   */
+  async withClientIfUnlocked<T>(
+    fn: (client: GitHubClient) => Promise<T>,
+  ): Promise<T | undefined> {
+    if (!this.token) {
+      return undefined;
+    }
+    return fn(this.client);
+  }
+
+  async prDetail(n: number): Promise<PrDetail | undefined> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) {
+      return undefined;
+    }
+    try {
+      const pr = await this.client.getPull(r.owner, r.repo, n);
+      // The FILES are the point of this response — losing them silently turns
+      // "Files (9)" into an empty tab. The checks are genuinely optional
+      // decoration, so those still degrade to blank.
+      const [files, status, runs] = await Promise.all([
+        this.client.getPullFiles(r.owner, r.repo, n),
+        this.client.getCombinedStatus(r.owner, r.repo, pr.head.sha).catch(() => ({ state: "", totalCount: 0 })),
+        // The legacy statuses alone know nothing of GitHub Actions — and say
+        // "pending" for a commit that has no statuses at all (prCheckState).
+        // read-failure-reviewed: these only colour the rail's pill (the Checks
+        // tab reads pr:checks itself); unreadable runs leave the statuses'
+        // state, and must never cost the page its files.
+        this.client.listCheckRuns(r.owner, r.repo, pr.head.sha).catch(() => []),
+      ]);
+      return { pr, files, checks: prCheckState(status, runs) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Read-only fetch of an issue/PR from ANY repo (cross-repo notifications open
+   *  in-app instead of github.com). Uses the client directly — not the current
+   *  repo's owner/repo — so any subject the user is notified about can be read here. */
+  async externalItem(req: {
+    owner: string;
+    repo: string;
+    number: number;
+    kind: "issue" | "pull";
+  }): Promise<ExternalItemDetail | undefined> {
+    if (!this.token) return undefined;
+    const { owner, repo, number, kind } = req;
+    try {
+      // read-failure-reviewed: this is the AI assistant's summary of an item it
+      // was handed, and the title/body/state below carry the answer. A dropped
+      // comment list makes the summary thinner, not wrong — and the whole call
+      // is already inside a try that returns undefined, so letting this reject
+      // would throw the item away over its least important part.
+      const comments = (await this.client.listConversation(owner, repo, number).catch(() => []))
+        .filter((c) => c.kind === "comment")
+        .map((c) => ({ author: c.author || null, body: c.body, createdAt: c.createdAt }));
+      if (kind === "pull") {
+        const pr = await this.client.getPull(owner, repo, number);
+        return {
+          kind: "pull", number, repo: `${owner}/${repo}`, title: pr.title,
+          state: pr.draft ? "draft" : pr.state, body: pr.body, htmlUrl: pr.htmlUrl,
+          author: pr.user?.login ?? null, createdAt: pr.createdAt, comments,
+        };
+      }
+      const issue = await this.client.getIssue(owner, repo, number);
+      return {
+        kind: "issue", number, repo: `${owner}/${repo}`, title: issue.title,
+        state: issue.state, body: issue.body, htmlUrl: issue.htmlUrl,
+        author: issue.user?.login ?? null, createdAt: issue.createdAt, comments,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Fetch the PR's head into a local `pr/<n>` branch and check it out. */
+  async prCheckout(req: number | { number: number; stashFirst?: string }): Promise<CommitActionResult> {
+    const ctx = this.repos.getContext();
+    if (!ctx) {
+      return { ok: false, changed: false, expected: true, message: l10n.t("No repository open.") };
+    }
+    // The number, or — sent again after Stash & Retry — `{ number, stashFirst }`.
+    const n = typeof req === "number" ? req : req?.number;
+    const stashFirst = typeof req === "number" ? undefined : req?.stashFirst;
+    if (!Number.isSafeInteger(n) || (n as number) <= 0) {
+      return { ok: false, changed: false, message: l10n.t("That isn't a pull request number.") };
+    }
+    try {
+      // pr/<n> is checked out in another worktree: said where, before
+      // anything runs (no fetch) — as the extension's checkoutPr and this
+      // app's branch checkout do, in the same words.
+      const where = await checkedOutElsewhere(ctx.process, `refs/heads/pr/${n}`);
+      if (where) {
+        return {
+          ok: false,
+          changed: false,
+          expected: true,
+          message: checkedOutElsewhereMessage(`pr/${n}`, where, "checkout", !existsSync(where)),
+        };
+      }
+      // The PR head is fetched on its own, and what that means for the pr/<n>
+      // already here is decided by git-service's planPrHead — the extension's
+      // rule too. `git fetch origin pull/<n>/head:pr/<n>` was refused while
+      // pr/<n> was checked out, and after any force-push to the PR.
+      // From the remote the pull requests are read from (origin, then
+      // upstream, then the rest — resolveOwnerRepo), as the extension fetches
+      // from its ctx.remoteName: "origin" by name asked a non-GitHub mirror.
+      const remote = (await this.resolveOwnerRepo()) ? this.cachedRemoteName : undefined;
+      const fetched = await fetchPrHead(ctx.process, remote ?? "origin", n as number);
+      if ("error" in fetched) {
+        return { ok: false, changed: false, message: fetched.error };
+      }
+      const plan = await planPrHead(ctx.process, n as number, fetched.sha);
+      let op: ApplyOp;
+      switch (plan.kind) {
+        case "elsewhere":
+          // Checked out elsewhere since the look above: the same words.
+          return {
+            ok: false,
+            changed: false,
+            expected: true,
+            message: plan.worktree
+              ? checkedOutElsewhereMessage(plan.local, plan.worktree, "checkout", !existsSync(plan.worktree))
+              : l10n.t("{0} is checked out in another worktree. Switch to it there.", plan.local),
+          };
+        case "diverged":
+          // Nothing is moved over commits the PR doesn't have.
+          return {
+            ok: false,
+            changed: false,
+            expected: true,
+            message: `${divergedMessage(n as number, plan)} It was left as it is: check it out from Branches as it is, or rename or delete ${plan.local}, then Check Out again to get the pull request's version.`,
+          };
+        case "current":
+          if (plan.checkedOut) return { ok: true, changed: false };
+          op = checkoutOp(["checkout", plan.local]);
+          break;
+        case "fast-forward":
+          if (plan.checkedOut) {
+            op = { kind: "merge", target: plan.sha, args: ["merge", "--ff-only", plan.sha] };
+          } else {
+            const moved = await movePrBranch(ctx.process, plan);
+            if (moved.code !== 0) {
+              return { ok: false, changed: false, message: moved.stderr.trim() };
+            }
+            op = checkoutOp(["checkout", plan.local]);
+          }
+          break;
+        case "create":
+          op = checkoutOp(["checkout", "-b", plan.local, plan.sha]);
+          break;
+      }
+      // Through the one door for commit-applying commands (main/inTheWay.ts):
+      // a switch refused over uncommitted work in its way said which files and
+      // offered nothing — git's "would be overwritten by checkout", in red, and
+      // filed. It answers which files now, `expected`, and the renderer offers
+      // Stash & Retry.
+      const applied = await applyForDoor(ctx, op, stashFirst);
+      if ("answer" in applied) return applied.answer;
+      const c = applied.result;
+      const withNote = applied.stashNote ? { stashNote: applied.stashNote } : {};
+      return c.code === 0
+        ? { ok: true, changed: true, ...withNote }
+        : { ok: false, changed: false, message: c.stderr.trim(), ...withNote };
+    } catch (err) {
+      return { ok: false, changed: false, message: String(err) };
+    }
+  }
+
+  async prMerge(req: { number: number; method: MergeMethod }): Promise<CommitActionResult> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) {
+      return { ok: false, changed: false, message: l10n.t("Not connected to GitHub."), expected: true };
+    }
+    try {
+      await this.client.mergePull(r.owner, r.repo, req.number, req.method);
+      return { ok: true, changed: true };
+    } catch (err) {
+      return { ok: false, changed: false, ...errorFields(err) };
+    }
+  }
+
+  // A FAILED read is not an empty result, and the difference is the whole
+  // message. Swallowed, a rate limit or a dropped connection rendered "This PR
+  // has no commits yet." beside a rail reading 14 — the app stating something
+  // false with total confidence, and offering no way to retry. The renderer's
+  // errorState-with-Retry branches were already written and could never run.
+  //
+  // "Not signed in" and "no repository" ARE empty, and stay empty: nothing went
+  // wrong, there is simply nothing to fetch.
+  async prCommits(n: number): Promise<PrCommitInfo[]> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) return [];
+    return this.client.listPrCommits(r.owner, r.repo, n);
+  }
+  async prConversation(n: number): Promise<PrComment[]> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) return [];
+    return this.client.listConversation(r.owner, r.repo, n);
+  }
+  async prChecks(n: number): Promise<CheckRun[]> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) return [];
+    try {
+      const pr = await this.client.getPull(r.owner, r.repo, n);
+      return await this.client.listCheckRuns(r.owner, r.repo, pr.head.sha);
+    } catch {
+      return [];
+    }
+  }
+  async prApprove(n: number): Promise<CommitActionResult> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) return { ok: false, changed: false, message: l10n.t("Not connected to GitHub."), expected: true };
+    try {
+      await this.client.approvePull(r.owner, r.repo, n);
+      return { ok: true, changed: false };
+    } catch (err) {
+      return { ok: false, changed: false, ...errorFields(err) };
+    }
+  }
+  async issueList(): Promise<IssueInfo[]> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) {
+      return [];
+    }
+    return this.client.listOpenIssues(r.owner, r.repo);
+  }
+
+  async issueDetail(n: number): Promise<IssueInfo | undefined> {
+    const r = await this.resolveOwnerRepo();
+    if (!r || !this.token) {
+      return undefined;
+    }
+    try {
+      return await this.client.getIssue(r.owner, r.repo, n);
+    } catch {
+      return undefined;
+    }
+  }
+
+}

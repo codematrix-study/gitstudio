@@ -1,0 +1,488 @@
+{
+  "name": "merge-studio",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "version": "1.4.2",
+  "publisher": "gitstudio",
+  "license": "MIT AND Apache-2.0",
+  "icon": "media/icon.png",
+  "homepage": "https://gitstudio.dev/merge-studio",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GitStudioHQ/merge-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/GitStudioHQ/merge-studio/issues"
+  },
+  "qna": "https://github.com/GitStudioHQ/merge-studio/issues",
+  "sponsor": {
+    "url": "https://github.com/sponsors/antonarnaudov"
+  },
+  "galleryBanner": {
+    "color": "#1E222A",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://img.shields.io/open-vsx/v/gitstudio/merge-studio?label=Open%20VSX&logo=eclipseide&logoColor=white&color=C160EF",
+      "href": "https://open-vsx.org/extension/gitstudio/merge-studio",
+      "description": "Also on Open VSX — Cursor, VSCodium, Windsurf, Gitpod"
+    },
+    {
+      "url": "https://img.shields.io/github/actions/workflow/status/GitStudioHQ/merge-studio/ci.yml?branch=main&label=build&logo=githubactions&logoColor=white",
+      "href": "https://github.com/GitStudioHQ/merge-studio/actions/workflows/ci.yml",
+      "description": "CI build status"
+    },
+    {
+      "url": "https://img.shields.io/badge/license-MIT%20%2B%20Apache--2.0-44a248",
+      "href": "https://github.com/GitStudioHQ/merge-studio/blob/main/NOTICE",
+      "description": "MIT, with GitStudio's shared packages under Apache-2.0"
+    }
+  ],
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Visualization"
+  ],
+  "keywords": [
+    "merge conflict",
+    "merge conflicts",
+    "merge conflict resolver",
+    "resolve merge conflicts",
+    "conflict resolver",
+    "git conflict",
+    "rebase conflict",
+    "merge editor",
+    "merge tool",
+    "mergetool",
+    "3-way merge",
+    "three-way merge",
+    "3-way diff",
+    "diff",
+    "diff tool",
+    "compare files",
+    "git",
+    "git merge",
+    "git rebase",
+    "rebase",
+    "cherry-pick",
+    "jetbrains",
+    "intellij",
+    "webstorm",
+    "pycharm",
+    "cursor",
+    "conflicts dashboard"
+  ],
+  "l10n": "./l10n",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "pricing": "Free",
+  "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.virtualWorkspaces.description%"
+    },
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "%capabilities.untrustedWorkspaces.description%"
+    }
+  },
+  "contributes": {
+    "configuration": {
+      "title": "%config.undefined.title%",
+      "properties": {
+        "jbMerge.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "order": 1,
+          "markdownDescription": "%config.jbMerge.autoOpen.markdownDescription%"
+        },
+        "jbMerge.autoApplyNonConflicting": {
+          "type": "boolean",
+          "default": false,
+          "order": 2,
+          "description": "%config.jbMerge.autoApplyNonConflicting.description%"
+        },
+        "jbMerge.useAsDefaultDiffViewer": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "order": 3,
+          "markdownDescription": "%config.jbMerge.useAsDefaultDiffViewer.markdownDescription%"
+        }
+      }
+    },
+    "walkthroughs": [
+      {
+        "id": "mergeStudio.gettingStarted",
+        "title": "%walkthrough.mergeStudio.gettingStarted.title%",
+        "description": "%walkthrough.mergeStudio.gettingStarted.description%",
+        "steps": [
+          {
+            "id": "mergeStudio.tryMerge",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.tryMerge.title%",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.tryMerge.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/sample-merge-dark.png",
+                "light": "media/walkthrough/sample-merge-light.png",
+                "hc": "media/walkthrough/sample-merge-dark.png",
+                "hcLight": "media/walkthrough/sample-merge-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.tryMerge.altText%"
+            },
+            "completionEvents": [
+              "onCommand:jbMerge.openDemo"
+            ]
+          },
+          {
+            "id": "mergeStudio.readColours",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.readColours.title%",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.readColours.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/legend-dark.png",
+                "light": "media/walkthrough/legend-light.png",
+                "hc": "media/walkthrough/legend-dark.png",
+                "hcLight": "media/walkthrough/legend-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.readColours.altText%"
+            },
+            "completionEvents": [
+              "onStepSelected"
+            ]
+          },
+          {
+            "id": "mergeStudio.rebaseSides",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.rebaseSides.title%",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.rebaseSides.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/rebase-sides-dark.png",
+                "light": "media/walkthrough/rebase-sides-light.png",
+                "hc": "media/walkthrough/rebase-sides-dark.png",
+                "hcLight": "media/walkthrough/rebase-sides-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.rebaseSides.altText%"
+            },
+            "completionEvents": [
+              "onStepSelected"
+            ]
+          },
+          {
+            "id": "mergeStudio.realConflicts",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.realConflicts.title%",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.realConflicts.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/dashboard-dark.png",
+                "light": "media/walkthrough/dashboard-light.png",
+                "hc": "media/walkthrough/dashboard-dark.png",
+                "hcLight": "media/walkthrough/dashboard-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.realConflicts.altText%"
+            },
+            "completionEvents": [
+              "onCommand:jbMerge.showConflicts"
+            ]
+          },
+          {
+            "id": "mergeStudio.chooseEditor",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.chooseEditor.title%",
+            "when": "!jbMerge.defersToGitStudio",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.chooseEditor.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/choose-editor-dark.png",
+                "light": "media/walkthrough/choose-editor-light.png",
+                "hc": "media/walkthrough/choose-editor-dark.png",
+                "hcLight": "media/walkthrough/choose-editor-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.chooseEditor.altText%"
+            },
+            "completionEvents": [
+              "onStepSelected"
+            ]
+          },
+          {
+            "id": "mergeStudio.usingGitStudio",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.usingGitStudio.title%",
+            "when": "jbMerge.defersToGitStudio",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.usingGitStudio.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/gitstudio-dark.png",
+                "light": "media/walkthrough/gitstudio-light.png",
+                "hc": "media/walkthrough/gitstudio-dark.png",
+                "hcLight": "media/walkthrough/gitstudio-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.usingGitStudio.altText%"
+            },
+            "completionEvents": [
+              "onStepSelected"
+            ]
+          },
+          {
+            "id": "mergeStudio.tryDiff",
+            "title": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.tryDiff.title%",
+            "description": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.tryDiff.description%",
+            "media": {
+              "image": {
+                "dark": "media/walkthrough/diff-dark.png",
+                "light": "media/walkthrough/diff-light.png",
+                "hc": "media/walkthrough/diff-dark.png",
+                "hcLight": "media/walkthrough/diff-light.png"
+              },
+              "altText": "%walkthrough.mergeStudio.gettingStarted.mergeStudio.tryDiff.altText%"
+            },
+            "completionEvents": [
+              "onCommand:jbMerge.openDemoDiff"
+            ]
+          }
+        ]
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "jbMerge.mergeEditor",
+        "displayName": "%customEditor.jbMerge.mergeEditor.displayName%",
+        "selector": [
+          {
+            "filenamePattern": "*.jbmerge-merge"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "jbMerge.diffEditor",
+        "displayName": "%customEditor.jbMerge.diffEditor.displayName%",
+        "selector": [
+          {
+            "filenamePattern": "*"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "jbMerge.showConflicts",
+        "title": "%command.jbMerge.showConflicts.title%",
+        "category": "Merge Studio",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "jbMerge.resolveInMergeEditor",
+        "title": "%command.jbMerge.resolveInMergeEditor.title%",
+        "category": "Merge Studio",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "jbMerge.compare",
+        "title": "%command.jbMerge.compare.title%",
+        "category": "Merge Studio",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "jbMerge.openDiff",
+        "title": "%command.jbMerge.openDiff.title%",
+        "category": "Merge Studio",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "jbMerge.openChanges",
+        "title": "%command.jbMerge.openChanges.title%",
+        "category": "Merge Studio",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "jbMerge.stageWithTicks",
+        "title": "%command.jbMerge.stageWithTicks.title%",
+        "category": "Merge Studio",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "jbMerge.openWalkthrough",
+        "title": "%command.jbMerge.openWalkthrough.title%",
+        "category": "Merge Studio",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "jbMerge.support",
+        "title": "%command.jbMerge.support.title%",
+        "category": "Merge Studio",
+        "icon": "$(heart)"
+      },
+      {
+        "command": "jbMerge.openDemo",
+        "title": "%command.jbMerge.openDemo.title%",
+        "category": "Merge Studio"
+      },
+      {
+        "command": "jbMerge.openDemoDiff",
+        "title": "%command.jbMerge.openDemoDiff.title%",
+        "category": "Merge Studio"
+      },
+      {
+        "command": "jbMerge.operation.continue",
+        "title": "%command.jbMerge.operation.continue.title%",
+        "category": "Merge Studio",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "jbMerge.operation.skip",
+        "title": "%command.jbMerge.operation.skip.title%",
+        "category": "Merge Studio",
+        "icon": "$(debug-step-over)"
+      },
+      {
+        "command": "jbMerge.operation.abort",
+        "title": "%command.jbMerge.operation.abort.title%",
+        "category": "Merge Studio",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "jbMerge.restoreBuiltInMergeEditor",
+        "title": "%command.jbMerge.restoreBuiltInMergeEditor.title%",
+        "category": "Merge Studio",
+        "icon": "$(discard)"
+      }
+    ],
+    "menus": {
+      "scm/resourceGroup/context": [
+        {
+          "command": "jbMerge.showConflicts",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "inline"
+        },
+        {
+          "command": "jbMerge.showConflicts",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "1_modification@1"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "jbMerge.resolveInMergeEditor",
+          "when": "scmProvider == git && scmResourceGroup == merge",
+          "group": "1_modification@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "jbMerge.resolveInMergeEditor",
+          "when": "config.git.enabled && !git.missing && resource in git.mergeChanges && git.activeResourceHasMergeConflicts",
+          "group": "navigation@-2"
+        },
+        {
+          "command": "jbMerge.openChanges",
+          "when": "config.git.enabled && !git.missing && gitOpenRepositoryCount != 0 && resourceScheme == file && scmActiveResourceHasChanges && !isInDiffEditor && activeCustomEditorId != 'jbMerge.mergeEditor'",
+          "group": "navigation@-1"
+        },
+        {
+          "command": "jbMerge.stageWithTicks",
+          "when": "config.git.enabled && !git.missing && gitOpenRepositoryCount != 0 && resourceScheme == file && scmActiveResourceHasChanges && !isInDiffEditor && activeCustomEditorId != 'jbMerge.mergeEditor'",
+          "group": "navigation@9"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "jbMerge.compare",
+          "when": "resourceScheme == file && !explorerResourceIsFolder",
+          "group": "3_compare@1"
+        },
+        {
+          "command": "jbMerge.stageWithTicks",
+          "when": "config.git.enabled && !git.missing && gitOpenRepositoryCount != 0 && resourceScheme == file && !explorerResourceIsFolder",
+          "group": "3_compare@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "jbMerge.openWalkthrough"
+        },
+        {
+          "command": "jbMerge.support"
+        },
+        {
+          "command": "jbMerge.openDemo"
+        },
+        {
+          "command": "jbMerge.openDemoDiff"
+        },
+        {
+          "command": "jbMerge.showConflicts"
+        },
+        {
+          "command": "jbMerge.compare"
+        },
+        {
+          "command": "jbMerge.openDiff"
+        },
+        {
+          "command": "jbMerge.openChanges",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "jbMerge.resolveInMergeEditor",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "jbMerge.stageWithTicks",
+          "when": "gitOpenRepositoryCount != 0 && resourceScheme == file"
+        },
+        {
+          "command": "jbMerge.operation.continue",
+          "when": "gitOpenRepositoryCount != 0 && jbMerge.operationInProgress"
+        },
+        {
+          "command": "jbMerge.operation.skip",
+          "when": "gitOpenRepositoryCount != 0 && jbMerge.operationInProgress"
+        },
+        {
+          "command": "jbMerge.operation.abort",
+          "when": "gitOpenRepositoryCount != 0 && jbMerge.operationInProgress"
+        },
+        {
+          "command": "jbMerge.restoreBuiltInMergeEditor"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production",
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx --import ../../scripts/test/hermetic-git.mjs --test \"test/**/*.test.ts\" && node --import ../../scripts/test/no-network-git.mjs --test \"../../scripts/merge-studio/test/*.test.mjs\"",
+    "vscode:prepublish": "npm run package"
+  },
+  "dependencies": {
+    "@gitstudio/engine": "*",
+    "@gitstudio/git-service": "*",
+    "@gitstudio/host-bridge": "*",
+    "@gitstudio/l10n": "*",
+    "@gitstudio/merge-vscode": "*",
+    "@gitstudio/webview-ui": "*",
+    "@vscode/l10n": "^0.0.18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.42",
+    "@types/vscode": "1.78.0",
+    "@vscode/codicons": "^0.0.45",
+    "esbuild": "^0.28.1",
+    "monaco-editor": "^0.55.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

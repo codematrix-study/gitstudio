@@ -1,0 +1,140 @@
+appId: dev.gitstudio.desktop
+productName: GitStudio
+copyright: Copyright © GitStudio. Licensed under Apache-2.0.
+
+# In an npm-workspaces repo `electron` is hoisted to the root node_modules, so
+# electron-builder can't infer the version from the local package tree; pin it
+# explicitly (kept in step with the devDependency in package.json).
+electronVersion: 41.10.7
+
+# node-pty ships N-API prebuilds that already load in Electron's ABI, so DON'T
+# let electron-builder rebuild native modules from source (node-gyp needs Python
+# distutils, removed in 3.12, and the rebuild fails the whole package).
+npmRebuild: false
+
+# Only the built bundles + the page shell ship; sources stay out of the app.
+# Sourcemaps are dev-only — never ship them (they bloat the app by ~20MB and
+# leak source). A production esbuild run doesn't emit them, but exclude defensively
+# so a stale dev `.map` left in dist/ can never end up in a shipped build.
+files:
+  - dist/**
+  - "!dist/**/*.map"
+  # The MCP server ships OUTSIDE the asar (below), not twice.
+  - "!dist/mcp/**"
+  - package.json
+
+# The MCP server (apps/mcp, bundled by esbuild.js into dist/mcp) that Settings ▸
+# Agent Access installs into Claude Desktop / Cursor / VS Code / Windsurf. It
+# must be a REAL file — an MCP client launches it by path, with the app's own
+# executable as Node — so it lands in resources/mcp/, where main/mcpConfig.ts
+# resolves it. Nothing shipped it before: every build offered an Add button
+# that could not work.
+extraResources:
+  - from: dist/mcp
+    to: mcp
+    filter:
+      - "**/*"
+      - "!**/*.map"
+
+# node-pty is a native module (the integrated terminal's PTY). Its prebuilt
+# `.node` binary CANNOT load from inside the asar, so unpack it.
+asarUnpack:
+  - "**/node_modules/node-pty/**"
+
+directories:
+  output: release
+  buildResources: build
+
+# Auto-update feed (no-op until the first app-v* release publishes installers).
+publish:
+  provider: github
+  owner: GitStudioHQ
+  repo: gitstudio
+
+# Icons. Windows and Linux take build/icon.png (the full-bleed tile) and
+# electron-builder converts it per platform. macOS gets two things:
+#   - build/icon.icns — the tile on Apple's icon grid (824/1024, transparent
+#     margins), so on macOS 11–15 it sits at the size of every other Dock icon.
+#     A full-bleed PNG converted by electron-builder rendered oversized there.
+#   - build/mac/Assets.car + CFBundleIconName — the Icon Composer icon
+#     (build/AppIcon.icon, compiled by build/compile-icon.sh) that macOS 26
+#     renders itself, with the system's glass, per appearance. Without it Tahoe
+#     frames the legacy icns as a smaller "old" icon on its own backing.
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  extendInfo:
+    CFBundleIconName: AppIcon
+  extraResources:
+    - from: build/mac/Assets.car
+      to: Assets.car
+  # dmg is the human download and what the in-app updater fetches; zip is kept
+  # as a plain archive download (macOS does not use electron-updater — see
+  # src/main/autoUpdate.ts).
+  target:
+    - dmg
+    - zip
+  # Include the arch so the Apple-Silicon and Intel builds (built natively on
+  # separate runners) don't clobber each other's assets on the Release.
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+# With no Developer ID configured, electron-builder ships the bundle UNSIGNED,
+# and macOS 15+ refuses a quarantined unsigned app as "damaged" with no way
+# through. build/afterPack.js ad-hoc signs it instead, which turns that into
+# the unidentified-developer prompt with an "Open Anyway" in System Settings.
+# A real identity (CSC_LINK) replaces the ad-hoc signature in the sign step.
+afterPack: build/afterPack.js
+
+dmg:
+  title: GitStudio ${version}
+
+win:
+  target:
+    # x64 and arm64: gitstudio.dev has always offered a Windows ARM64 build and
+    # the release never produced one, so that download 404'd. The matrix builds
+    # arm64 on a windows-11-arm runner rather than cross-compiling, because
+    # node-pty (the integrated terminal) is a native module and an x64 prebuild
+    # in an arm64 app is a terminal that cannot start.
+    - target: nsis
+      arch:
+        - x64
+  # No spaces (the nsis default is "GitStudio Setup 1.0.0.exe"): GitHub asset
+  # names replace spaces with dots while electron-updater requests them with
+  # dashes — a guaranteed 404. Dashes also give the website stable download URLs.
+  artifactName: ${productName}-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  category: Development
+  # AppImage = the universal, distro-agnostic download; deb = native install for
+  # Debian/Ubuntu/Mint (the largest Linux desktop share); rpm = Fedora/RHEL;
+  # tar.gz = the portable "unpack it anywhere" option. The last two were listed
+  # on gitstudio.dev for a year and never built, so both links 404'd.
+  target:
+    - AppImage
+    - deb
+    - rpm
+    - tar.gz
+  # Pinned so the website can link GitStudio-<version>-<arch>.AppImage forever.
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  maintainer: GitStudio <hello@gitstudio.dev>
+  synopsis: A free, open-source, JetBrains-grade Git suite for your desktop.
+  # Without this, electron-builder falls back to package.json's description —
+  # an internal note about which workspace packages the app reuses, which would
+  # be what `apt show` and every Linux software centre displayed.
+  description: >-
+    GitStudio is a free, open-source Git client for people who work in Git all
+    day. Stage by hunk or by line, read history in a real commit graph, resolve
+    conflicts in a three-way merge editor, reshape history with a visual
+    interactive rebase, and manage branches, stashes, worktrees, tags and pull
+    requests without leaving the app. Optional AI assistance is off until you
+    connect a provider, and it never gates or blocks a Git operation.
+
+deb:
+  priority: optional

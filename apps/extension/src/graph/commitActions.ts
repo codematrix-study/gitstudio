@@ -1,0 +1,1322 @@
+import * as vscode from "vscode";
+import { failed, notice } from "../ui/notify";
+import type { GitContext } from "@gitstudio/git-service/index";
+import type { GraphMenuItem } from "@gitstudio/host-bridge/graphProtocol";
+import { ErrorReporter } from "../reporting/errorReporter";
+import { pausedForUser } from "../git/pausedForUser";
+import { notifyPaused } from "../git/pauseNotice";
+import { applyOrAsk, checkoutOp } from "../git/inTheWay";
+import { unresolvedConflictsMessage } from "@gitstudio/git-service/ConflictProvider";
+import { stoppedIn } from "@gitstudio/git-service/stoppedOperation";
+import { optionLikeCheckout, planRefCheckout } from "@gitstudio/git-service/checkoutRef";
+import { explainOptionLikeCheckout } from "../views/optionLikeBranch";
+import { askOverLocalBranch, isCheckedOutHere, resetBranchTo } from "../views/branchReset";
+import { saidCheckedOutElsewhere } from "../views/branchElsewhere";
+import type { UndoOptions } from "../git/repoManager";
+import { refLabel } from "@gitstudio/host-bridge/graphRefFilter";
+import { promptConfirm, promptInput, promptPick } from "../ui/dialogs";
+import { ellipsizeMiddle, resolveCheckoutTarget, type MenuRef } from "./checkoutTarget";
+import { dropBlocker, dropCommit, planDropCommit } from "@gitstudio/git-service/dropCommit";
+import { noCopyClause } from "@gitstudio/git-service/SnapshotProvider";
+import { dropOutcomeMessage, dropQuestion } from "@gitstudio/engine/rebase/drop";
+import { runRebasePlan } from "../rebase/rebaseRunner";
+import {
+  applyManyArgs,
+  manyBlocker,
+  mergesAmong,
+  orderCommits,
+  planMany,
+  rewriteMany,
+} from "@gitstudio/git-service/multiCommit";
+import {
+  applyManyMessage,
+  dropManyQuestion,
+  manyOutcomeMessage,
+  rewordOutcomeMessage,
+  rewordQuestion,
+  squashCarryQuestion,
+  squashQuestion,
+} from "@gitstudio/engine/rebase/many";
+import * as l10n from "@vscode/l10n";
+
+/** The commit actions as plain items for the IN-GRAPH popover (no vscode types
+ * / codicon markup) — the webview renders these; ids match runCommitAction.
+ *
+ * `drop` offers "Drop Commit…" (issue #32) and `reword` "Edit Message…" (issue
+ * #75). Only the caller knows whether this commit CAN be rewritten — see
+ * commitMenuItemsFor — and each item is left out where it cannot, the way the
+ * per-ref items leave out the branch you are on. */
+export function commitMenuItems(opts: { drop?: boolean; reword?: boolean } = {}): GraphMenuItem[] {
+  return [
+    { id: "checkout", label: l10n.t("Checkout Commit"), icon: "git-commit" },
+    // Detaching stays a FIRST-CLASS action. "Checkout Commit" prefers the
+    // branch a commit sits on (see checkout()), which is right for the common
+    // case but silently removed the ability to detach at a commit that has one
+    // — the old behaviour, and the whole point of checking a commit out for
+    // some workflows. Making it a separate item keeps both reachable.
+    { id: "detach", label: l10n.t("Detach HEAD Here…"), icon: "git-commit" },
+    { id: "branch", label: l10n.t("Create Branch Here…"), icon: "git-branch" },
+    { id: "tag", label: l10n.t("Create Tag Here…"), icon: "tag" },
+    { id: "cherryPick", label: l10n.t("Cherry-Pick Commit"), icon: "git-pull-request" },
+    { id: "revert", label: l10n.t("Revert Commit"), icon: "history" },
+    ...(opts.reword ? [{ id: "reword", label: l10n.t("Edit Message…"), icon: "edit" }] : []),
+    ...(opts.drop ? [{ id: "drop", label: l10n.t("Drop Commit…"), icon: "trash", danger: true }] : []),
+    { id: "reset", label: l10n.t("Reset Current Branch to Here…"), icon: "discard", danger: true },
+    { id: "interactiveRebase", label: l10n.t("Start Interactive Rebase Here…"), icon: "git-merge" },
+    { id: "", label: "", sep: true },
+    // With a branch, a tag or another commit (issue #123) — the graph host
+    // asks which and opens the Compare panel; see COMPARE_WITH.
+    { id: COMPARE_WITH, label: l10n.t("Compare With…"), icon: "git-compare" },
+    { id: "copySha", label: l10n.t("Copy SHA"), icon: "copy" },
+    { id: "copyMessage", label: l10n.t("Copy Message"), icon: "copy" },
+  ];
+}
+
+/**
+ * "Compare With…": not a runCommitAction arm. It changes nothing in the
+ * repository and opens a panel, which only the graph host can (it owns the
+ * RepoManager and the extension's URI) — like Start Interactive Rebase Here.
+ */
+export const COMPARE_WITH = "compareWith";
+
+/**
+ * The commit menu for `sha`, asking git whether it can be dropped.
+ *
+ * Drop Commit is offered only where it can work: a commit on HEAD's
+ * first-parent line, not a merge, not below one, and not the branch's only
+ * commit (git-service/dropCommit.ts). Everything else leaves the item out
+ * rather than offering a click that can only be refused. A read that fails is
+ * "cannot drop", never a menu that fails to open.
+ */
+export async function commitMenuItemsFor(ctx: GitContext, sha: string): Promise<GraphMenuItem[]> {
+  const [drop, reword] = await Promise.all([
+    planDropCommit(ctx.process, sha).catch(() => undefined),
+    planMany(ctx.process, "reword", [sha]).catch(() => undefined),
+  ]);
+  return commitMenuItems({ drop: drop?.ok === true, reword: reword?.ok === true });
+}
+
+/** Namespace for the per-ref items, so they cannot collide with a commit id. */
+const REF_ACTION = "ref:";
+
+/**
+ * The id `runCommitAction` checks a ref out under — what a "Checkout <ref>"
+ * item posts back, and what the chip's own menu asks for (issue #30), so
+ * both doors run the same arm with the same questions.
+ *
+ * It carries the FULL name, never the chip's short one. `%(refname:short)`
+ * is only shortest-unambiguous: with a tag and a branch both called
+ * "release" the branch is "heads/release", and `git checkout heads/release`
+ * detached HEAD at the branch tip under a toast saying it had switched. The
+ * namespace in the full name is also what tells the arm how to check it out.
+ */
+export function refActionId(fullName: string): string {
+  return `${REF_ACTION}${fullName}`;
+}
+
+/**
+ * "Checkout <branch>" entries for the refs sitting on a commit, shown above the
+ * commit actions.
+ *
+ * The menu used to be purely commit-scoped, so right-clicking a row whose tip is
+ * `main` offered only "Checkout Commit" — which detaches HEAD. Landing on a
+ * detached HEAD when you meant "switch to main" is the wrong outcome, and the
+ * branch name was right there on the row.
+ *
+ * Built host-side from the refs the panel already holds rather than from the
+ * clicked chip, which is deliberate: a row's local branch and its remote twin
+ * render as ONE chip, and any ref that does not fit the column is folded into a
+ * "+N" pill, so a chip-driven menu could never reach either. The full name
+ * rides in the id, so this needs no protocol change.
+ */
+export function refMenuItems(refs: readonly MenuRef[]): GraphMenuItem[] {
+  // Labelled by the full name shorn (refLabel) — "Checkout release", never
+  // git's "heads/release" beside a tag of that name, as the chips say it.
+  const items: GraphMenuItem[] = [];
+  for (const ref of refs) {
+    // Already on it — offering to switch to where you are is noise.
+    if (ref.kind === "currentHead") {
+      continue;
+    }
+    if (ref.kind === "head") {
+      items.push({
+        id: refActionId(ref.fullName),
+        label: l10n.t("Checkout {0}", refLabel(ref.fullName)),
+        icon: "git-branch",
+      });
+    } else if (ref.kind === "remoteHead") {
+      // No ellipsis: as of 1.6.0 this acts immediately, landing you on a local
+      // branch that tracks the remote one. It used to open a rename prompt and
+      // was labelled "…" accordingly; leaving the ellipsis behind would promise
+      // a dialog that no longer exists, which is exactly the thing an ellipsis
+      // is for. The tag arm below keeps its ellipsis because it still asks.
+      items.push({
+        id: refActionId(ref.fullName),
+        label: l10n.t("Checkout {0}", refLabel(ref.fullName)),
+        icon: "cloud",
+      });
+    } else {
+      // Ellipsis: checking out a tag confirms first, because it detaches HEAD.
+      items.push({
+        id: refActionId(ref.fullName),
+        label: l10n.t("Checkout {0}…", refLabel(ref.fullName)),
+        icon: "tag",
+      });
+    }
+  }
+  if (items.length) {
+    items.push({ id: "", label: "", sep: true });
+  }
+  return items;
+}
+
+/**
+ * The commit-graph context-menu actions. Each runs a real git command via the
+ * GitContext process pool, confirms destructive operations clearly, and surfaces
+ * git's stderr on failure. Returns true when the repo state likely changed
+ * (so the caller can refresh the graph).
+ *
+ * The universal Undo envelope (M8) wraps the destructive actions: callers pass
+ * an `undo` runner that snapshots the repo before the op and records an entry
+ * for one-keystroke reversal (with a pushed-history → Revert safeguard). The
+ * non-destructive actions (branch, tag, copy) run unwrapped.
+ */
+
+interface CommitContext {
+  /** Full sha of the targeted commit. */
+  readonly sha: string;
+  /** Commit subject, for friendlier prompts/messages. */
+  readonly subject: string;
+  /**
+   * The refs sitting on this commit, when the caller knows them. Checkout uses
+   * them to land you on a BRANCH rather than a detached HEAD — see checkout().
+   */
+  readonly refs?: readonly MenuRef[];
+}
+
+/**
+ * Wraps a destructive op so the Undo envelope can snapshot before / record
+ * after. When no runner is supplied the op runs directly (so existing tests and
+ * any caller without an UndoLedger keep working).
+ */
+export type UndoRunner = <T>(label: string, fn: () => Promise<T>, opts?: UndoOptions) => Promise<T>;
+
+function withUndo<T>(
+  undo: UndoRunner | undefined,
+  label: string,
+  fn: () => Promise<T>,
+  opts?: UndoOptions,
+): Promise<T> {
+  return undo ? undo(label, fn, opts) : fn();
+}
+
+export interface CommitActionItem extends vscode.QuickPickItem {
+  id: string;
+}
+
+/** The action menu, in the order GitLens presents them. */
+export function commitActionItems(): CommitActionItem[] {
+  return [
+    { id: "checkout", label: l10n.t("$(git-commit) Checkout Commit") },
+    { id: "detach", label: l10n.t("$(git-commit) Detach HEAD Here…") },
+    { id: "branch", label: l10n.t("$(git-branch) Create Branch Here…") },
+    { id: "tag", label: l10n.t("$(tag) Create Tag Here…") },
+    { id: "cherryPick", label: l10n.t("$(git-pull-request) Cherry-Pick Commit") },
+    { id: "revert", label: l10n.t("$(history) Revert Commit") },
+    {
+      id: "reset",
+      label: l10n.t("$(discard) Reset Current Branch to Here…"),
+    },
+    {
+      id: "interactiveRebase",
+      label: l10n.t("$(git-merge) Start Interactive Rebase Here…"),
+    },
+    { id: "", label: "", kind: vscode.QuickPickItemKind.Separator },
+    { id: "copySha", label: l10n.t("$(copy) Copy SHA") },
+    { id: "copyMessage", label: l10n.t("$(copy) Copy Message") },
+  ];
+}
+
+/**
+ * Runs the chosen action. `ctx` is the active repo's GitContext; `commit`
+ * carries the target sha + subject. Returns true if the graph should refresh.
+ */
+export async function runCommitAction(
+  id: string,
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  switch (id) {
+    case "checkout":
+      return checkout(ctx, commit, undo);
+    case "detach":
+      return detachHere(ctx, commit, undo);
+    case "branch":
+      return createBranch(ctx, commit);
+    case "tag":
+      return createTag(ctx, commit);
+    case "cherryPick":
+      return cherryPick(ctx, commit, undo);
+    case "revert":
+      return revert(ctx, commit, undo);
+    case "drop":
+      return dropCommitHere(ctx, commit, undo);
+    case "reword":
+      return rewordHere(ctx, commit.sha, undo);
+    case "reset":
+      return resetTo(ctx, commit, undo);
+    case "copySha":
+      await vscode.env.clipboard.writeText(commit.sha);
+      flash(l10n.t("Copied {0}", short(commit.sha)));
+      return false;
+    case "copyMessage":
+      await vscode.env.clipboard.writeText(commit.subject);
+      flash(l10n.t("Copied commit message"));
+      return false;
+    default:
+      // The per-ref checkout items carry their ref's FULL name in the id.
+      if (id.startsWith(REF_ACTION)) {
+        return checkoutRef(id.slice(REF_ACTION.length), ctx, undo);
+      }
+      return false;
+  }
+}
+
+// ── Individual actions ───────────────────────────────────────────────────────
+
+/**
+ * Check out one of the refs on the row, by its FULL name. The namespace says
+ * how: a branch by its name under refs/heads/ (git looks that namespace up
+ * first, so a tag of the same name is only a warning), a remote-tracking
+ * branch straight onto a local one — no name prompt, "Checkout origin/x" does
+ * what it says, the same as clicking a local branch does — and a tag by its
+ * full name, which detaches, so it asks first. The plan is git-service's, so
+ * the desktop's graph menu means the same thing.
+ *
+ * The tag question mirrors the Branches view (views/branchActions.ts), so the
+ * same operation asks the same question wherever you start it.
+ */
+async function checkoutRef(
+  fullName: string,
+  ctx: GitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  // A branch whose name starts with "-" is refused by the planner — git
+  // would read it as an option — and this arm used to return in SILENCE,
+  // from both the row's menu and the chip's. Say why, and offer the rename.
+  const refusal = optionLikeCheckout(fullName);
+  if (refusal) {
+    return explainOptionLikeCheckout(ctx, refusal, fullName, () => undefined);
+  }
+  const plan = await planRefCheckout(ctx.process, fullName);
+  if (!plan) {
+    return false;
+  }
+  // The branch it lands on is checked out in another worktree: git refuses,
+  // and its words went down the path that files crash reports. Said first.
+  if (await saidCheckedOutElsewhere(ctx, plan.branch, "checkout")) {
+    return false;
+  }
+  // A remote branch whose local branch has commits of its own: switch to
+  // the local one, or reset it to the remote's first (#32) — the same
+  // question the branch menu's Remote group asks (branchActions).
+  if (fullName.startsWith("refs/remotes/")) {
+    const over = await askOverLocalBranch(ctx, fullName);
+    if (over.choice === "cancel") {
+      return false;
+    }
+    if (over.choice === "reset") {
+      if (!(await resetBranchTo(ctx, over.localFullName, fullName, undo))) {
+        return false;
+      }
+      if (await isCheckedOutHere(ctx, over.localFullName)) {
+        return true;
+      }
+      // The switch is not an Undo entry of its own: undoing a checkout by
+      // resetting HEAD would move the branch just reset. The reset's entry
+      // undoes it where it stands (`reset --keep` on the checked-out branch).
+      return runCheckout(ctx, plan.args, plan.success, l10n.t("Checkout"));
+    }
+  }
+  if (plan.detaches) {
+    const ok = await promptConfirm({
+      title: l10n.t("Check out tag {0}?", fullName.replace(/^refs\/tags\//, "")),
+      message:
+        l10n.t("A tag is a fixed point, so you'll be on a detached HEAD — not on any branch. Commits made here belong to nothing until you create a branch for them."),
+      confirmLabel: l10n.t("Checkout"),
+    });
+    if (!ok) {
+      return false;
+    }
+  }
+  return withUndo(undo, plan.undoLabel, () =>
+    runCheckout(ctx, plan.args, plan.success, l10n.t("Checkout")),
+  );
+}
+
+/**
+ * Check out a commit — as a BRANCH whenever this commit is one.
+ *
+ * Checking out the tip of `main` by sha lands you on a detached HEAD at a
+ * commit that git would happily have called `main`. It is technically what was
+ * asked for and almost never what was meant: the next commit belongs to no
+ * branch, and the UI has to start explaining detached HEAD for a click that
+ * looked routine. So when the commit carries local branches:
+ *
+ *  - exactly one, and it is not already current → switch to it, no warning
+ *    needed, because nothing surprising happens;
+ *  - more than one → ask WHICH, since the sha alone cannot say;
+ *  - already the current branch → say so instead of re-running a no-op.
+ *
+ * Detaching stays available in the "more than one" picker and remains the
+ * behaviour for a commit with no local branch on it, which is the only case
+ * where detaching is what the user actually asked for.
+ */
+async function checkout(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  const target = resolveCheckoutTarget(commit.refs);
+
+  if (target.kind === "already") {
+    flash(l10n.t("Already on {0}", target.name));
+    return false;
+  }
+
+  // ONE short dialog that offers both outcomes, rather than a wall of prose
+  // asking yes/no to just one of them. The previous version named the branch
+  // twice — once in the title, once in the body — which on a long ref filled
+  // the dialog with the same string wrapped over six lines and still did not
+  // let you pick the other option.
+  if (target.kind === "branch" || target.kind === "choose") {
+    const branches = target.kind === "branch" ? [target.name] : target.branches;
+    const picked = await promptPick({
+      title: l10n.t("Check out {0}", short(commit.sha)),
+      choices: [
+        ...branches.map((name) => ({
+          id: name,
+          label: l10n.t("Switch to {0}", ellipsizeMiddle(name)),
+          icon: "git-branch",
+        })),
+        {
+          id: DETACH_CHOICE,
+          label: l10n.t("Detach HEAD here"),
+          icon: "git-commit",
+          description: l10n.t("Not on any branch"),
+        },
+      ],
+    });
+    if (!picked) {
+      return false;
+    }
+    if (picked === DETACH_CHOICE) {
+      return detachAt(ctx, commit, undo);
+    }
+    // Choosing a name IS the confirmation — do not ask twice. The switch goes
+    // through the ref arm, by the branch's FULL name, never `git checkout
+    // <picked>` bare: a branch called "-f" (update-ref and a fetch make one;
+    // porcelain never would) made that `git checkout -f`, which threw away
+    // every uncommitted change, stayed put, and toasted "Switched to -f". The
+    // arm refuses an option-like name, says why and offers the rename, and
+    // plans every other branch exactly as this did (`git checkout <name>`).
+    const fullName = commit.refs?.find(
+      (r) => r.kind === "head" && r.fullName === `refs/heads/${picked}`,
+    )?.fullName;
+    if (!fullName) {
+      void vscode.window.showErrorMessage(
+        l10n.t("GitStudio: {0} is not a branch on this commit any more — refresh and try again.", picked),
+      );
+      return false;
+    }
+    return checkoutRef(fullName, ctx, undo);
+  }
+
+  return detachHere(ctx, commit, undo);
+}
+
+/**
+ * Sentinel for the "detach" row, safe to sit in the same id space as ref names:
+ * git forbids ".." anywhere in a ref name, and unlike a NUL it survives JSON and
+ * a DOM attribute without surprises.
+ */
+const DETACH_CHOICE = "..detach";
+
+/** Detach HEAD at this commit, confirming first. Its own menu action. */
+async function detachHere(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  const ok = await promptConfirm({
+    title: l10n.t("Check out {0}?", short(commit.sha)),
+    message:
+      l10n.t("You'll be on a detached HEAD — not on any branch. Commits made here belong to nothing until you create a branch for them."),
+    confirmLabel: l10n.t("Checkout"),
+  });
+  if (!ok) {
+    return false;
+  }
+  return detachAt(ctx, commit, undo);
+}
+
+/**
+ * Explicitly `--detach`. The bare `git checkout <sha>` this used to run detaches
+ * too, but only because a sha is not a branch name — say it outright so the
+ * command cannot be re-read as an ordinary checkout.
+ */
+function detachAt(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  return withUndo(undo, l10n.t("Checkout {0}", short(commit.sha)), () =>
+    runCheckout(ctx, ["checkout", "--detach", commit.sha], l10n.t("Checked out"), l10n.t("Checkout")),
+  );
+}
+
+async function createBranch(
+  ctx: GitContext,
+  commit: CommitContext,
+): Promise<boolean> {
+  const name = await promptInput({
+    title: l10n.t("Create branch at {0}", short(commit.sha)),
+    hint: l10n.t("{0} — the branch starts here. You stay on the current branch.", commit.subject),
+    placeholder: "feature/my-branch",
+    confirmLabel: l10n.t("Create Branch"),
+    validate: "refName",
+  });
+  if (!name) {
+    return false;
+  }
+  return runGit(ctx, ["branch", name, commit.sha], l10n.t("Created branch {0}", name), l10n.t("Create branch"));
+}
+
+async function createTag(
+  ctx: GitContext,
+  commit: CommitContext,
+): Promise<boolean> {
+  const name = await promptInput({
+    title: l10n.t("Create tag at {0}", short(commit.sha)),
+    hint: l10n.t("{0} — the tag stays local until you push it.", commit.subject),
+    placeholder: "v1.0.0",
+    confirmLabel: l10n.t("Create Tag"),
+    validate: "refName",
+  });
+  if (!name) {
+    return false;
+  }
+  return runGit(ctx, ["tag", name, commit.sha], l10n.t("Created tag {0}", name), l10n.t("Create tag"));
+}
+
+async function cherryPick(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  return withUndo(undo, l10n.t("Cherry-pick {0}", short(commit.sha)), async () => {
+    // Through the one door every commit-applying action shares: uncommitted
+    // work in the pick's way is said, with Stash & Retry, and never filed.
+    const applied = await applyOrAsk(ctx, {
+      kind: "cherry-pick",
+      commit: commit.sha,
+      args: ["cherry-pick", commit.sha],
+    });
+    if (applied.cancelled || applied.settled) {
+      return !applied.cancelled;
+    }
+    const result = applied.result;
+    if (result.code === 0) {
+      flash(l10n.t("Cherry-picked {0}", short(commit.sha)));
+      return true;
+    }
+    const stderr = result.stderr.trim();
+    // Paused, not failed. Git leaves CHERRY_PICK_HEAD behind whenever it stops
+    // to ask you something — a conflict, or a pick that turned out to be empty
+    // because the change is already on this branch.
+    //
+    // Matching git's English prose is what got this wrong: a user on a Russian
+    // locale hit the empty-pick case, the /conflict/i test did not fire, and a
+    // routine "this is already applied" was shown as a failure AND filed as a
+    // crash report. The marker file says the same thing in every language.
+    if (await pausedForUser(ctx.process, result.code, "CHERRY_PICK_HEAD")) {
+      notifyPaused(
+        l10n.t("Cherry-pick of {0} needs a decision — resolve any ", short(commit.sha)) +
+          l10n.t("conflicts and continue, skip this commit, or abort."),
+      );
+      return true;
+    }
+    await showGitError(ctx, l10n.t("Cherry-pick"), stderr, "Cherry-pick failed");
+    return true;
+  });
+}
+
+/**
+ * Reverting a MERGE needs to know which side to keep.
+ *
+ * A merge has two parents, so "undo this commit" is ambiguous — git refuses with
+ * *"commit X is a merge but no -m option was given"* and stops. We used to hand
+ * that sentence straight to the user, which reads as a defect in GitStudio and
+ * offers nothing to do about it.
+ *
+ * Ask instead. `-m 1` keeps the branch the merge was made ON — the common intent
+ * ("undo this merge, put my branch back") — and `-m 2` keeps the branch that was
+ * merged in. Returns the mainline number, `undefined` for an ordinary commit, or
+ * `null` if the user cancelled.
+ */
+async function mainlineFor(
+  ctx: GitContext,
+  commit: CommitContext,
+): Promise<number | undefined | null> {
+  const r = await ctx.process.run(["rev-list", "--parents", "-n", "1", commit.sha]);
+  if (r.code !== 0) {
+    return undefined; // let the revert itself report the real problem
+  }
+  const parents = r.stdout.trim().split(/\s+/).slice(1);
+  if (parents.length < 2) {
+    return undefined;
+  }
+
+  const describe = async (sha: string): Promise<string> => {
+    const s = await ctx.process.run(["log", "-1", "--format=%s", sha]);
+    return s.code === 0 ? s.stdout.trim() : "";
+  };
+  const subjects = await Promise.all(parents.map(describe));
+
+  // Every parent, not just the first two — an octopus merge has three or more,
+  // and offering a subset would silently make the others unrevertable.
+  const pair = parents.length === 2;
+  const chosen = await promptPick({
+    title: l10n.t("Revert the merge {0}", short(commit.sha)),
+    hint: pair
+      ? l10n.t("A merge has two sides, so git needs to know which one to keep.")
+      : l10n.t("This merge has {0} parents. Which one should be kept as the mainline?", parents.length),
+    choices: parents.map((sha, i) => ({
+      id: String(i + 1),
+      label: pair
+        ? i === 0
+          ? l10n.t("Keep the branch this was merged into")
+          : l10n.t("Keep the branch that was merged in")
+        : l10n.t("Keep parent {0}", i + 1),
+      icon: i === 0 ? "git-branch" : "git-merge",
+      detail: short(sha),
+      description:
+        subjects[i] || (i === 0 ? l10n.t("The first parent — usually what you want.") : ""),
+    })),
+  });
+  if (!chosen) {
+    return null;
+  }
+  const picked = Number(chosen);
+  // git counts parents from 1. An id outside that range cannot happen — they are
+  // generated just above — but falling back to 1 would silently revert against
+  // the WRONG parent, so treat it as a cancel instead.
+  return Number.isInteger(picked) && picked >= 1 && picked <= parents.length ? picked : null;
+}
+
+async function revert(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  const mainline = await mainlineFor(ctx, commit);
+  if (mainline === null) {
+    return false;
+  }
+  return withUndo(undo, l10n.t("Revert {0}", short(commit.sha)), async () => {
+    const args = ["revert", "--no-edit"];
+    if (mainline !== undefined) {
+      args.push("-m", String(mainline));
+    }
+    args.push(commit.sha);
+    // Report #18: a revert over an edit to a file it touches was filed as a
+    // crash with git's "would be overwritten by merge" text. The shared door
+    // says which changes are in the way and offers Stash & Retry instead.
+    const applied = await applyOrAsk(ctx, { kind: "revert", commit: commit.sha, mainline, args });
+    if (applied.cancelled || applied.settled) {
+      return !applied.cancelled;
+    }
+    const result = applied.result;
+    if (result.code === 0) {
+      flash(l10n.t("Reverted {0}", short(commit.sha)));
+      return true;
+    }
+    const stderr = result.stderr.trim();
+    // Same locale-independent test as cherryPick: REVERT_HEAD means git stopped
+    // to ask, not that the revert failed.
+    if (await pausedForUser(ctx.process, result.code, "REVERT_HEAD")) {
+      notifyPaused(
+        l10n.t("Revert of {0} needs a decision — resolve any ", short(commit.sha)) +
+          l10n.t("conflicts and continue, or abort the revert."),
+      );
+      return true;
+    }
+    // Nothing left to undo. Reverting an already-reverted change exits non-zero
+    // with an EMPTY stderr — git puts "nothing to commit, working tree clean" on
+    // stdout — so reading stderr alone produced a modal saying only "Revert
+    // failed", with no reason, for a case where git did exactly the right thing.
+    // Reverting a merge twice is an easy thing to do now that it works at all.
+    if (!stderr) {
+      void vscode.window.showInformationMessage(
+        notice(l10n.t("Nothing to revert — {0} is already undone on this branch.", short(commit.sha))),
+      );
+      return true;
+    }
+    await showGitError(ctx, l10n.t("Revert"), stderr, "Revert failed");
+    return true;
+  });
+}
+
+async function resetTo(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  // Three named outcomes with real consequences — a dialog, not the search bar.
+  const chosen = await promptPick({
+    title: l10n.t("Reset current branch to {0}", short(commit.sha)),
+    hint: commit.subject,
+    choices: [
+      {
+        id: "--soft",
+        label: l10n.t("Soft"),
+        icon: "history",
+        detail: "--soft",
+        description: l10n.t("Move the branch. Keep your working tree AND everything staged."),
+      },
+      {
+        id: "--mixed",
+        label: l10n.t("Mixed"),
+        icon: "list-flat",
+        detail: "--mixed",
+        description: l10n.t("Move the branch, keep the working tree, unstage everything. Git's default."),
+      },
+      {
+        id: "--hard",
+        label: l10n.t("Hard"),
+        icon: "trash",
+        detail: "--hard",
+        danger: true,
+        description: l10n.t("Move the branch and DISCARD every working-tree and staged change."),
+      },
+    ],
+  });
+  if (!chosen) {
+    return false;
+  }
+  const mode = { value: chosen };
+
+  if (mode.value === "--hard") {
+    // A second gate, because this is the one reset that destroys work git has
+    // never seen — the reflog can restore the commits, but not your edits.
+    // GitStudio's Undo can: its snapshot (`stash create`) holds them, and
+    // undoing the reset puts them back with the branch. But git won't copy an
+    // index with a conflict in progress — exactly when a hard reset is most
+    // often reached for — and then Undo can put the branch back and nothing
+    // more. Asked of git before the question, so the question is true.
+    const discards = l10n.t("Hard-resetting to {0} throws away every uncommitted edit in the working tree and the index.", short(commit.sha));
+    const noCopy = undo ? await ctx.snapshot.whyNoCopy().catch(() => "other" as const) : undefined;
+    const ok = await promptConfirm({
+      title: l10n.t("Discard all uncommitted changes?"),
+      message: !undo
+        ? l10n.t("{0} git keeps no copy of them, so nothing can bring them back.", discards)
+        : noCopy
+          ? l10n.t("{0} git can't keep a copy of them {1}, so GitStudio's Undo can put the branch back, but not those edits.", discards, noCopyClause(noCopy, "now"))
+          : l10n.t("{0} GitStudio's Undo can put the branch back and bring those edits back with it — git itself keeps no copy of them.", discards),
+      confirmLabel: l10n.t("Reset --hard"),
+      danger: true,
+    });
+    if (!ok) {
+      return false;
+    }
+  }
+  return withUndo(undo, l10n.t("Reset to {0} ({1})", short(commit.sha), mode.value), () =>
+    runGit(
+      ctx,
+      ["reset", mode.value, commit.sha],
+      l10n.t("Reset to {0}", short(commit.sha)),
+      l10n.t("Reset"),
+    ),
+  );
+}
+
+/**
+ * Drop Commit (issue #32): take this commit out of the current branch and
+ * replay the ones after it.
+ *
+ * The drag-to-reorder pipeline with one row set to `drop` — the plan, the
+ * todo and the run are git-service's (dropCommit.ts), shared with the desktop
+ * — under the same Undo envelope reorder runs in. What this door adds is the
+ * asking: refusals first (an operation in progress, uncommitted changes), so
+ * nobody agrees to a rewrite that is then refused; then one question that says
+ * which commit, how many later commits are replayed, and whether it is already
+ * pushed; and, when other branches point at the replayed commits, whether they
+ * come along — the reorder's own question.
+ */
+async function dropCommitHere(
+  ctx: GitContext,
+  commit: CommitContext,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  // Re-read, never trust the menu: it may have been open while history moved.
+  const plan = await planDropCommit(ctx.process, commit.sha);
+  if (!plan.ok) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", plan.message));
+    return false;
+  }
+  const blocked = await dropBlocker(ctx.process);
+  if (blocked) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", blocked));
+    return false;
+  }
+
+  const question = dropQuestion(plan);
+  let carry = false;
+  if (plan.carryable.length > 0) {
+    // The question names the branches; the choice IS the confirmation.
+    const picked = await promptPick({
+      title: question.title,
+      hint: question.message,
+      choices: [
+        {
+          id: "carry",
+          label: l10n.t("Drop and move those branches"),
+          icon: "git-branch",
+          description: l10n.t("They follow onto the replayed commits."),
+          danger: true,
+        },
+        {
+          id: "only",
+          label: l10n.t("Drop from this branch only"),
+          icon: "git-commit",
+          description: l10n.t("They keep pointing at the commits as they are now."),
+          danger: true,
+        },
+        { id: "no", label: l10n.t("Cancel"), icon: "close" },
+      ],
+    });
+    if (picked !== "carry" && picked !== "only") {
+      return false;
+    }
+    carry = picked === "carry";
+  } else {
+    const ok = await promptConfirm({
+      title: question.title,
+      message: question.message,
+      confirmLabel: l10n.t("Drop Commit"),
+      danger: true,
+    });
+    if (!ok) {
+      return false;
+    }
+  }
+
+  const outcome = await withUndo(
+    undo,
+    l10n.t("Drop {0}", plan.shortSha),
+    async () => {
+      const out = await dropCommit(
+        ctx.process,
+        { sha: plan.sha, head: plan.head, carry },
+        (p) => runRebasePlan(ctx.process.cwd, p),
+      );
+      // A drop that failed changed nothing — every refusal comes before git
+      // writes, and a failed rebase ends where it began — so there is nothing
+      // for Undo to offer. `cancelled` is how the ledger is told exactly that.
+      return out.status === "failed" ? { ...out, cancelled: true as const } : out;
+    },
+  );
+
+  const text = dropOutcomeMessage(plan.shortSha, outcome);
+  if (outcome.status === "done") {
+    flash(text);
+    return true;
+  }
+  if (outcome.status === "stopped") {
+    // The rebase is left open and the conflict flow takes it from here: the
+    // notice's Resolve Conflicts… opens the dashboard, and the Changes view's
+    // banner offers Continue, Skip and Abort.
+    notifyPaused(l10n.t("GitStudio: {0}", text));
+    return true;
+  }
+  if (outcome.expected) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", text));
+  } else {
+    void vscode.window.showErrorMessage(l10n.t("GitStudio: {0}", text));
+  }
+  return false;
+}
+
+// ── Several commits at once (issue #32) ──────────────────────────────────────
+
+/** What the several-commit menu can offer, as decided by git (see …For). */
+export interface ManyMenuOptions {
+  /** Cherry-Pick / Revert: no merge among them. */
+  apply: boolean;
+  /** Drop N: all on the current branch's rewritable line. */
+  drop: boolean;
+  /** Squash N: that, and contiguous on it. */
+  squash: boolean;
+}
+
+/**
+ * The menu for a selection of several commits — the graph's and the Commits
+ * list's right-click, and the "N commits selected" summary's buttons. Items
+ * that cannot apply are left out, as the one-commit menu leaves out Drop.
+ */
+export function multiCommitMenuItems(n: number, opts: ManyMenuOptions): GraphMenuItem[] {
+  const acts: GraphMenuItem[] = [
+    ...(opts.apply
+      ? [
+          { id: "cherryPickMany", label: l10n.t("Cherry-Pick {0} Commits", n), icon: "git-pull-request" },
+          { id: "revertMany", label: l10n.t("Revert {0} Commits", n), icon: "history" },
+        ]
+      : []),
+    ...(opts.squash ? [{ id: "squashMany", label: l10n.t("Squash {0} Commits…", n), icon: "fold-down" }] : []),
+    ...(opts.drop ? [{ id: "dropMany", label: l10n.t("Drop {0} Commits…", n), icon: "trash", danger: true }] : []),
+  ];
+  return [
+    ...acts,
+    // Between the two groups only: with none of the actions above (a merge
+    // among them) the menu opened on a divider right under its title.
+    ...(acts.length > 0 ? [{ id: "", label: "", sep: true }] : []),
+    ...(n === 2 ? [{ id: "compareTwo", label: l10n.t("Compare These Two Commits"), icon: "git-compare" }] : []),
+    { id: "copyShas", label: l10n.t("Copy SHAs"), icon: "copy" },
+  ];
+}
+
+/**
+ * The several-commit menu for `shas`, asking git what applies. A read that
+ * fails leaves that item out — never a menu that fails to open.
+ */
+export async function multiCommitMenuItemsFor(ctx: GitContext, shas: readonly string[]): Promise<GraphMenuItem[]> {
+  const [merges, drop, squash] = await Promise.all([
+    mergesAmong(ctx.process, shas).catch(() => undefined),
+    planMany(ctx.process, "drop", shas).catch(() => undefined),
+    planMany(ctx.process, "squash", shas).catch(() => undefined),
+  ]);
+  return multiCommitMenuItems(shas.length, {
+    apply: merges !== undefined && merges.length === 0,
+    drop: drop?.ok === true,
+    squash: squash?.ok === true,
+  });
+}
+
+/** What a several-commit action needs from the panel it runs in. */
+export interface ManyActionHost {
+  /** Open the compare view: what `head` has that `base` does not. */
+  compare(base: string, head: string): Promise<void>;
+}
+
+/**
+ * Run an item of the several-commit menu. `shas` are newest first, as the
+ * list showed them; nothing about their order is trusted — git is asked.
+ * Returns true when the graph should refresh.
+ */
+export async function runMultiCommitAction(
+  id: string,
+  ctx: GitContext,
+  shas: readonly string[],
+  host: ManyActionHost,
+  undo?: UndoRunner,
+): Promise<boolean> {
+  switch (id) {
+    case "cherryPickMany":
+      return applyMany("cherry-pick", ctx, shas, undo);
+    case "revertMany":
+      return applyMany("revert", ctx, shas, undo);
+    case "dropMany":
+      return rewriteManyHere("drop", ctx, shas, undo);
+    case "squashMany":
+      return rewriteManyHere("squash", ctx, shas, undo);
+    case "compareTwo": {
+      const ordered = shas.length === 2 ? await orderCommits(ctx.process, shas, "oldest-first") : undefined;
+      if (!ordered) {
+        void vscode.window.showWarningMessage(l10n.t("GitStudio: select exactly two commits to compare them."));
+        return false;
+      }
+      await host.compare(ordered[0], ordered[1]);
+      return false;
+    }
+    case "copyShas":
+      await vscode.env.clipboard.writeText(shas.join("\n"));
+      flash(l10n.t("Copied {0} SHAs", shas.length));
+      return false;
+    default:
+      return false;
+  }
+}
+
+/** The warning for a menu that went stale before its item was chosen. */
+const MANY_UNREADABLE = l10n.t("those commits could not be read any more — refresh the graph and try again.");
+
+/**
+ * Cherry-Pick N / Revert N: ONE git command over all of them — oldest first
+ * for a pick, newest first for a revert — through the commit-applying door,
+ * which asks about uncommitted changes in the way before git starts. A stop
+ * (a conflict, an empty pick) is the conflict flow's; abort undoes the run.
+ */
+async function applyMany(
+  verb: "cherry-pick" | "revert",
+  ctx: GitContext,
+  shas: readonly string[],
+  undo?: UndoRunner,
+): Promise<boolean> {
+  const [merges, ordered] = await Promise.all([
+    mergesAmong(ctx.process, shas),
+    orderCommits(ctx.process, shas, verb === "cherry-pick" ? "oldest-first" : "newest-first"),
+  ]);
+  if (!merges || !ordered) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", MANY_UNREADABLE));
+    return false;
+  }
+  if (merges.length > 0) {
+    void vscode.window.showWarningMessage(
+      l10n.t("GitStudio: {0} is a merge commit — {1} it on its own, where you can choose which side to keep.", short(merges[0]), verb === "cherry-pick" ? l10n.t("cherry-pick") : l10n.t("revert")),
+    );
+    return false;
+  }
+  const n = ordered.length;
+  const label = verb === "cherry-pick" ? l10n.t("Cherry-pick {0} commits", n) : l10n.t("Revert {0} commits", n);
+  return withUndo(undo, label, async () => {
+    const applied = await applyOrAsk(ctx, {
+      kind: verb,
+      commit: ordered[0],
+      commits: ordered,
+      args: applyManyArgs(verb, ordered),
+    });
+    if (applied.cancelled || applied.settled) {
+      return !applied.cancelled;
+    }
+    const result = applied.result;
+    if (result.code === 0) {
+      flash(applyManyMessage(verb, n, "done"));
+      return true;
+    }
+    // Stopped, not failed: git leaves its marker whenever it waits on a
+    // conflict or an emptied commit — locale-independent, as for one commit.
+    if (await pausedForUser(ctx.process, result.code, verb === "cherry-pick" ? "CHERRY_PICK_HEAD" : "REVERT_HEAD")) {
+      notifyPaused(l10n.t("GitStudio: {0}", applyManyMessage(verb, n, "stopped")));
+      return true;
+    }
+    await showGitError(
+      ctx,
+      verb === "cherry-pick" ? l10n.t("Cherry-picking {0} commits", n) : l10n.t("Reverting {0} commits", n),
+      result.stderr.trim(),
+      `${verb === "cherry-pick" ? "Cherry-picking" : "Reverting"} ${n} commits failed`,
+    );
+    return true;
+  });
+}
+
+/**
+ * Drop N Commits… / Squash N Commits…: the drop pipeline with several rows
+ * changed (git-service/multiCommit.ts), under the Undo envelope. Refusals
+ * first, so nobody agrees to a rewrite that is then refused; then one
+ * question — for a squash, the message editor pre-filled with every message
+ * (JetBrains' Squash Commits); then, when other branches point at rewritten
+ * commits, whether they come along.
+ */
+async function rewriteManyHere(
+  verb: "drop" | "squash",
+  ctx: GitContext,
+  shas: readonly string[],
+  undo?: UndoRunner,
+): Promise<boolean> {
+  // Re-read, never trust the menu: it may have been open while history moved.
+  const plan = await planMany(ctx.process, verb, shas);
+  if (!plan.ok) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", plan.message));
+    return false;
+  }
+  const blocked = await manyBlocker(ctx.process, verb);
+  if (blocked) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", blocked));
+    return false;
+  }
+  const n = plan.shas.length;
+  let message: string | undefined;
+  if (verb === "squash") {
+    const q = squashQuestion(plan);
+    message = (
+      await promptInput({
+        title: q.title,
+        hint: q.message,
+        value: plan.message ?? "",
+        multiline: true,
+        selectOnOpen: false,
+        validate: "nonEmpty",
+        confirmLabel: l10n.t("Squash Commits"),
+      })
+    )?.trim();
+    if (!message) {
+      return false;
+    }
+  }
+
+  let carry = false;
+  // The undo entry's label goes into git (the reflog and the revert commit), so
+  // it stays English: only the words this dialog shows are translated.
+  const Verb = verb === "drop" ? "Drop" : "Squash";
+  const verbWord = verb === "drop" ? l10n.t("Drop") : l10n.t("Squash");
+  if (plan.carryable.length > 0) {
+    // A squash's own words here: the editor's "with the message below" is
+    // not what is below this question — its choices are.
+    const q = verb === "drop" ? dropManyQuestion(plan) : squashCarryQuestion(plan);
+    const picked = await promptPick({
+      title: q.title,
+      hint: q.message,
+      choices: [
+        {
+          id: "carry",
+          label: l10n.t("{0} and move those branches", verbWord),
+          icon: "git-branch",
+          description: l10n.t("They follow onto the rewritten commits."),
+          danger: true,
+        },
+        {
+          id: "only",
+          label: l10n.t("{0} on this branch only", verbWord),
+          icon: "git-commit",
+          description: l10n.t("They keep pointing at the commits as they are now."),
+          danger: true,
+        },
+        { id: "no", label: l10n.t("Cancel"), icon: "close" },
+      ],
+    });
+    if (picked !== "carry" && picked !== "only") {
+      return false;
+    }
+    carry = picked === "carry";
+  } else if (verb === "drop") {
+    const q = dropManyQuestion(plan);
+    const ok = await promptConfirm({
+      title: q.title,
+      message: q.message,
+      confirmLabel: l10n.t("Drop Commits"),
+      danger: true,
+    });
+    if (!ok) {
+      return false;
+    }
+  }
+
+  const outcome = await withUndo(
+    undo,
+    `${Verb} ${n} commits`,
+    async () => {
+      const out = await rewriteMany(
+        ctx.process,
+        verb,
+        { shas: plan.shas, head: plan.head, carry, ...(message ? { message } : {}) },
+        (p) => runRebasePlan(ctx.process.cwd, p),
+      );
+      // A rewrite that failed changed nothing — every refusal comes before git
+      // writes, and a failed rebase ends where it began — so there is nothing
+      // for Undo to offer. `cancelled` tells the ledger exactly that.
+      return out.status === "failed" ? { ...out, cancelled: true as const } : out;
+    },
+  );
+
+  const text = manyOutcomeMessage(verb, n, outcome);
+  if (outcome.status === "done") {
+    flash(text);
+    return true;
+  }
+  if (outcome.status === "stopped") {
+    notifyPaused(l10n.t("GitStudio: {0}", text));
+    return true;
+  }
+  if (outcome.expected) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", text));
+  } else {
+    void vscode.window.showErrorMessage(l10n.t("GitStudio: {0}", text));
+  }
+  return false;
+}
+
+/**
+ * Edit Message… (issue #75): the commit's whole message in an editor, then a
+ * rebase that rewords it and replays what came after — the squash pipeline
+ * with one row changed (git-service/multiCommit.ts), under the Undo envelope.
+ * Refusals first; when other branches point at rewritten commits, whether
+ * they come along.
+ */
+async function rewordHere(ctx: GitContext, sha: string, undo?: UndoRunner): Promise<boolean> {
+  // Re-read, never trust the menu: it may have been open while history moved.
+  const plan = await planMany(ctx.process, "reword", [sha]);
+  if (!plan.ok) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", plan.message));
+    return false;
+  }
+  const blocked = await manyBlocker(ctx.process, "reword");
+  if (blocked) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", blocked));
+    return false;
+  }
+  const q = rewordQuestion(plan);
+  const message = (
+    await promptInput({
+      title: q.title,
+      hint: q.message,
+      value: plan.message ?? "",
+      multiline: true,
+      selectOnOpen: false,
+      validate: "nonEmpty",
+      confirmLabel: l10n.t("Edit Message"),
+    })
+  )?.trim();
+  if (!message || message === (plan.message ?? "").trim()) {
+    return false;
+  }
+
+  let carry = false;
+  if (plan.carryable.length > 0) {
+    const picked = await promptPick({
+      title: l10n.t("Move the branches on rewritten commits too?"),
+      hint: q.message,
+      choices: [
+        {
+          id: "carry",
+          label: l10n.t("Edit and move those branches"),
+          icon: "git-branch",
+          description: l10n.t("They follow onto the rewritten commits."),
+        },
+        {
+          id: "only",
+          label: l10n.t("Edit on this branch only"),
+          icon: "git-commit",
+          description: l10n.t("They keep pointing at the commits as they are now."),
+        },
+        { id: "no", label: l10n.t("Cancel"), icon: "close" },
+      ],
+    });
+    if (picked !== "carry" && picked !== "only") {
+      return false;
+    }
+    carry = picked === "carry";
+  }
+
+  // The undo entry's label goes into git (the reflog), so it stays English.
+  const outcome = await withUndo(undo, `Edit message of ${short(plan.shas[0])}`, async () => {
+    const out = await rewriteMany(
+      ctx.process,
+      "reword",
+      { shas: plan.shas, head: plan.head, carry, message },
+      (p) => runRebasePlan(ctx.process.cwd, p),
+    );
+    return out.status === "failed" ? { ...out, cancelled: true as const } : out;
+  });
+
+  const text = rewordOutcomeMessage(outcome);
+  if (outcome.status === "done") {
+    flash(text);
+    return true;
+  }
+  if (outcome.status === "stopped") {
+    notifyPaused(l10n.t("GitStudio: {0}", text));
+    return true;
+  }
+  if (outcome.expected) {
+    void vscode.window.showWarningMessage(l10n.t("GitStudio: {0}", text));
+  } else {
+    void vscode.window.showErrorMessage(l10n.t("GitStudio: {0}", text));
+  }
+  return false;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * A checkout, through the door every commit-applying action shares: a switch
+ * refused over uncommitted work in its way is said, with Stash & Retry, rather
+ * than shown as git's "would be overwritten by checkout" in red and filed.
+ */
+async function runCheckout(
+  ctx: GitContext,
+  args: string[],
+  successMessage: string,
+  action: string,
+): Promise<boolean> {
+  const applied = await applyOrAsk(ctx, checkoutOp(args));
+  if (applied.cancelled || applied.settled) {
+    return !applied.cancelled;
+  }
+  if (applied.result.code === 0) {
+    flash(successMessage);
+    return true;
+  }
+  await showGitError(ctx, action, applied.result.stderr.trim(), `git ${args[0]} failed`);
+  return true;
+}
+
+async function runGit(
+  ctx: GitContext,
+  args: string[],
+  successMessage: string,
+  action: string,
+): Promise<boolean> {
+  const result = await ctx.process.run(args);
+  if (result.code === 0) {
+    flash(successMessage);
+    return true;
+  }
+  await showGitError(ctx, action, result.stderr.trim(), `git ${args[0]} failed`);
+  return true;
+}
+
+/**
+ * Tell the user a git command failed — and decide whether it is worth reporting.
+ *
+ * Those were the same thing until crash report #9 arrived: "git checkout failed",
+ * stderr "error: you need to resolve your current index first". Nothing was
+ * broken. The user was mid-conflict, and git declined to move HEAD over an
+ * unmerged index, which is exactly what it should do. It was shown as a red error
+ * AND filed as a crash.
+ *
+ * So the question "is this OUR bug?" is asked separately now, with a
+ * locale-independent probe: does the index still have unmerged files? If so this
+ * is the repo's state, not a defect — say so as a warning, and file nothing.
+ *
+ * Deliberately NOT the operation markers (MERGE_HEAD and friends). A cherry-pick
+ * that turns out empty leaves CHERRY_PICK_HEAD behind with ZERO unmerged files,
+ * and that is the report that found the locale bug fixed in 1.5.2 — a
+ * marker-based test would have silenced the most valuable report we have had.
+ */
+async function showGitError(
+  ctx: GitContext,
+  action: string,
+  stderr: string,
+  // What a crash report files it under: unchanged, so the collector keeps
+  // grouping a failure with the reports it already has.
+  op = `${action} failed`,
+): Promise<void> {
+  let unmerged = 0;
+  try {
+    unmerged = await ctx.conflict.unmergedCount();
+  } catch {
+    unmerged = 0; // never let the probe turn a failure into a silent one
+  }
+  if (unmerged > 0) {
+    // In the stopped operation's own words: a rebase or a pick CONTINUES.
+    const stop = await stoppedIn(ctx.process).catch(() => null);
+    void vscode.window.showWarningMessage(
+      failed(action, unresolvedConflictsMessage(unmerged, stop)),
+    );
+    return;
+  }
+  // "GitStudio: Cherry-pick failed — <git's reason>", as every failure reads.
+  void vscode.window.showErrorMessage(failed(action, stderr));
+  // Anonymous, scrubbed crash report so we hear about failures during beta
+  // (no-op if the user turned reporting off or VS Code telemetry is off).
+  ErrorReporter.current?.captureGitError(op, stderr);
+}
+
+function flash(message: string): void {
+  void vscode.window.setStatusBarMessage(l10n.t("$(check) {0}", message), 2500);
+}
+
+function short(sha: string): string {
+  return sha.slice(0, 7);
+}

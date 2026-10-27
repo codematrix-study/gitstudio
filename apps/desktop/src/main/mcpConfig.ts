@@ -1,0 +1,461 @@
+// "Agent Access": everything the Settings ▸ Agent Access card needs to point an
+// external agent (Claude Desktop, Cursor, VS Code/Copilot, Windsurf) at the
+// bundled GitStudio MCP server. We resolve the server's entry script, build a
+// ready-to-paste config snippet, detect which clients already have it, and can
+// one-click merge it into a client's config — scoped to the open repo, with the
+// write/destructive permission flags the user chose.
+
+import { app } from "electron";
+import * as l10n from "@vscode/l10n";
+import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+import type { McpClientInfo, McpInfo, McpInstallRequest, OkResult } from "../shared/ipc";
+
+// ── Where the server is, and what runs it ─────────────────────────────────────
+//
+// The server SHIPS with the app. The desktop's own esbuild bundles apps/mcp into
+// one self-contained file, dist/mcp/gitstudio-mcp.js, and electron-builder
+// places it outside the asar as resources/mcp/gitstudio-mcp.js — a real file,
+// because an MCP client launches it with a path of its own.
+//
+// Before this, nothing packaged apps/mcp at all: every shipped build showed an
+// Add button that could not work and told the user to "Run npm run build in
+// apps/mcp", in a repository they do not have (report #16 was that message,
+// filed from a shipped build).
+
+/** The server bundle's file name, in both layouts. */
+const SERVER_FILE = "gitstudio-mcp.js";
+
+/** Everything the launch plan depends on — injectable, so both layouts are testable. */
+export interface McpRuntime {
+  /** `app.isPackaged`: a shipped build rather than a dev tree. */
+  packaged: boolean;
+  /** `process.execPath`: the app's own executable. */
+  execPath: string;
+  /** `process.resourcesPath`: where extraResources land in a packaged build. */
+  resourcesPath: string;
+  /** The directory of the main bundle (`dist/main` in both layouts). */
+  mainDir: string;
+  /** `app.getPath("userData")`. */
+  userData: string;
+  /** `$APPIMAGE`: the AppImage file a Linux AppImage build was launched from. */
+  appImage?: string;
+  /** `$GITSTUDIO_MCP_BIN`: an explicit server path, for development. */
+  override?: string;
+}
+
+/** The running app's own runtime. */
+export function currentRuntime(): McpRuntime {
+  return {
+    packaged: !!app?.isPackaged,
+    execPath: process.execPath,
+    resourcesPath: process.resourcesPath ?? "",
+    mainDir: __dirname,
+    userData: app?.getPath("userData") ?? "",
+    appImage: process.env.APPIMAGE || undefined,
+    override: process.env.GITSTUDIO_MCP_BIN || undefined,
+  };
+}
+
+/**
+ * The shipped server's path for this layout — where it IS in a packaged build,
+ * beside the main bundle in a dev tree — whether or not the file exists, so a
+ * missing one can be named.
+ */
+function expectedServerPath(rt: McpRuntime): string {
+  return rt.packaged
+    ? join(rt.resourcesPath, "mcp", SERVER_FILE)
+    : join(rt.mainDir, "..", "mcp", SERVER_FILE);
+}
+
+/** Resolve the bundled gitstudio-mcp entry across dev + packaged layouts. */
+export function resolveMcpBin(rt: McpRuntime = currentRuntime()): string {
+  if (rt.override && existsSync(rt.override)) {
+    return rt.override;
+  }
+  return expectedServerPath(rt);
+}
+
+/**
+ * The server path a client config should name: one that still exists after
+ * this app quits.
+ *
+ * Everywhere but an AppImage that is the shipped file itself. An AppImage runs
+ * from a per-launch mount (/tmp/.mount_*) that disappears on exit, taking the
+ * resources directory with it, so the server is copied into userData — the
+ * copy is refreshed whenever it differs, so an updated app updates it.
+ */
+function stableServerPath(rt: McpRuntime): string {
+  const bin = resolveMcpBin(rt);
+  if (!rt.appImage || !existsSync(bin)) {
+    return bin;
+  }
+  const copy = join(rt.userData, "mcp", SERVER_FILE);
+  try {
+    const same =
+      existsSync(copy) && statSync(copy).size === statSync(bin).size &&
+      readFileSync(copy).equals(readFileSync(bin));
+    if (!same) {
+      mkdirSync(dirname(copy), { recursive: true });
+      copyFileSync(bin, copy);
+    }
+    return copy;
+  } catch {
+    return bin;
+  }
+}
+
+/**
+ * Is this executable running from a Gatekeeper App Translocation mount?
+ *
+ * macOS runs a downloaded, quarantined app that has not been moved from where
+ * it was unpacked (Downloads, the mounted DMG) from a random read-only copy
+ * under /private/var/folders/…/AppTranslocation/<uuid>/d/ — a path that
+ * disappears when the app quits. A client config naming it works exactly until
+ * then, and the agent then fails to start with nothing on screen to say why.
+ */
+export function isTranslocated(execPath: string): boolean {
+  return /^(?:\/private)?\/var\/folders\/.+\/AppTranslocation\//.test(execPath);
+}
+
+/** Why Agent Access will not write a translocated path, and what to do. A
+ *  function, not a module-level constant — l10n.t() must run AFTER boot()
+ *  configures the bundle (main/language.ts), and a module-level const captures
+ *  its value at import time, before that happens. */
+function translocatedMessage(): string {
+  return l10n.t(
+    "GitStudio is running from a temporary copy macOS made because the app hasn't been moved to Applications yet, and that copy disappears when GitStudio quits — an agent set up now would stop working. Move GitStudio to your Applications folder, open it from there, then add it again.",
+  );
+}
+
+/**
+ * Is this executable running straight from a mounted disk image?
+ *
+ * The same vanishing path as translocation, by another road. An app that was
+ * never quarantined — fetched with curl, or with the attribute cleared — is not
+ * translocated when it is opened from its disk image: it runs from
+ * /Volumes/<image>/GitStudio.app itself, and a config naming that works until
+ * the image is ejected. A disk image puts the app at the ROOT of its volume,
+ * which is what this matches; an app kept in an Applications folder on another
+ * drive is where its owner chose to install it, and is left alone.
+ */
+export function isOnDiskImage(execPath: string): boolean {
+  return /^\/Volumes\/[^/]+\/[^/]+\.app\/Contents\//.test(execPath);
+}
+
+/** Why Agent Access will not write a disk-image path, and what to do. A
+ *  function, not a module-level constant — see translocatedMessage() above. */
+function diskImageMessage(): string {
+  return l10n.t(
+    "GitStudio is running straight from its disk image, and that path goes away when the image is ejected — an agent set up now would stop working. Move GitStudio to Applications first, open it from there, then add it again.",
+  );
+}
+
+/**
+ * Why the path Add would write will not outlive this run of the app — a
+ * translocated copy, or a disk image — or undefined when it will. The one
+ * answer both the card and Add give, so neither can offer what the other
+ * refuses.
+ */
+function vanishingLocation(execPath: string): string | undefined {
+  if (isTranslocated(execPath)) return translocatedMessage();
+  if (isOnDiskImage(execPath)) return diskImageMessage();
+  return undefined;
+}
+
+/**
+ * What a client runs to start the server: the app's OWN executable as Node
+ * (`ELECTRON_RUN_AS_NODE=1`), never a bare `node`.
+ *
+ * A desktop user need not have Node installed, and a client started from the
+ * Dock — Claude Desktop is — gets a bare PATH that will not find the one they
+ * do have. The runtime that ships the server is the one sure to run it. From an
+ * AppImage the command is the AppImage file, for the same reason as above.
+ */
+export function mcpLaunch(rt: McpRuntime = currentRuntime()): {
+  command: string;
+  env: Record<string, string>;
+} {
+  return { command: rt.appImage || rt.execPath, env: { ELECTRON_RUN_AS_NODE: "1" } };
+}
+
+interface ClientConfig {
+  id: string;
+  label: string;
+  /** Config file path (mac/linux/win as available). */
+  path: string;
+  /** The JSON key the client uses for its server map. */
+  serversKey: "mcpServers" | "servers";
+}
+
+/** Per-OS client config locations. mac is fully supported; others best-effort. */
+function clientConfigs(): ClientConfig[] {
+  const home = homedir();
+  const mac = process.platform === "darwin";
+  const appData = process.env.APPDATA ?? join(home, "AppData", "Roaming");
+  const list: ClientConfig[] = [
+    {
+      id: "claude",
+      label: "Claude Desktop",
+      path: mac
+        ? join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+        : join(appData, "Claude", "claude_desktop_config.json"),
+      serversKey: "mcpServers",
+    },
+    {
+      id: "cursor",
+      label: "Cursor",
+      path: join(home, ".cursor", "mcp.json"),
+      serversKey: "mcpServers",
+    },
+    {
+      id: "windsurf",
+      label: "Windsurf",
+      path: join(home, ".codeium", "windsurf", "mcp_config.json"),
+      serversKey: "mcpServers",
+    },
+    {
+      id: "vscode",
+      label: "VS Code (Copilot)",
+      path: mac
+        ? join(home, "Library", "Application Support", "Code", "User", "mcp.json")
+        : join(appData, "Code", "User", "mcp.json"),
+      serversKey: "servers",
+    },
+  ];
+  return list;
+}
+
+/** Build the args a client should launch the server with. */
+function serverArgs(binPath: string, repoRoot: string | undefined, req: { write: boolean; destructive: boolean }): string[] {
+  const args = [binPath];
+  if (repoRoot) {
+    args.push("--repo", repoRoot);
+  }
+  if (req.destructive) {
+    args.push("--allow-destructive");
+  } else if (req.write) {
+    args.push("--write");
+  }
+  return args;
+}
+
+/**
+ * Reading a client's MCP config, keeping "there is no file" DISTINCT from "there
+ * is a file I could not parse".
+ *
+ * Collapsing the two is destructive: install would fall back to `{}` and write
+ * that over a config it simply failed to understand, deleting every other MCP
+ * server the user had. Several of these clients accept JSONC (comments and
+ * trailing commas), which `JSON.parse` rejects outright — so this is the normal
+ * case, not an exotic one.
+ */
+type ConfigRead =
+  | { kind: "missing" }
+  | { kind: "parsed"; json: Record<string, unknown> }
+  | { kind: "unreadable"; reason: string };
+
+function readConfig(path: string): ConfigRead {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") {
+      return { kind: "missing" };
+    }
+    return { kind: "unreadable", reason: err instanceof Error ? err.message : String(err) };
+  }
+  // An empty/whitespace-only file is effectively absent, and safe to replace.
+  if (text.trim().length === 0) {
+    return { kind: "missing" };
+  }
+  try {
+    const json = JSON.parse(text) as unknown;
+    if (!json || typeof json !== "object" || Array.isArray(json)) {
+      return { kind: "unreadable", reason: l10n.t("the file is not a JSON object") };
+    }
+    return { kind: "parsed", json: json as Record<string, unknown> };
+  } catch (err) {
+    return {
+      kind: "unreadable",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function readJson(path: string): Record<string, unknown> | undefined {
+  const r = readConfig(path);
+  return r.kind === "parsed" ? r.json : undefined;
+}
+
+/** GitStudio's entry in a client's config, or undefined when it has none. */
+function installedEntry(cfg: ClientConfig): { command?: unknown; args?: unknown } | undefined {
+  const json = readJson(cfg.path);
+  if (!json) {
+    return undefined;
+  }
+  const servers = json[cfg.serversKey];
+  if (!servers || typeof servers !== "object" || !("gitstudio" in (servers as Record<string, unknown>))) {
+    return undefined;
+  }
+  const entry = (servers as Record<string, unknown>).gitstudio;
+  return entry && typeof entry === "object" ? (entry as { command?: unknown; args?: unknown }) : {};
+}
+
+/**
+ * Why a configured entry can no longer start the server — the GitStudio it
+ * names is not where it was (the app was moved, reinstalled elsewhere, or set
+ * up from a translocated copy) — or undefined when its paths still exist.
+ *
+ * Only absolute paths are judged: an old entry's bare `node` is a PATH lookup
+ * this cannot answer for.
+ */
+function staleEntry(entry: { command?: unknown; args?: unknown }): string | undefined {
+  const paths = [entry.command, Array.isArray(entry.args) ? entry.args[0] : undefined].filter(
+    (p): p is string => typeof p === "string" && isAbsolute(p),
+  );
+  const gone = paths.find((p) => !existsSync(p));
+  return gone ? l10n.t("The GitStudio this was set up with is no longer at {0}.", gone) : undefined;
+}
+
+/**
+ * Why there is no server to install, in words for whoever can act on it — or
+ * undefined when there is one.
+ *
+ * In a dev tree the bundle is simply not built yet: a condition of the
+ * checkout. In a shipped build the server is packaged with the app, so its
+ * absence is a broken build — OUR defect, never "run npm run build" at a user
+ * who has no repository to run it in.
+ */
+function missingServer(
+  rt: McpRuntime,
+  binPath: string,
+): (OkResult & { message: string }) | undefined {
+  if (binPath && existsSync(binPath)) {
+    return undefined;
+  }
+  // Report #16 was the dev-tree sentence, filed from a shipped build — where
+  // it was never a condition: the build had left the server out. So `expected`
+  // belongs to the dev tree alone, and a shipped build's refusal reports.
+  return rt.packaged
+    ? {
+        ok: false,
+        message: l10n.t(
+          "This build of GitStudio is missing its MCP server, so Agent Access can't be set up. Reinstalling the app restores it.",
+        ),
+      }
+    : {
+        ok: false,
+        expected: true,
+        message: l10n.t("The MCP server isn't built yet — run `node esbuild.js` in apps/desktop."),
+      };
+}
+
+export function mcpInfo(repoRoot: string | undefined, rt: McpRuntime = currentRuntime()): McpInfo {
+  const binPath = stableServerPath(rt);
+  const { command, env } = mcpLaunch(rt);
+  const args = serverArgs(binPath, repoRoot, { write: false, destructive: false });
+  const snippet = JSON.stringify({ mcpServers: { gitstudio: { command, args, env } } }, null, 2);
+  const clients: McpClientInfo[] = clientConfigs().map((c) => {
+    const entry = installedEntry(c);
+    const staleReason = entry ? staleEntry(entry) : undefined;
+    return {
+      id: c.id,
+      label: c.label,
+      installed: !!entry,
+      configPath: c.path,
+      ...(staleReason ? { stale: true, staleReason } : {}),
+    };
+  });
+  // Nothing to offer when the server is missing — or when the path Add would
+  // write vanishes: a translocated copy on quit, a disk image on eject.
+  const unavailable = vanishingLocation(rt.execPath) ?? missingServer(rt, binPath)?.message;
+  return {
+    binPath,
+    command,
+    args,
+    env,
+    configSnippet: snippet,
+    clients,
+    repoRoot,
+    available: !unavailable,
+    ...(unavailable ? { missing: unavailable } : {}),
+  };
+}
+
+export function installMcp(
+  repoRoot: string | undefined,
+  req: McpInstallRequest,
+  rt: McpRuntime = currentRuntime(),
+): OkResult & { message: string } {
+  const cfg = clientConfigs().find((c) => c.id === req.client);
+  // An unknown client id can only come from our own list, so it stays
+  // crash-reportable. A client config the user has hand-edited into something
+  // that is not JSON is a state of the machine (see main/expectedError.ts).
+  if (!cfg) {
+    return { ok: false, message: l10n.t("Unknown client: {0}.", req.client) };
+  }
+  // Refused, not written: the path would name a copy of the app that is gone
+  // the moment it quits, or a disk image that is gone the moment it is
+  // ejected. Where the app runs from is the user's state, and the way on is
+  // theirs to take — so `expected`, with the way on in the message.
+  const vanishing = vanishingLocation(rt.execPath);
+  if (vanishing) {
+    return { ok: false, expected: true, message: vanishing };
+  }
+  const binPath = stableServerPath(rt);
+  const missing = missingServer(rt, binPath);
+  if (missing) {
+    return missing;
+  }
+  const { command, env } = mcpLaunch(rt);
+  const entry = { command, args: serverArgs(binPath, repoRoot, req), env };
+  try {
+    mkdirSync(dirname(cfg.path), { recursive: true });
+    const read = readConfig(cfg.path);
+    if (read.kind === "unreadable") {
+      // Refuse rather than overwrite. Editing by hand is a two-minute job; a
+      // silently erased MCP config is not recoverable.
+      return {
+        ok: false,
+        expected: true,
+        message: l10n.t(
+          "{0}'s config at {1} couldn't be read as JSON ({2}). GitStudio won't overwrite it — add the \"gitstudio\" entry under \"{3}\" by hand, or fix the file and retry.",
+          cfg.label,
+          cfg.path,
+          read.reason,
+          cfg.serversKey,
+        ),
+      };
+    }
+    const json = read.kind === "parsed" ? read.json : {};
+    const servers = (json[cfg.serversKey] && typeof json[cfg.serversKey] === "object"
+      ? json[cfg.serversKey]
+      : {}) as Record<string, unknown>;
+    servers.gitstudio = entry;
+    json[cfg.serversKey] = servers;
+    // Keep one backup of a file we did not create — cheap insurance against a
+    // shape we round-tripped wrongly.
+    if (read.kind === "parsed") {
+      try {
+        writeFileSync(`${cfg.path}.gitstudio-backup`, readFileSync(cfg.path, "utf8"));
+      } catch {
+        /* best effort — never block the install on the backup */
+      }
+    }
+    writeFileSync(cfg.path, JSON.stringify(json, null, 2));
+    const mode = req.destructive
+      ? l10n.t("read + write + destructive")
+      : req.write
+        ? l10n.t("read + write")
+        : l10n.t("read-only");
+    return {
+      ok: true,
+      message: l10n.t("Added GitStudio ({0}) to {1}. Restart {1} to pick it up.", mode, cfg.label),
+    };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  }
+}

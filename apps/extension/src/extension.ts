@@ -1,0 +1,913 @@
+import "./l10n";
+import * as vscode from "vscode";
+import { notice } from "./ui/notify";
+import { ErrorReporter } from "./reporting/errorReporter";
+import { ProcessAudit } from "./debug/processAudit";
+import { RepoManager } from "./git/repoManager";
+import { switchRepository } from "./git/repoPicker";
+import { BlameController } from "./blame/blameController";
+import {
+  CommitsTreeProvider,
+  copyCommitSha,
+  type CommitNode,
+} from "./views/commitsView";
+import { RefsTreeProvider } from "./views/branchesView";
+import {
+  StashDiffContentProvider,
+  applyStash,
+  branchFromStash,
+  dropStash,
+  pickStash,
+  popStash,
+  saveStash,
+} from "./views/stashesView";
+import {
+  openWorktreeIn,
+  addWorktree,
+  removeWorktree,
+  forgetWorktree,
+  lockWorktree,
+  pruneWorktrees,
+  type WorktreeTarget,
+} from "./views/worktreesView";
+import { WorktreesWebviewProvider } from "./views/worktreesWebview";
+import { ComparePanel } from "./compare/comparePanel";
+import { SyncStatusItem } from "./statusBar/syncStatus";
+import { StatusCluster } from "./statusBar/statusCluster";
+import * as branchActions from "./views/branchActions";
+import { CommitGraphPanel } from "./graph/graphPanel";
+import { CommitsGraphViewProvider } from "./graph/commitsGraphView";
+import { CommitPanelViewProvider } from "./graph/commitPanelView";
+import { RefFilterStore, realpathRoot, setRefFilterStore } from "./graph/refFilterStore";
+import { FilesLayoutStore, setFilesLayoutStore } from "./graph/filesLayoutStore";
+import {
+  GitHubAuthorAvatars,
+  setAuthorAvatarResolver,
+} from "./graph/authorAvatars";
+import { GitHubApi } from "./pr/githubApi";
+import { GitHubAuth } from "./pr/githubAuth";
+import {
+  OPEN_HISTORY_DIFF_COMMAND,
+  RevisionContentProvider,
+  REVISION_SCHEME,
+} from "./history/revisionContentProvider";
+import { FileTimelineProvider } from "./history/fileTimelineProvider";
+import { commitToReveal } from "./history/revealInGraph";
+import { registerTimelineProvider } from "./history/timelineApi";
+import { showLineHistory } from "./history/lineHistory";
+import { RevisionNavigator } from "./history/revisionNavigation";
+import { showReflog } from "./history/reflog";
+import { registerGitStudioMerge } from "./merge/gitstudioMerge";
+import { GITSTUDIO_COEXISTENCE_PROMPT_KEY, GITSTUDIO_SUPPORT_COMMAND } from "./merge/mergeIds";
+import { askAndOpenSupport } from "./ui/support";
+import type { MergePeerApi } from "@gitstudio/merge-vscode/product";
+import { isOwnDiff, routableIntent } from "@gitstudio/merge-vscode/ownDiffs";
+import { openDiff } from "./merge/diffPlaces";
+import { setUpSidesTip, SIDES_WHY_URL } from "@gitstudio/merge-vscode/upgradeTip";
+import { StagedGutter } from "./changes/stagedGutter";
+import { EditorStagingActions, runSetChange, runSetSelectedLines } from "./changes/editorStagingActions";
+import { SET_CHANGE_COMMAND, SET_SELECTED_LINES_COMMAND } from "./changes/stagingActions";
+import { lineMenuTarget, type LineMenuArg } from "./changes/lineTargets";
+import { CommitViewProvider } from "./changes/commitView";
+import {
+  stageSelectedLines,
+  unstageSelectedLines,
+  stageHunk,
+  unstageHunk,
+  type StagingRefresh,
+} from "./changes/lineStaging";
+import { runCommitAction } from "./graph/commitActions";
+import { UndoLedger } from "./undo/undoLedger";
+import { RebaseTodoEditorProvider } from "./rebase/rebaseTodoEditor";
+import { abortRebase } from "./rebase/rebaseCommands";
+import { RebaseWorkspacePanel } from "./rebase/rebaseWorkspacePanel";
+import { AiFeatures } from "./ai/aiFeatures";
+import { AiSettingsPanel } from "./ai/aiSettingsPanel";
+import {
+  setApiKey,
+  clearApiKey,
+  setOpenAIKey,
+  clearOpenAIKey,
+  selectModelCommand,
+  draftCommitMessage,
+  generateCommitMessageCommand,
+  explainDiffCommand,
+  summarizeChangesCommand,
+  reviewChangesCommand,
+} from "./ai/aiCommands";
+import { registerPrFeature } from "./pr/prFeature";
+import { promptConfirm, promptPick, registerDialogHost } from "./ui/dialogs";
+import * as l10n from "@vscode/l10n";
+
+// GitStudio extension entry point.
+//
+// The suite grows pillar-by-pillar (M1+): git-service wiring, the Commits /
+// Branches / Remotes / Stashes / Worktrees / Tags tree views, inline blame, the
+// commit graph, file & line history, hunk/line staging, diff + 3-pane merge,
+// interactive rebase + the universal Undo envelope, and the optional AI features.
+//
+// Activation stays cheap (`onStartupFinished`): heavy git work is lazy and
+// off the activation path — the first commit/ref load happens when a view is
+// first resolved (TreeDataProvider.getChildren). Stable VS Code APIs only, so
+// the same build ships identically to the Marketplace and Open VSX (Cursor).
+/**
+ * What GitStudio's `activate` returns: what Merge Studio reads from it
+ * (vscode.extensions.getExtension("gitstudio.gitstudio").exports).
+ */
+export interface GitStudioApi {
+  readonly mergePeer: MergePeerApi;
+}
+
+export function activate(context: vscode.ExtensionContext): GitStudioApi {
+  const out = vscode.window.createOutputChannel("GitStudio");
+  context.subscriptions.push(out);
+  const log = (m: string): void =>
+    out.appendLine(`[${new Date().toISOString().slice(11, 23)}] ${m}`);
+  log("activate() called");
+
+  // Anonymous crash reporting. Constructed first so its failure hooks are live
+  // before any command runs. On by default but honors VS Code's telemetry
+  // opt-out and a blank endpoint — see reporting/errorReporter.ts.
+  context.subscriptions.push(new ErrorReporter(context));
+
+  // Child-process audit — OFF by default. macOS blames the EDITOR for a prompt
+  // raised by any child it is responsible for, so when a user reports one this
+  // is the only record of what GitStudio actually launched. See debug/processAudit.
+  const processAudit = new ProcessAudit();
+  context.subscriptions.push(
+    processAudit,
+    vscode.commands.registerCommand("gitstudio.debug.showProcessAudit", () =>
+      processAudit.show(),
+    ),
+  );
+
+  // POLISH A5.9: an upgrade from 1.13.0 or earlier, where a rebase's sides
+  // were swapped, gets a one-time tip at its first rebase or stash conflict.
+  // Read BEFORE the walkthrough key below is written: that key is how an
+  // install from before this bookkeeping is told from a fresh one.
+  const sidesTip = setUpSidesTip(context.globalState, {
+    version: String((context.extension?.packageJSON as { version?: unknown } | undefined)?.version ?? ""),
+    lastVersionKey: "gitstudio.lastVersion",
+    flippedAfter: "1.13.0",
+    priorInstall: context.globalState.get("gitstudio.walkthroughShown") !== undefined,
+    dismissedKey: "gitstudio.merge.sidesTipDismissed",
+    why: SIDES_WHY_URL,
+  });
+
+  const WALKTHROUGH_ID = "gitstudio.gitstudio#gitstudio.gettingStarted";
+  context.subscriptions.push(
+    // Kept for old keybindings: it opens Get Started, the one listed.
+    vscode.commands.registerCommand("gitstudio.showWelcome", () =>
+      vscode.commands.executeCommand("gitstudio.openWalkthrough"),
+    ),
+    vscode.commands.registerCommand("gitstudio.openWalkthrough", () => {
+      void vscode.commands.executeCommand(
+        "workbench.action.openWalkthrough",
+        WALKTHROUGH_ID,
+        false,
+      );
+    }),
+    // Support GitStudio…: only ever asked for (the palette, the bottom of the
+    // Changes view's "…" menu, the walkthrough's last line) — see ui/support.ts.
+    vscode.commands.registerCommand(GITSTUDIO_SUPPORT_COMMAND, () =>
+      askAndOpenSupport(
+        (spec) => promptPick(spec),
+        (url) => vscode.env.openExternal(vscode.Uri.parse(url)),
+      ),
+    ),
+  );
+
+  // First-run nudge: auto-open the Getting Started walkthrough once, guarded by
+  // globalState so it never reappears. Never blocks activation or git work.
+  const SEEN_KEY = "gitstudio.walkthroughShown";
+  let walkthroughOpened = false;
+  if (!context.globalState.get<boolean>(SEEN_KEY)) {
+    void context.globalState.update(SEEN_KEY, true);
+    walkthroughOpened = true;
+    void vscode.commands.executeCommand(
+      "workbench.action.openWalkthrough",
+      WALKTHROUGH_ID,
+      false,
+    );
+  }
+  // Read by Merge Studio: it waits with its own walkthrough while GitStudio's
+  // is on screen (one Welcome editor — the second replaced the first), and
+  // does not ask the question about VS Code's merge editor a second time.
+  const api: GitStudioApi = {
+    mergePeer: {
+      coexistenceAnswered: () => context.globalState.get<boolean>(GITSTUDIO_COEXISTENCE_PROMPT_KEY) === true,
+      walkthroughOpenedThisSession: () => walkthroughOpened,
+      // Under Merge Studio's default diff viewer too, the diffs GitStudio's
+      // views open for VS Code's diff editor stay there, and the ones they
+      // open routable (Changes, the graph, stashes) are redirected.
+      ownsDiff: isOwnDiff,
+      routableDiff: routableIntent,
+    },
+  };
+
+  // RepoManager.create activates vscode.git; do it off the activation path so a
+  // slow git extension never blocks startup. The views attach as soon as it
+  // resolves and render empty (or the no-repo welcome) until repos arrive.
+  // workspaceState: where the repository picked with Switch Repository… is
+  // remembered, per workspace, across reloads (issue #32).
+  void RepoManager.create(context.workspaceState).then((repos) => {
+    try {
+    context.subscriptions.push(repos);
+    // NOTE: git activation now runs in the BACKGROUND (RepoManager.create no
+    // longer awaits init), so this body runs BEFORE repos are discovered — the
+    // views register immediately and fill in on the first onDidChange. The real
+    // repo count is logged from that first change (below), not here (0 now).
+    log("views registered — repos discovering in background");
+    const readyOnce = repos.onDidChange(() => {
+      readyOnce.dispose();
+      log(
+        l10n.t("RepoManager ready — repos={0}, active={1}", repos.getAll().length, repos.getActive()?.root ?? "none"),
+      );
+    });
+    context.subscriptions.push(readyOnce);
+
+    // Inline blame, status bar, rich hover, and full-file annotations.
+    const blame = new BlameController(repos, context, log);
+    context.subscriptions.push(blame);
+
+    // The graph's branch filter (issue #30) is remembered per REPOSITORY in
+    // globalState, keyed by the root's real path — the same repository opened
+    // as a folder or inside a .code-workspace keeps one selection, as it does
+    // in the desktop app — and shared by every graph surface. This workspace's
+    // old workspaceState record is carried over once. Installed before the
+    // first graph host exists, so none of them starts without it.
+    setRefFilterStore(
+      new RefFilterStore(context.globalState, { canonical: realpathRoot, legacy: context.workspaceState }),
+    );
+    context.subscriptions.push({ dispose: () => setRefFilterStore(undefined) });
+    // The details pane's View as Tree / View as List (#81): one choice, kept
+    // here for every graph surface — their webviews each have storage of
+    // their own, so the editor tab and the bottom panel disagreed.
+    setFilesLayoutStore(new FilesLayoutStore(context.globalState));
+    context.subscriptions.push({ dispose: () => setFilesLayoutStore(undefined) });
+
+    // Inspecting a commit means revealing it in OUR Commit Graph — hosted in
+    // the BOTTOM panel as a graph | details split, so your code stays open
+    // above it, the way JetBrains docks its Git log.
+    const commitPanel = new CommitPanelViewProvider(repos, context.extensionUri);
+    context.subscriptions.push(
+      commitPanel,
+      vscode.window.registerWebviewViewProvider(
+        CommitPanelViewProvider.viewId,
+        commitPanel,
+        { webviewOptions: { retainContextWhenHidden: true } },
+      ),
+      // A sha (blame, the graph's links, a history row), or — from an editor's
+      // title bar or the palette — the commit that editor shows (issue #111).
+      vscode.commands.registerCommand("gitstudio.revealCommitInGraph", async (arg?: unknown) => {
+        const sha = await commitToReveal(repos, arg);
+        if (sha) {
+          void commitPanel.reveal(sha);
+        }
+      }),
+      vscode.commands.registerCommand("gitstudio.showCommitPanel", () =>
+        commitPanel.show(),
+      ),
+    );
+
+    // The Commits and Branches views were retired: the commit graph supersedes
+    // the flat Commits list, and all branch actions now live in the Changes
+    // view's branch menu. The providers stay (the branch-action commands +
+    // copyCommitSha's CommitNode type still use them), they're just no longer
+    // mounted as sidebar tree views.
+    const commitsProvider = new CommitsTreeProvider(repos);
+    const refsProvider = new RefsTreeProvider(repos);
+    // The Commits sidebar view renders the commit graph inline (webview view).
+    const commitsGraphView = new CommitsGraphViewProvider(
+      repos,
+      context.extensionUri,
+    );
+    context.subscriptions.push(commitsProvider, refsProvider, commitsGraphView);
+
+    // Real author photos for the commit graph. A GitHub-backed resolver injected
+    // once and used best-effort by the graph surfaces: the signed-in user's own
+    // commits show their GitHub avatar even in a local repo, and GitHub-hosted
+    // repos resolve every recent author. Falls back to Gravatar/initials when
+    // GitHub isn't connected. Its own auth instance keeps it independent of the
+    // PR feature's lifecycle.
+    const avatarAuth = new GitHubAuth();
+    const avatarApi = new GitHubApi({ getToken: (o) => avatarAuth.getToken(o) });
+    setAuthorAvatarResolver(
+      new GitHubAuthorAvatars(avatarApi, repos, () => avatarAuth.isConnected()),
+    );
+    context.subscriptions.push(avatarAuth);
+
+    // File & line history + revision navigation (M5).
+    const revisionContent = new RevisionContentProvider(repos);
+    const timelineProvider = new FileTimelineProvider(repos);
+    const navigator = new RevisionNavigator(repos);
+    context.subscriptions.push(timelineProvider, navigator);
+
+    context.subscriptions.push(
+      vscode.workspace.registerTextDocumentContentProvider(
+        REVISION_SCHEME,
+        revisionContent,
+      ),
+      vscode.commands.registerCommand("gitstudio.refreshCommits", () => {
+        commitsProvider.refresh();
+      }),
+      vscode.commands.registerCommand("gitstudio.refreshBranches", () => {
+        refsProvider.refresh();
+      }),
+      vscode.commands.registerCommand(
+        "gitstudio.copyCommitSha",
+        (arg?: CommitNode | string) => void copyCommitSha(arg),
+      ),
+      // Deprecated surface, kept as an alias: the editor-tab graph is superseded
+      // by the bottom-panel graph, which shows the graph and commit details side
+      // by side without eating an editor tab. The command still exists so old
+      // keybindings and muscle memory keep working — it just opens the panel.
+      vscode.commands.registerCommand("gitstudio.showCommitGraph", () => {
+        void commitPanel.show();
+      }),
+      vscode.commands.registerCommand(
+        OPEN_HISTORY_DIFF_COMMAND,
+        (left: vscode.Uri, right: vscode.Uri, title?: string, options?: vscode.TextDocumentShowOptions) =>
+          openDiff(left, right, title, options, "history"),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.openCommitInGraph",
+        (sha?: string) => {
+          if (typeof sha === "string" && sha) {
+            void commitsGraphView.reveal(sha);
+          }
+        },
+      ),
+      vscode.commands.registerCommand("gitstudio.showLineHistory", () => {
+        void showLineHistory(repos);
+      }),
+      vscode.commands.registerCommand(
+        "gitstudio.openFileAtRevision",
+        (resource?: vscode.Uri) =>
+          void navigator.openFileAtRevision(resource),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.revisionNavigateBack",
+        (resource?: vscode.Uri) => void navigator.navigateBack(resource),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.revisionNavigateForward",
+        (resource?: vscode.Uri) => void navigator.navigateForward(resource),
+      ),
+      vscode.commands.registerCommand("gitstudio.showReflog", () => {
+        void showReflog(repos);
+      }),
+      // Which repository GitStudio shows, when the workspace holds several
+      // (issue #32). The Changes view header opens the same picker.
+      vscode.commands.registerCommand("gitstudio.switchRepository", () =>
+        switchRepository(repos),
+      ),
+    );
+
+    // File history in the native Timeline relies on the `timeline` PROPOSED API,
+    // which published extensions cannot use in stable VS Code / Cursor — calling
+    // it throws. Guard it so it lights up the Timeline where available (Insiders
+    // / dev host) and is silently skipped otherwise. File & line history remain
+    // available via the GitStudio commands regardless.
+    try {
+      context.subscriptions.push(
+        registerTimelineProvider("file", timelineProvider),
+      );
+    } catch {
+      log("native Timeline integration skipped (proposed API unavailable)");
+    }
+
+    // The merge experience GitStudio shares with Merge Studio
+    // (@gitstudio/merge-vscode): the 3-pane merge editor, the Conflicts
+    // dashboard, automatic routing (gitstudio.merge.autoOpen), the status item,
+    // the embedded diff, and the commands resolve /
+    // compare / openChanges / stageWithTicks / operation.continue|skip|abort.
+    //
+    // Its refresh hook reaches `stagingRefresh`, so that binding is declared
+    // HERE, before the hook exists. It used to be declared ~140 lines down: a
+    // temporal dead zone that held only while nothing called the hook first,
+    // and that threw for the rest of the session if activation failed in
+    // between. What a refresh does is filled in once its pieces exist.
+    let runStagingRefresh: (() => void) | undefined;
+    const stagingRefresh: StagingRefresh = {
+      refresh() {
+        runStagingRefresh?.();
+      },
+    };
+    const merge = registerGitStudioMerge(context, repos, {
+      openChangesNative: (uri) => navigator.openChanges(uri),
+      refresh: () => stagingRefresh.refresh(),
+      sidesTip,
+    });
+    context.subscriptions.push(merge);
+
+    // The AI features — the optional bring-your-own-key layer (M10). It is OFF until
+    // configured: with no provider, `gitstudio.ai.enabled` stays false, the ✨
+    // affordance and palette commands stay hidden, and every call returns null.
+    // AI never gates or breaks a git op. The API key lives in GitStudio's own
+    // encrypted store — NOT the editor's OS-keyring-backed SecretStorage, whose
+    // read is what made this very line raise a macOS password prompt at startup
+    // — and never leaves the host (the commit box only gets the result text).
+    const brain = new AiFeatures(context);
+    context.subscriptions.push(brain);
+    void brain.refreshEnabled();
+    context.subscriptions.push(
+      vscode.commands.registerCommand("gitstudio.ai.setApiKey", () =>
+        setApiKey(context, brain),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.clearApiKey", () =>
+        clearApiKey(context, brain),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.setOpenAIKey", () =>
+        setOpenAIKey(context, brain),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.clearOpenAIKey", () =>
+        clearOpenAIKey(context, brain),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.selectModel", () =>
+        selectModelCommand(context, brain),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.ai.generateCommitMessage",
+        (arg?: unknown) => generateCommitMessageCommand(brain, repos, arg),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.explainDiff", () =>
+        explainDiffCommand(brain, repos),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.summarizeChanges", () =>
+        summarizeChangesCommand(brain, repos),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.reviewChanges", () =>
+        reviewChangesCommand(brain, repos),
+      ),
+      vscode.commands.registerCommand("gitstudio.ai.connect", () =>
+        AiSettingsPanel.show(brain, context.extensionUri),
+      ),
+      // The inverse of Connect. Turning AI off was only possible by knowing to
+      // find `gitstudio.ai.provider` in Settings; this makes it a first-class,
+      // discoverable action. It writes that same setting rather than
+      // introducing a second source of truth.
+      vscode.commands.registerCommand("gitstudio.ai.disable", async () => {
+        const cfg = vscode.workspace.getConfiguration("gitstudio");
+        if (cfg.get<string>("ai.provider") === "off") {
+          void vscode.window.showInformationMessage(
+            l10n.t("GitStudio: AI features are already disabled."),
+          );
+          return;
+        }
+        const ok = await promptConfirm({
+          title: l10n.t("Disable all GitStudio AI features?"),
+          message:
+            l10n.t("Commit-message drafting, diff explanation, summaries and AI review stop being offered. Git operations are unaffected. Re-enable with GitStudio: Connect AI Provider, or by setting gitstudio.ai.provider."),
+          confirmLabel: l10n.t("Disable AI"),
+        });
+        if (!ok) {
+          return;
+        }
+        await cfg.update(
+          "ai.provider",
+          "off",
+          vscode.ConfigurationTarget.Global,
+        );
+        void vscode.window.setStatusBarMessage(
+          l10n.t("$(check) GitStudio: AI features disabled"),
+          3000,
+        );
+      }),
+    );
+
+    // In-editor Pull Request review — GitHub first (M11). Connect once via VS
+    // Code's built-in GitHub auth, then list / check out / review / merge /
+    // create PRs without leaving the editor. Everything degrades gracefully:
+    // not a GitHub repo or not signed in → the view is empty + a connect-prompt
+    // shows, and no command throws. Reuses the AI features for the optional AI-drafted
+    // PR body.
+    registerPrFeature(context, repos, brain);
+
+    // Hunk/line staging + the unified Commit window (M7). The Commit webview now
+    // renders BOTH the message box AND the working-tree changes inline (SCM-style
+    // groups with a tree/list toggle), so it owns the changes surface; the old
+    // standalone "Changes" tree view is gone. It refreshes on
+    // RepoManager.onDidChange; a shared `refresh` also invalidates open
+    // index/HEAD diffs after a staging op.
+    const commitProvider = new CommitViewProvider(
+      context,
+      context.extensionUri,
+      repos,
+      () => {
+        revisionContent.notifyChanged();
+      },
+      context.globalState,
+      {
+        // The cached answer: this runs on every state push, and the probe
+        // behind isEnabled() is re-run by the events that can change it.
+        isEnabled: () => brain.isEnabledCached(),
+        draft: (entry) => draftCommitMessage(brain, entry),
+      },
+      merge.changesHooks,
+    );
+    context.subscriptions.push(commitProvider, revisionContent);
+
+    // The Changes view is where every GitStudio dialog renders — naming a
+    // branch, choosing a reset mode, confirming a delete. Registering it here
+    // means command code can call promptInput/promptPick/promptConfirm from
+    // anywhere (palette, graph, tree context menu) and get OUR dialog rather
+    // than the command-palette search bar. See ui/dialogs.ts.
+    context.subscriptions.push(registerDialogHost(commitProvider));
+
+    // The instant a model is connected/disconnected, refresh the composer so the
+    // plug → ✨/Review buttons flip live (not on the next git event).
+    context.subscriptions.push(
+      brain.onDidChangeEnabled(() => commitProvider.requestState()),
+    );
+
+    // After any staging op (line/hunk staging): re-push the commit webview's
+    // state and invalidate open diffs. The webview owns the change lists now.
+    // Staging state in VS Code's own gutter, and the status-bar counts. Both are
+    // constructed before runStagingRefresh (what stagingRefresh runs), which
+    // closes over them: declaring them after it would leave a temporal dead
+    // zone that any refresh fired during activation would fall into.
+    const stagedGutter = new StagedGutter(context, repos, (uri) =>
+      blame.ownsGutterStrip(uri),
+    );
+    // The hover's Stage / Unstage links (#87). Where they show, blame's hover
+    // leaves out its "Uncommitted changes" note: the links already say it.
+    const editorStaging = new EditorStagingActions(stagedGutter);
+    blame.yieldUncommittedHover((document, line) => editorStaging.offersLinksAt(document, line));
+    const statusCluster = new StatusCluster(repos);
+
+    // What `stagingRefresh` (declared above, before the merge hook) does.
+    runStagingRefresh = () => {
+      revisionContent.notifyChanged();
+      commitProvider.requestState();
+      stagedGutter.refreshAll();
+      statusCluster.refresh();
+      // Nudge vscode.git to re-scan so the groups update promptly.
+      const active = repos.getActive();
+      void active?.repo?.status?.();
+    };
+
+    context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(
+        CommitViewProvider.viewId,
+        commitProvider,
+        // Keep the webview alive when the view is hidden so switching away and
+        // back is INSTANT — without this VS Code disposes + rebuilds it (reload
+        // HTML, re-run JS, re-scan git) every time, which reads as seconds of lag.
+        { webviewOptions: { retainContextWhenHidden: true } },
+      ),
+      // Line / hunk staging in any file or diff editor.
+      stagedGutter,
+      vscode.commands.registerCommand(
+        "gitstudio.toggleStageAtLine",
+        async (arg?: LineMenuArg<vscode.Uri>) => {
+          // The line-number menu hands over a 1-BASED lineNumber and the
+          // document it was opened on; a keybinding hands over nothing and
+          // means "where the cursor is". See lineMenuTarget for why the menu's
+          // document wins over the active editor.
+          const editor = vscode.window.activeTextEditor;
+          const target = lineMenuTarget(
+            arg,
+            editor && { uri: editor.document.uri, line: editor.selection.active.line },
+          );
+          if (target) await stagedGutter.toggleAtUri(target.uri, target.line);
+        },
+      ),
+      // The hover's and the CodeLens's links (editorStagingActions.ts): the
+      // change at a line, staged or unstaged by the same engine as the menu
+      // item above; and the selected lines of the editor showing a document,
+      // by the same engine as Stage / Unstage Selected Lines.
+      editorStaging,
+      vscode.commands.registerCommand(SET_CHANGE_COMMAND, (arg?: unknown) => runSetChange(stagedGutter, arg)),
+      vscode.commands.registerCommand(SET_SELECTED_LINES_COMMAND, (arg?: unknown) =>
+        runSetSelectedLines(repos, stagingRefresh, arg),
+      ),
+      vscode.commands.registerCommand("gitstudio.stageSelectedLines", () =>
+        stageSelectedLines(repos, stagingRefresh),
+      ),
+      vscode.commands.registerCommand("gitstudio.unstageSelectedLines", () =>
+        unstageSelectedLines(repos, stagingRefresh),
+      ),
+      vscode.commands.registerCommand("gitstudio.stageHunk", () =>
+        stageHunk(repos, stagingRefresh),
+      ),
+      vscode.commands.registerCommand("gitstudio.unstageHunk", () =>
+        unstageHunk(repos, stagingRefresh),
+      ),
+      // Lets the commit webview pull fresh state (staged count) after a stage op.
+      vscode.commands.registerCommand("gitstudio.commit.requestState", () => {
+        commitProvider.requestState();
+      }),
+    );
+
+    // Interactive rebase + the universal Undo envelope (M8). The UndoLedger
+    // snapshots before every destructive op and offers one-keystroke reversal
+    // (with a pushed-history → Revert safeguard); the rebase editor renders any
+    // `git-rebase-todo` as the reorderable webview.
+    const undo = new UndoLedger(repos, context);
+    repos.setUndoLedger(undo);
+
+    context.subscriptions.push(
+      RebaseTodoEditorProvider.register(context),
+      vscode.commands.registerCommand(
+        "gitstudio.startInteractiveRebase",
+        (arg?: string | { commit?: { sha?: string } }) => {
+          const sha =
+            typeof arg === "string" ? arg : arg?.commit?.sha;
+          // Opens the visual Interactive Rebase workspace (editor-area panel)
+          // and drives the rebase non-interactively — works in VS Code, Cursor,
+          // and VSCodium (no terminal / `code --wait` dependency).
+          void RebaseWorkspacePanel.show(repos, undo, context.extensionUri, sha);
+        },
+      ),
+      vscode.commands.registerCommand("gitstudio.abortRebase", () =>
+        abortRebase(repos),
+      ),
+      vscode.commands.registerCommand("gitstudio.undo", () =>
+        undo.undoLast(),
+      ),
+      vscode.commands.registerCommand("gitstudio.showUndoHistory", () =>
+        undo.showHistory(),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.resetToCommit",
+        async (arg?: string | { commit?: { sha?: string; subject?: string } }) => {
+          const active = repos.getActive();
+          if (!active) {
+            return;
+          }
+          const sha = typeof arg === "string" ? arg : arg?.commit?.sha;
+          if (!sha) {
+            return;
+          }
+          const subject =
+            typeof arg === "string" ? "" : arg?.commit?.subject ?? "";
+          const changed = await runCommitAction(
+            "reset",
+            active.ctx,
+            { sha, subject },
+            (label, fn, opts) => undo.runWithUndo(active, label, fn, opts),
+          );
+          if (changed) {
+            commitsProvider.refresh();
+          }
+        },
+      ),
+    );
+
+    // M9 — the remaining sidebar pillars + operations: Worktrees, Search &
+    // Compare views; branch / remote / tag context actions; and the
+    // status-bar sync segment. Stashes live in the Changes view (its Stashes
+    // group), with palette commands of their own. Destructive ops (pop/drop,
+    // merge/rebase, branch delete) route through the universal Undo envelope
+    // via the RepoManager's wired-in ledger.
+    //
+    // Worktrees: a webview (views/worktreesWebview.ts). Its Push… opens the
+    // push review — the Changes view's — for that worktree; a Stash & Remove
+    // adds a stash, so the Changes view's Stashes group is told.
+    const worktreesProvider = new WorktreesWebviewProvider(
+      repos,
+      context.extensionUri,
+      context.workspaceState,
+      {
+        openPushReview: (target) => commitProvider.openPushReview(target),
+        onChanged: () => commitProvider.stashesChanged(),
+      },
+    );
+    const stashDiffContent = new StashDiffContentProvider(repos);
+    context.subscriptions.push(worktreesProvider);
+    // The stash list is the Changes view's Stashes group.
+    const refreshStashes = () => commitProvider.stashesChanged();
+    const refreshWorktrees = () => worktreesProvider.refresh();
+    const refreshBranches = () => refsProvider.refresh();
+
+    // The status-bar sync segment. The cluster beside it is constructed earlier,
+    // next to stagedGutter, because stagingRefresh closes over both.
+    const syncStatus = new SyncStatusItem(repos, () =>
+      commitProvider.openBranchMenu(),
+    );
+    context.subscriptions.push(
+      syncStatus,
+      statusCluster,
+      // "GitStudio: Branches…" — the same branch menu, from the keyboard: the
+      // palette, or a key the user binds to it.
+      vscode.commands.registerCommand("gitstudio.branches.open", () =>
+        commitProvider.openBranchMenu(),
+      ),
+    );
+
+    context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(
+        WorktreesWebviewProvider.viewId,
+        worktreesProvider,
+        // Kept while hidden: its open rows and the keyboard's place survive a
+        // collapse, and no read runs meanwhile (the provider skips them).
+        { webviewOptions: { retainContextWhenHidden: true } },
+      ),
+      vscode.window.registerWebviewViewProvider(
+        CommitsGraphViewProvider.viewId,
+        commitsGraphView,
+        // Retain so re-opening the Commits graph is instant (no re-render/re-fetch).
+        { webviewOptions: { retainContextWhenHidden: true } },
+      ),
+      vscode.workspace.registerTextDocumentContentProvider(
+        StashDiffContentProvider.scheme,
+        stashDiffContent,
+      ),
+
+      // ── Stashes ────────────────────────────────────────────────────────────
+      // Listed, file by file, in the Changes view's Stashes group, which runs
+      // these same operations by sha. From the palette they ask which stash,
+      // in the Changes view (never a quick pick); a caller that knows it
+      // passes `{ sha }`.
+      vscode.commands.registerCommand("gitstudio.stashes.refresh", () =>
+        refreshStashes(),
+      ),
+      vscode.commands.registerCommand("gitstudio.stash.save", () =>
+        saveStash(repos, refreshStashes),
+      ),
+      vscode.commands.registerCommand("gitstudio.stash.apply", async (arg?: { sha?: string }) => {
+        const sha = arg?.sha ?? (await pickStash(repos, l10n.t("Apply")));
+        if (sha) await applyStash(repos, sha, refreshStashes);
+      }),
+      vscode.commands.registerCommand("gitstudio.stash.pop", async (arg?: { sha?: string }) => {
+        const sha = arg?.sha ?? (await pickStash(repos, l10n.t("Pop")));
+        if (sha) await popStash(repos, sha, refreshStashes);
+      }),
+      vscode.commands.registerCommand("gitstudio.stash.drop", async (arg?: { sha?: string }) => {
+        const sha = arg?.sha ?? (await pickStash(repos, l10n.t("Drop")));
+        if (sha) await dropStash(repos, sha, refreshStashes);
+      }),
+      vscode.commands.registerCommand("gitstudio.stash.branch", async (arg?: { sha?: string }) => {
+        const sha = arg?.sha ?? (await pickStash(repos, l10n.t("Create a branch from")));
+        if (sha) await branchFromStash(repos, sha, refreshStashes);
+      }),
+      // Scoped stashes. Not in the palette: both take an argument, and a palette
+      // entry that silently stashes everything when invoked without one would be
+      // worse than no entry at all.
+      vscode.commands.registerCommand(
+        "gitstudio.stash.paths",
+        (arg?: { paths?: string[] }) =>
+          saveStash(repos, refreshStashes, { paths: arg?.paths ?? [] }),
+      ),
+      vscode.commands.registerCommand("gitstudio.stash.staged", () =>
+        saveStash(repos, refreshStashes, { stagedOnly: true }),
+      ),
+
+      // ── Worktrees ──────────────────────────────────────────────────────────
+      vscode.commands.registerCommand("gitstudio.worktrees.refresh", () =>
+        worktreesProvider.refresh(),
+      ),
+      // Each takes a worktree's folder (the view passes it); from the palette,
+      // with none, it asks which worktree. "Open Worktree" opens it in a new
+      // window — it asked which window, and every control now says where.
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.open",
+        (t?: WorktreeTarget) => openWorktreeIn(repos, t, "new"),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.openInNewWindow",
+        (t?: WorktreeTarget) => openWorktreeIn(repos, t, "new"),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.openHere",
+        (t?: WorktreeTarget) => openWorktreeIn(repos, t, "here"),
+      ),
+      vscode.commands.registerCommand("gitstudio.worktree.add", () =>
+        addWorktree(repos, refreshWorktrees),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.remove",
+        (t?: WorktreeTarget) => removeWorktree(repos, t, refreshWorktrees),
+      ),
+      // A worktree whose folder is gone, or isn't a worktree any more: git's
+      // record of it goes and nothing on disk changes. Its own door — never
+      // Remove's, which deletes a folder.
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.forget",
+        (t?: WorktreeTarget) => forgetWorktree(repos, t, refreshWorktrees),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.lock",
+        (t?: WorktreeTarget) => lockWorktree(repos, t, true, refreshWorktrees),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.worktree.unlock",
+        (t?: WorktreeTarget) => lockWorktree(repos, t, false, refreshWorktrees),
+      ),
+      vscode.commands.registerCommand("gitstudio.worktree.prune", () =>
+        pruneWorktrees(repos, refreshWorktrees),
+      ),
+
+      // ── Compare branches / tags ────────────────────────────────────────────
+      vscode.commands.registerCommand("gitstudio.compareRefs", () =>
+        ComparePanel.show(repos, context.extensionUri),
+      ),
+
+      // ── Branch / remote / tag context actions ──────────────────────────────
+      vscode.commands.registerCommand(
+        "gitstudio.branch.checkout",
+        (arg) => branchActions.checkoutBranch(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.merge",
+        (arg) =>
+          branchActions.mergeBranchIntoCurrent(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.rebase",
+        (arg) => branchActions.rebaseCurrentOnto(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.rename",
+        (arg) => branchActions.renameBranch(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.delete",
+        (arg) => branchActions.deleteBranch(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.push",
+        (arg) => branchActions.pushBranch(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.setUpstream",
+        (arg) => branchActions.setUpstream(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.resetToUpstream",
+        (arg) => branchActions.resetBranchToUpstream(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.new",
+        (arg) => branchActions.newBranchFrom(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.branch.createWorktree",
+        (arg) =>
+          branchActions.createWorktreeForBranch(repos, arg, refreshWorktrees),
+      ),
+      vscode.commands.registerCommand("gitstudio.branch.compare", (arg) => {
+        // Compare the clicked branch against the current one. The branch-pill
+        // menu passes `{ ref: { name } }`; the (dead) tree passed a RefNode.
+        const a = arg as
+          | { ref?: { name?: string }; name?: string }
+          | string
+          | undefined;
+        const head =
+          typeof a === "string" ? a : (a?.ref?.name ?? a?.name ?? undefined);
+        return ComparePanel.show(repos, context.extensionUri, undefined, head);
+      }),
+      vscode.commands.registerCommand(
+        "gitstudio.remoteBranch.checkout",
+        (arg) =>
+          branchActions.checkoutRemoteBranch(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.remoteBranch.delete",
+        (arg) => branchActions.deleteRemoteBranch(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.tag.checkout",
+        (arg) => branchActions.checkoutTag(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.tag.delete",
+        (arg) => branchActions.deleteTag(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand(
+        "gitstudio.tag.push",
+        (arg) => branchActions.pushTag(repos, arg, refreshBranches),
+      ),
+      vscode.commands.registerCommand("gitstudio.fetch", () =>
+        branchActions.fetchAll(repos, refreshBranches),
+      ),
+      vscode.commands.registerCommand("gitstudio.addRemote", () =>
+        branchActions.addRemote(repos, refreshBranches),
+      ),
+      vscode.commands.registerCommand("gitstudio.manageRemotes", () =>
+        branchActions.manageRemotes(repos, refreshBranches),
+      ),
+    );
+    log("registration complete — every section wired with no errors");
+    } catch (e) {
+      const detail = e instanceof Error ? (e.stack ?? e.message) : String(e);
+      log("ACTIVATION ERROR (everything after this line failed to register):");
+      log(detail);
+      console.error("[GitStudio] activation error:", e);
+      out.show(true);
+      void vscode.window.showErrorMessage(
+        notice(l10n.t("Could not finish loading — see the GitStudio Output channel for the error")),
+      );
+    }
+  }).catch((e) => {
+    const detail = e instanceof Error ? (e.stack ?? e.message) : String(e);
+    log("RepoManager.create() rejected — nothing registered: " + detail);
+    out.show(true);
+  });
+  return api;
+}
+
+export function deactivate(): void {
+  // no-op; disposables are tracked on context.subscriptions
+}

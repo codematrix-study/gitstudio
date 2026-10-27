@@ -1,0 +1,342 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { removeTempRepo } from "./tmpRepo";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { GitContext } from "@gitstudio/git-service/GitContext";
+import { RepoWatcher, gitWatchDirs, shouldRefreshFor, DEBOUNCE_MS } from "../src/main/repoWatcher";
+
+// The app never watched the filesystem, so editing a file elsewhere and switching
+// back showed a stale Changes list (issue #17). A watcher fixes that only if it
+// stays quiet: a recursive watch on a real repo sees node_modules churn during an
+// install and .git lock files several times a second during a fetch, and every
+// event we accept costs a git spawn.
+//
+// This predicate is the whole difference between a watcher that is invisible and
+// one that makes the app worse than it was.
+
+test("an ordinary source edit refreshes", () => {
+  for (const p of ["src/index.ts", "README.md", "a.txt", "deep/nested/file.rs"]) {
+    assert.equal(shouldRefreshFor(p), true, p);
+  }
+});
+
+test("dotfiles people actually edit still refresh", () => {
+  // A naive ".git" prefix check swallows all of these.
+  for (const p of [".gitignore", ".gitattributes", ".github/workflows/ci.yml", ".env"]) {
+    assert.equal(shouldRefreshFor(p), true, p);
+  }
+});
+
+test("build output and dependency trees are ignored", () => {
+  // The volume case: an npm install writes tens of thousands of these.
+  for (const p of [
+    "node_modules/lodash/index.js",
+    "apps/desktop/node_modules/x/y.js",
+    "dist/main.js",
+    "out/bundle.js",
+    "build/app.o",
+    "target/debug/app",
+    ".next/cache/x",
+    "__pycache__/mod.pyc",
+  ]) {
+    assert.equal(shouldRefreshFor(p), false, p);
+  }
+});
+
+test("git's own churn is ignored, but the parts that move history are not", () => {
+  // Kept: these change what the user sees.
+  for (const p of [
+    ".git/HEAD",
+    ".git/index",
+    ".git/packed-refs",
+    ".git/MERGE_HEAD",
+    ".git/CHERRY_PICK_HEAD",
+    ".git/REVERT_HEAD",
+    ".git/REBASE_HEAD",
+    ".git/refs/heads/main",
+    ".git/rebase-merge/done",
+  ]) {
+    assert.equal(shouldRefreshFor(p), true, p);
+  }
+  // Dropped: pure noise, and there is a lot of it.
+  for (const p of [
+    ".git/objects/ab/cdef123",
+    ".git/logs/HEAD",
+    ".git/COMMIT_EDITMSG",
+    ".git/FETCH_HEAD",
+    ".git/hooks/pre-commit.sample",
+  ]) {
+    assert.equal(shouldRefreshFor(p), false, p);
+  }
+});
+
+test("lock files never trigger — the real write follows a moment later", () => {
+  // Reacting to the lock doubles every refresh: git writes index.lock, then
+  // index. Both would fire inside one debounce window at best, two at worst.
+  for (const p of [".git/index.lock", ".git/refs/heads/main.lock", ".git/HEAD.lock"]) {
+    assert.equal(shouldRefreshFor(p), false, p);
+  }
+});
+
+test("editor scratch files are ignored", () => {
+  // Save-through-temp-file would otherwise fire twice per save.
+  for (const p of ["src/index.ts~", "src/.#index.ts", ".DS_Store", "src/.index.ts.swp", "notes.tmp"]) {
+    assert.equal(shouldRefreshFor(p), false, p);
+  }
+});
+
+test("Windows backslash paths are understood", () => {
+  // fs.watch hands back the platform separator, and on Windows that is "\".
+  assert.equal(shouldRefreshFor("src\\index.ts"), true);
+  assert.equal(shouldRefreshFor("node_modules\\lodash\\index.js"), false);
+  assert.equal(shouldRefreshFor(".git\\index"), true);
+  assert.equal(shouldRefreshFor(".git\\objects\\ab\\cdef"), false);
+  assert.equal(shouldRefreshFor(".git\\index.lock"), false);
+});
+
+test("an empty or nameless path never triggers", () => {
+  assert.equal(shouldRefreshFor(""), false);
+  assert.equal(shouldRefreshFor("/"), false);
+});
+
+test("a file merely NAMED like an ignored directory still refreshes", () => {
+  // The filter matches path SEGMENTS, so a real source file called dist.ts, or a
+  // folder called distribution, must not be swallowed.
+  assert.equal(shouldRefreshFor("src/dist.ts"), true);
+  assert.equal(shouldRefreshFor("distribution/readme.md"), true);
+  assert.equal(shouldRefreshFor("src/build.rs"), true);
+  assert.equal(shouldRefreshFor("my-node_modules-notes.md"), true);
+});
+
+// ── The watcher itself, against a real directory ─────────────────────────────
+//
+// The filter tests above prove what we IGNORE. These prove the thing actually
+// fires — which is the half that matters to the person who reported it, and the
+// half a pure unit test cannot show.
+
+/** Resolve on the watcher's next callback, or reject after `ms`. */
+/**
+ * Await the first reported change, re-doing `write` until one arrives.
+ *
+ * A single write races the watcher: `fs.watch` is not listening the instant the
+ * constructor returns — on macOS FSEvents in particular there is a real arming
+ * delay — so a write issued immediately can land before anything is watching and
+ * the test then waits out its whole timeout for an event that was never going to
+ * come. It failed roughly one run in ten, which is exactly the shape that breaks
+ * a release instead of a pull request.
+ *
+ * Repeating the write removes the race without weakening the assertion: what is
+ * being tested is that a change of this KIND is classified correctly, not that
+ * the watcher catches one specific syscall.
+ *
+ * The poke interval must EXCEED the watcher's debounce. Poking faster than it
+ * resets the debounce timer on every iteration, so the refresh it is waiting for
+ * can never fire and the helper written to remove a flake instead hangs every
+ * run — which is exactly what the first version of this did.
+ */
+const POKE_MS = DEBOUNCE_MS + 100;
+
+async function changeAfter(
+  attach: (cb: (info: { gitDir: boolean }) => void) => void,
+  write: () => void,
+  ms = 5000,
+): Promise<{ gitDir: boolean }> {
+  let seen: { gitDir: boolean } | undefined;
+  attach((info) => {
+    seen ??= info;
+  });
+  const deadline = Date.now() + ms;
+  while (!seen && Date.now() < deadline) {
+    write();
+    await new Promise((r) => setTimeout(r, POKE_MS));
+  }
+  if (!seen) throw new Error(`no change within ${ms}ms`);
+  return seen;
+}
+
+test("a working-tree edit fires, and is NOT reported as a git-dir change", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gs-watch-"));
+  mkdirSync(join(dir, ".git"), { recursive: true });
+  let fire: ((i: { gitDir: boolean }) => void) | undefined;
+  const w = new RepoWatcher(dir, (i) => fire?.(i));
+  try {
+    if (w.degraded) {
+      return; // no recursive watch on this platform/kernel — the focus path covers it
+    }
+    const info = await changeAfter(
+      (cb) => (fire = cb),
+      () => writeFileSync(join(dir, "hello.txt"), `hi ${process.hrtime.bigint()}\n`),
+    );
+    assert.equal(info.gitDir, false, "a file edit must not drag a graph reload with it");
+  } finally {
+    w.dispose();
+    removeTempRepo(dir);
+  }
+});
+
+test("a .git change IS reported as one, so history gets re-read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gs-watch-"));
+  mkdirSync(join(dir, ".git"), { recursive: true });
+  let fire: ((i: { gitDir: boolean }) => void) | undefined;
+  const w = new RepoWatcher(dir, (i) => fire?.(i));
+  try {
+    if (w.degraded) {
+      return;
+    }
+    const info = await changeAfter(
+      (cb) => (fire = cb),
+      () => writeFileSync(join(dir, ".git", "HEAD"), `ref: refs/heads/main\n`),
+    );
+    assert.equal(info.gitDir, true);
+  } finally {
+    w.dispose();
+    removeTempRepo(dir);
+  }
+});
+
+test("a burst of writes collapses into ONE refresh", async () => {
+  // Save All over fifty files, or a build, must not mean fifty git spawns.
+  const dir = mkdtempSync(join(tmpdir(), "gs-watch-"));
+  mkdirSync(join(dir, ".git"), { recursive: true });
+  let calls = 0;
+  const w = new RepoWatcher(dir, () => {
+    calls++;
+  });
+  try {
+    if (w.degraded) {
+      return;
+    }
+    for (let i = 0; i < 50; i++) {
+      writeFileSync(join(dir, `f${i}.txt`), `x${i}\n`);
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+    // One in practice; two only if the burst itself straddles the debounce window
+    // on a loaded CI runner. Either way the claim being made — that a Save All is
+    // not fifty git spawns — holds.
+    assert.ok(calls >= 1 && calls <= 2, `fifty writes produced ${calls} refreshes`);
+  } finally {
+    w.dispose();
+    removeTempRepo(dir);
+  }
+});
+
+test("ignored churn produces NO refresh at all", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gs-watch-"));
+  mkdirSync(join(dir, ".git", "objects", "ab"), { recursive: true });
+  mkdirSync(join(dir, "node_modules", "pkg"), { recursive: true });
+  let calls = 0;
+  const w = new RepoWatcher(dir, () => {
+    calls++;
+  });
+  try {
+    if (w.degraded) {
+      return;
+    }
+    writeFileSync(join(dir, ".git", "objects", "ab", "cdef"), "blob\n");
+    writeFileSync(join(dir, ".git", "index.lock"), "");
+    for (let i = 0; i < 20; i++) {
+      writeFileSync(join(dir, "node_modules", "pkg", `m${i}.js`), "//\n");
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+    // At most one, not exactly zero — and the difference is a real property of
+    // fs.watch rather than slack in the test. The OS sometimes reports a change
+    // WITHOUT naming the file (a coalesced batch), and the watcher deliberately
+    // treats that as "something happened, refresh": missing a change is the bug
+    // being fixed here, so an unnameable event errs towards refreshing. The
+    // guarantee that matters is that twenty-two ignored writes cannot produce a
+    // storm — which the debounce plus the filter deliver.
+    assert.ok(calls <= 1, `an npm install must not wake the app up repeatedly (got ${calls})`);
+  } finally {
+    w.dispose();
+    removeTempRepo(dir);
+  }
+});
+
+test("dispose() stops it, so a closed repo cannot keep firing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gs-watch-"));
+  let calls = 0;
+  const w = new RepoWatcher(dir, () => {
+    calls++;
+  });
+  w.dispose();
+  writeFileSync(join(dir, "after.txt"), "x\n");
+  await new Promise((r) => setTimeout(r, 800));
+  assert.equal(calls, 0);
+  removeTempRepo(dir);
+});
+
+test("a missing directory degrades instead of throwing", () => {
+  // The app must survive opening a repo that vanished from under it.
+  const w = new RepoWatcher(join(tmpdir(), "gs-does-not-exist-" + Date.now()), () => {});
+  assert.equal(w.degraded, true, "no watcher, but no crash either");
+  w.dispose();
+});
+
+// ── Linked worktrees (the watcher's .git is not a directory) ────────────────
+//
+// In a LINKED worktree `.git` is a FILE pointing at <main>/.git/worktrees/<wt>,
+// where HEAD, the index, MERGE_HEAD and rebase-merge/ live; the refs a commit
+// moves live in the main repository's common dir. A watcher that only
+// matches `.git/<name>` under the worktree root saw none of it: a merge or
+// rebase stopping there, or a commit made there from a terminal, never
+// refreshed anything. The directories come from `git rev-parse --git-path`,
+// as every operation read already does.
+
+test("sequencer/ (a cherry-pick or revert range) is worth a refresh", () => {
+  assert.equal(shouldRefreshFor(".git/sequencer/todo"), true);
+  assert.equal(shouldRefreshFor(".git/sequencer/head"), true);
+});
+
+test("a linked worktree's git dir is watched: a commit made there is a git-dir change", async () => {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0" };
+  const git = (cwd: string, ...a: string[]): string =>
+    execFileSync("git", a, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "gs-watch-wt-")));
+  const mainRoot = join(base, "main");
+  const wt = join(base, "wt");
+  mkdirSync(mainRoot);
+  git(mainRoot, "init", "-q", "-b", "main");
+  git(mainRoot, "config", "user.email", "t@t");
+  git(mainRoot, "config", "user.name", "t");
+  writeFileSync(join(mainRoot, "a.txt"), "a\n");
+  git(mainRoot, "add", "-A");
+  git(mainRoot, "commit", "-qm", "base");
+  git(mainRoot, "worktree", "add", "-q", "-b", "side", wt);
+  const ctx = new GitContext({ root: wt });
+  let fire: ((i: { gitDir: boolean }) => void) | undefined;
+  const w = new RepoWatcher(wt, (i) => fire?.(i));
+  try {
+    if (w.degraded) return;
+    const dirs = await gitWatchDirs(ctx);
+    assert.ok(dirs, "git named the worktree's directories");
+    // Compared as the OS spells them: on Windows git names these by the long
+    // path (C:/Users/runneradmin/…, from the gitfile) while `base` may be an
+    // 8.3 short one (C:\Users\RUNNER~1\…, os.tmpdir()) — one folder, two
+    // spellings, and the JS realpath keeps the spelling it is given.
+    const real = (p: string) => realpathSync.native(p);
+    assert.equal(real(dirs!.commonDir), real(join(mainRoot, ".git")));
+    assert.equal(dirname(real(dirs!.gitDir)), real(join(mainRoot, ".git", "worktrees")));
+    w.watchGitDirs(dirs!);
+    let n = 0;
+    const info = await changeAfter(
+      (cb) => (fire = cb),
+      () => git(wt, "commit", "-q", "--allow-empty", "-m", `empty ${n++}`),
+    );
+    assert.equal(info.gitDir, true, "a commit is history moving, not a file edit");
+  } finally {
+    w.dispose();
+    ctx.dispose();
+    removeTempRepo(base);
+  }
+});
+
+test("gitWatchDirs refuses an answer that does not name what it asked for", async () => {
+  // A git killed mid-answer used to come back as exit 0 with no output, and
+  // `resolve(root, "")` is the root — the folder ABOVE .git would have been
+  // watched as the "git dir".
+  const fake = { operation: { gitPath: async (name: string) => (name === "HEAD" ? "/repo" : "/repo/.git/refs") } };
+  assert.equal(await gitWatchDirs(fake), undefined);
+});

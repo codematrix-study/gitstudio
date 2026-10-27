@@ -1,0 +1,333 @@
+// esbuild build for the GitStudio desktop (Electron) app — three bundles plus
+// Monaco's editor worker:
+//   • main     — Electron main process (Node/CJS; `electron` external)
+//   • preload  — contextBridge preload  (Node/CJS; `electron` external)
+//   • renderer — the page bundle        (browser/IIFE; bundles Lit + Monaco +
+//                the @gitstudio/* packages)
+//
+// The renderer mirrors the extension's webview build: the dompurify-redirect
+// plugin (so Monaco carries the patched standalone dompurify), `.ttf` inlined as
+// a data URL, and a standalone Monaco worker. `electron` is marked external, so
+// these bundles build WITHOUT the Electron binary installed.
+
+const esbuild = require("esbuild");
+const path = require("path");
+const fs = require("fs");
+
+const production = process.argv.includes("--production");
+const watch = process.argv.includes("--watch");
+
+const repoRoot = path.resolve(__dirname, "../..");
+const rendererDir = path.resolve(__dirname, "src/renderer");
+const distDir = path.resolve(__dirname, "dist");
+
+/**
+ * monaco-editor vendors a stale DOMPurify; redirect its internal import to the
+ * patched standalone dompurify (pinned via the root npm "overrides"). Identical
+ * to the extension's plugin.
+ * @type {import('esbuild').Plugin}
+ */
+const dompurifyRedirectPlugin = {
+  name: "dompurify-redirect",
+  setup(build) {
+    const patched = path.join(
+      path.dirname(require.resolve("dompurify")),
+      "purify.es.mjs",
+    );
+    build.onResolve({ filter: /dompurify[\\/]dompurify\.js$/ }, () => ({
+      path: patched,
+    }));
+  },
+};
+
+/**
+ * Drop Monaco's four LANGUAGE SERVICES (css / html / json / typescript).
+ *
+ * `import * as monaco from "monaco-editor"` resolves to editor.main.js, which
+ * pulls in those four alongside the 81 basic-language tokenizers. Each service
+ * wants its OWN web worker — ts.worker, json.worker and so on — and we ship
+ * only the base editor worker. So every TypeScript file opened in a diff fired
+ * language requests at a worker with no handler for them, and the renderer took
+ * seven uncaught errors per file click:
+ *
+ *   Uncaught Error: Missing requestHandler or method: getNavigationTree
+ *   Uncaught Error: Missing requestHandler or method: provideInlayHints
+ *   (unhandled rejection) Missing requestHandler or method: getSyntacticDiagnostics
+ *
+ * This was known and written off in monacoBoot.ts as "harmless noise" filtered
+ * by the error boundary. It is neither: they reach window.onerror, they are
+ * uncaught, and the person using the app sees them. Filtering the symptom was
+ * the wrong move — the services should not be loaded at all. Nothing is lost:
+ * the app has never offered IntelliSense, diffing lives in the BASE worker, and
+ * syntax highlighting comes from the basic-language tokenizers, which stay.
+ *
+ * Kept as a build-time redirect rather than a curated import list so a Monaco
+ * upgrade cannot quietly re-add a service, and so the three renderer modules go
+ * on importing "monaco-editor" plainly.
+ * @type {import('esbuild').Plugin}
+ */
+const monacoLanguageServicesPlugin = {
+  name: "monaco-drop-language-services",
+  setup(build) {
+    const SERVICES = /[\\/]language[\\/](css|html|json|typescript)[\\/]monaco\.contribution(\.js)?$/;
+    build.onResolve({ filter: SERVICES }, (args) => {
+      if (!args.importer.includes("monaco-editor")) return null;
+      return { path: args.path, namespace: "monaco-dropped" };
+    });
+    build.onLoad({ filter: /.*/, namespace: "monaco-dropped" }, () => ({
+      contents: "",
+      loader: "js",
+    }));
+  },
+};
+
+/** @type {import('esbuild').Plugin} */
+const problemMatcherPlugin = {
+  name: "esbuild-problem-matcher",
+  setup(build) {
+    build.onStart(() => console.log("[build] started"));
+    build.onEnd((result) => {
+      for (const { text, location } of result.errors) {
+        console.error(`✘ [ERROR] ${text}`);
+        if (location) {
+          console.error(
+            `    ${location.file}:${location.line}:${location.column}:`,
+          );
+        }
+      }
+      console.log(
+        `[build] finished${result.errors.length ? ` with ${result.errors.length} error(s)` : ""}`,
+      );
+    });
+  },
+};
+
+/** @type {import('esbuild').BuildOptions} */
+const base = {
+  bundle: true,
+  minify: production,
+  sourcemap: !production,
+  logLevel: "silent",
+  tsconfig: path.resolve(__dirname, "tsconfig.json"),
+  plugins: [problemMatcherPlugin],
+};
+
+function copyStaticAssets() {
+  fs.mkdirSync(path.join(distDir, "renderer"), { recursive: true });
+  // The page shell — cache-bust the bundle refs so a reload after a rebuild can
+  // NEVER serve Chromium's stale cached renderer.css / renderer.js.
+  const stamp = Date.now().toString(36);
+  const html = fs
+    .readFileSync(path.join(rendererDir, "index.html"), "utf8")
+    .replace('href="./renderer.css"', `href="./renderer.css?v=${stamp}"`)
+    .replace('src="./theme-boot.js"', `src="./theme-boot.js?v=${stamp}"`)
+    .replace('src="./renderer.js"', `src="./renderer.js?v=${stamp}"`);
+  // Preload the icon fonts.
+  //
+  // They used to be base64 inside the stylesheet, so they were resident the
+  // moment it parsed. As separate files they are fetched on demand, and every
+  // one of these faces is declared `font-display: block` — which renders glyphs
+  // INVISIBLE rather than falling back while it waits. Off local disk that
+  // window is sub-millisecond, but it is a new dependency on the first-paint
+  // path and it costs one line to remove: preloading starts the read alongside
+  // the stylesheet instead of after it.
+  const fonts = fs
+    .readdirSync(path.join(distDir, "renderer"))
+    .filter((f) => f.endsWith(".ttf"))
+    .sort();
+  const preloads = fonts
+    .map((f) => `    <link rel="preload" as="font" type="font/ttf" href="./${f}" crossorigin />\n`)
+    .join("");
+  fs.writeFileSync(
+    path.join(distDir, "renderer/index.html"),
+    preloads ? html.replace("  </head>", preloads + "  </head>") : html,
+  );
+  // The pre-paint theme bootstrap — a same-origin file so the CSP can forbid
+  // inline scripts. Copied verbatim (esbuild does not process it).
+  fs.copyFileSync(
+    path.join(rendererDir, "theme-boot.js"),
+    path.join(distDir, "renderer/theme-boot.js"),
+  );
+  // The window/dev icon (electron-builder embeds the packaged icon separately)
+  // plus the in-app brand assets. The welcome hero is the squircle app-icon
+  // mark, theme-swapped (a light-tile sibling so it sits on the light welcome
+  // screen instead of floating as a dark square); the wordmark is theme-swapped
+  // text. The top-bar mark is an inline currentColor SVG in the renderer, so it
+  // needs no asset here.
+  const brand = {
+    "brand/gitstudio-icon-512.png": "icon.png",
+    // Light-tile sibling of the dock mark, so the dock icon can theme-swap at
+    // runtime (main's `appearance:dockIcon` picks light/dark per the app theme).
+    "brand/gitstudio-icon-light-512.png": "icon-light.png",
+    // The Dock tiles: the same artwork on Apple's icon grid (see main.ts
+    // dockIconPath) so a runtime theme swap never shrinks the icon.
+    "brand/gitstudio-dock-1024.png": "dock.png",
+    "brand/gitstudio-dock-light-1024.png": "dock-light.png",
+    // Dark style ▸ Graphite (shared/darkStyle.ts): the tile macOS draws for
+    // the closed app, for a dev build's Dock (its bundle icon is Electron's)
+    // and Settings' preview.
+    "brand/gitstudio-dock-graphite-1024.png": "dock-graphite.png",
+    "brand/gitstudio-icon-graphite-512.png": "icon-graphite.png",
+    "brand/gitstudio-icon.svg": "brand-icon.svg",
+    "brand/gitstudio-icon-light.svg": "brand-icon-light.svg",
+    "brand/gitstudio-wordmark-light.svg": "brand-wordmark-light.svg",
+    "brand/gitstudio-wordmark-dark.svg": "brand-wordmark-dark.svg",
+  };
+  for (const [src, dest] of Object.entries(brand)) {
+    const abs = path.join(repoRoot, src);
+    if (fs.existsSync(abs)) {
+      fs.copyFileSync(abs, path.join(distDir, "renderer", dest));
+    }
+  }
+  writeLanguageBundles();
+}
+
+/**
+ * dist/l10n/bundle.l10n.<locale>.json: each language in the shared catalog
+ * (l10n/<locale>.json at the repository root) cut down to the messages the
+ * desktop asks for (l10n/bundle.l10n.json here, made by
+ * scripts/i18n/bundle-nls.mjs --write). main/language.ts loads one at start.
+ */
+function writeLanguageBundles() {
+  const out = path.join(distDir, "l10n");
+  fs.rmSync(out, { recursive: true, force: true });
+  fs.mkdirSync(out, { recursive: true });
+  const source = JSON.parse(fs.readFileSync(path.join(__dirname, "l10n/bundle.l10n.json"), "utf8"));
+  const catalog = path.join(repoRoot, "l10n");
+  for (const name of fs.existsSync(catalog) ? fs.readdirSync(catalog) : []) {
+    const locale = /^(.+)\.json$/.exec(name)?.[1];
+    if (!locale) continue;
+    const all = JSON.parse(fs.readFileSync(path.join(catalog, name), "utf8"));
+    const cut = {};
+    for (const key of Object.keys(source)) if (key in all) cut[key] = all[key];
+    fs.writeFileSync(path.join(out, `bundle.l10n.${locale}.json`), JSON.stringify(cut));
+  }
+}
+
+/** A plugin that re-copies the static assets after each (re)build, for watch. */
+const copyAssetsPlugin = {
+  name: "copy-assets",
+  setup(build) {
+    build.onEnd(() => copyStaticAssets());
+  },
+};
+
+async function main() {
+  const mainCtx = await esbuild.context({
+    ...base,
+    entryPoints: [path.resolve(__dirname, "src/main/main.ts")],
+    outfile: path.join(distDir, "main/main.js"),
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+    // `electron` is provided by the runtime; `node-pty` is a NATIVE module (the
+    // terminal bridge loads it lazily) that can't be bundled — kept external so
+    // `require("node-pty")` resolves from node_modules (packaged builds
+    // asar-unpack it). electron-updater is pure JS and MUST be bundled: the
+    // packaged app ships only `dist/**` (not node_modules), so leaving it
+    // external silently disabled auto-update in every shipped build.
+    external: ["electron", "node-pty"],
+  });
+
+  const preloadCtx = await esbuild.context({
+    ...base,
+    entryPoints: [path.resolve(__dirname, "src/preload/preload.ts")],
+    outfile: path.join(distDir, "preload/preload.js"),
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+    external: ["electron"],
+  });
+
+  const rendererCtx = await esbuild.context({
+    ...base,
+    entryPoints: [path.resolve(rendererDir, "renderer.ts")],
+    outfile: path.join(distDir, "renderer/renderer.js"),
+    platform: "browser",
+    format: "iife",
+    target: "chrome120",
+    // The bundle's first statement asks main to show the window — see
+    // src/renderer/launch-reveal.js for why there, and why not a module.
+    banner: { js: fs.readFileSync(path.join(rendererDir, "launch-reveal.js"), "utf8") },
+    // FILE, not dataurl. Six stylesheets declare @font-face for the same
+    // @vscode/codicons TTF — app.css plus the shared webview-ui sheets the
+    // desktop pulls in — and `dataurl` inlines the bytes at every import site.
+    // The shipped stylesheet came out 55% base64, with three byte-identical
+    // copies of the same 125,828-byte font in it. esbuild emits each distinct
+    // file once and rewrites every url() to point at it, so the duplication
+    // disappears without touching a single @font-face rule.
+    loader: { ".ttf": "file" },
+    plugins: [
+      problemMatcherPlugin,
+      dompurifyRedirectPlugin,
+      monacoLanguageServicesPlugin,
+      copyAssetsPlugin,
+    ],
+  });
+
+  // The MCP server (apps/mcp), as ONE self-contained file the app ships.
+  //
+  // Settings ▸ Agent Access installs this into Claude Desktop / Cursor / VS
+  // Code / Windsurf, which launch it with the app's own executable as Node
+  // (see main/mcpConfig.ts). electron-builder copies dist/mcp out of the asar
+  // as resources/mcp/ — an MCP client needs a real file path. Built here rather
+  // than by apps/mcp's own script so that every desktop build, the release
+  // workflow's included, has it: nothing ever packaged apps/mcp before, and
+  // every shipped build offered an Add button that could not work (#16).
+  const mcpCtx = await esbuild.context({
+    ...base,
+    tsconfig: path.resolve(__dirname, "../mcp/tsconfig.json"),
+    entryPoints: [path.resolve(__dirname, "../mcp/src/index.ts")],
+    outfile: path.join(distDir, "mcp/gitstudio-mcp.js"),
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+  });
+
+  // Monaco's editor worker, bundled standalone; loaded via a blob shim at runtime.
+  const workerCtx = await esbuild.context({
+    ...base,
+    entryPoints: [
+      require.resolve("monaco-editor/esm/vs/editor/editor.worker.js"),
+    ],
+    outfile: path.join(distDir, "renderer/editor.worker.js"),
+    platform: "browser",
+    format: "iife",
+    target: "chrome120",
+  });
+
+  const contexts = [mainCtx, preloadCtx, rendererCtx, workerCtx, mcpCtx];
+
+  if (watch) {
+    await Promise.all(contexts.map((c) => c.watch()));
+    console.log("[build] watching…");
+  } else {
+    await Promise.all(contexts.map((c) => c.rebuild()));
+    copyStaticAssets();
+    reportSizes();
+    await Promise.all(contexts.map((c) => c.dispose()));
+  }
+}
+
+function reportSizes() {
+  const files = [
+    "main/main.js",
+    "preload/preload.js",
+    "renderer/renderer.js",
+    "renderer/editor.worker.js",
+    "mcp/gitstudio-mcp.js",
+  ];
+  console.log("[build] bundle sizes:");
+  for (const rel of files) {
+    const p = path.join(distDir, rel);
+    if (fs.existsSync(p)) {
+      const kb = (fs.statSync(p).size / 1024).toFixed(1);
+      console.log(`  ${rel.padEnd(28)} ${kb} KB`);
+    }
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

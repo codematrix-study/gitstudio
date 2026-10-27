@@ -1,0 +1,915 @@
+// The Notifications section view — the user's GitHub inbox. A single-pane LIST
+// view (like Actions / Projects, not the two-pane gh-list/gh-detail): each row
+// IS the unit of interaction (open the subject + per-row mark-read), with two
+// inbox-wide actions in the header (a "Show all / Unread only" toggle and
+// "Mark all read"). Notifications are ACCOUNT-scoped, so the gate does NOT
+// require a github.com repo (NEEDS_REPO = false).
+
+import * as l10n from "@vscode/l10n";
+import { host } from "../bridge";
+import {
+  el,
+  span,
+  glyph,
+  pill,
+  relTimeISO,
+  absTimeISO,
+  skeletonList,
+  loadingState,
+  statePill,
+  errorState,
+  emptyState,
+  cleanErr,
+  openMenu,
+  textBtn,
+  ghRow,
+  subLink,
+  parseGitHubItemUrl,
+} from "../ui";
+import { toast, confirmDialog, openModal } from "../dialogs";
+import { renderMarkdown } from "../markdown";
+import { registerLayer } from "../overlays";
+import { openRemoteRepoBrowser } from "../repoBrowser";
+import {
+  facetBar,
+  blankable,
+  ghGate,
+  segmented,
+  ghHeader,
+  wireToolsWrap,
+  harvestValues,
+  searchField,
+  wireListNav,
+  type FacetState,
+  type SectionRender,
+  type SectionNav,
+} from "./common";
+import type { NotificationThread } from "../../shared/ipc";
+import { perTab } from "../tabState";
+
+/** What the Inbox remembers, for ONE tab (issue #32; tabState.ts): every tab
+ *  keeps its own Inbox page, and a shared query was what another tab's page
+ *  rebuilt with. */
+interface InboxTabState {
+  /** Persisted across re-renders of this view: include already-read threads? */
+  notifAll: boolean;
+  /** Inbox text query — the only one of the four lists that had no search. */
+  notifQuery: string;
+  /** Inbox facets (type / reason / repo), kept across refreshes. */
+  notifFacets: FacetState;
+}
+const inboxTab = perTab<InboxTabState>(() => ({ notifAll: false, notifQuery: "", notifFacets: {} }));
+
+/** The dismiss handle for the open notifications popover (so the bell toggles). */
+let closePanel: ((restoreFocus?: boolean) => void) | null = null;
+
+export const renderNotifications: SectionRender = (wrap, nav) => {
+  void mount(wrap, nav);
+};
+
+async function mount(wrap: HTMLElement, nav: SectionNav): Promise<void> {
+  const S = inboxTab();
+  const refresh = (): void => renderNotifications(wrap, nav);
+  // Gate first (NEEDS_REPO = false — the inbox is account-wide).
+  const gate = await ghGate(wrap, nav, false, refresh);
+  if (!gate) return;
+
+  // The in-app issue/PR views are scoped to the CURRENT repo, so a notification
+  // can only deep-link in-app when it belongs to that repo (else it's genuinely
+  // another repo and "Open" still goes to GitHub). Resolve the current slug once.
+  let currentRepo: string | undefined;
+  try {
+    const status = await host.invoke("github:status", undefined);
+    if (status.repo) currentRepo = `${status.repo.owner}/${status.repo.repo}`.toLowerCase();
+  } catch {
+    /* no current repo / not connected — every Open falls back to GitHub */
+  }
+
+  const view = el("div", "list-view notif-view");
+
+  // Header: title + signed-in @login + a refresh, then splice in the inbox-wide
+  // action cluster (toggle + mark-all-read) so the chrome matches the other
+  // section views while exposing the actions unique to a list-of-actions view.
+  const header = ghHeader(l10n.t("Inbox"), gate.login, refresh);
+  // On the page this is a .gh-head-tools row like every sibling list's —
+  // segment first, facets, then the verb pinned right — so the header is
+  // the same two lines at the same height. The popover keeps its own shape.
+  const actions = el("div", "notif-actions");
+
+  // A segment shows which mode you are IN. The old button was labelled with the
+  // action it would perform ("Show all"), styled identically in both states, so
+  // nothing on screen said whether you were looking at everything or not.
+  const toggleBtn = segmented<"unread" | "all">({
+    options: [
+      { value: "unread", label: l10n.t("Unread") },
+      { value: "all", label: l10n.t("All") },
+    ],
+    value: S.notifAll ? "all" : "unread",
+    ariaLabel: l10n.t("Which notifications to show"),
+    onChange: (v) => {
+      S.notifAll = v === "all";
+      refresh();
+    },
+  });
+
+  const markAllBtn = el("button", "mini-btn notif-markall");
+  markAllBtn.append(glyph("check-all"), span(l10n.t("Mark all read")));
+  // A tooltip that repeats the label tells nobody anything — and in the bell
+  // popover the label is hidden, so this title is the button's ONLY name.
+  // It says what the click really does, which is more than the list shows:
+  // the request marks the whole inbox on GitHub, not just the 150 threads
+  // loaded here, so it deliberately quotes no number.
+  markAllBtn.title = l10n.t("Mark every notification in your inbox as read on GitHub");
+  markAllBtn.setAttribute("aria-label", markAllBtn.title);
+  markAllBtn.addEventListener("click", () => void markAllRead(markAllBtn, refresh));
+
+  // The facet bar belongs to the full Inbox page. In the 520px bell popover it
+  // pushed the refresh button onto a second line, leaving a 40px band that was
+  // 90% empty — and filtering is not what a glance at the bell is for.
+  const inPopover = !!wrap.closest(".notif-pop");
+  // …and because the popover shows no filter UI, it must not APPLY the page's
+  // either. Sharing the module state meant filtering the Inbox to "review
+  // requested" silently made the bell hide every other unread thread, with
+  // nothing on screen to say why or any way to clear it. The bell is a glance
+  // at what is unread; it keeps its own (empty) filters.
+  const facetState: FacetState = inPopover ? {} : S.notifFacets;
+  let query = inPopover ? "" : S.notifQuery;
+
+  // Type / reason facets over the fetched inbox — triage is exactly "show me
+  // only the review requests", and scrolling for them is not triage.
+  const facets = facetBar<NotificationThread>({
+    specs: [
+      {
+        key: "type",
+        label: l10n.t("Type"),
+        icon: "inbox",
+        anyLabel: l10n.t("Anything"),
+        harvest: harvestValues<NotificationThread>((t) => t.type, notifTypeLabel),
+        predicate: (t, v) => t.type === v,
+      },
+      {
+        key: "reason",
+        label: l10n.t("Reason"),
+        icon: "question",
+        anyLabel: l10n.t("Any reason"),
+        harvest: harvestValues<NotificationThread>((t) => t.reason, notifReasonLabel),
+        predicate: (t, v) => t.reason === v,
+      },
+      {
+        key: "repo",
+        label: l10n.t("Repo"),
+        icon: "repo",
+        anyLabel: l10n.t("All repos"),
+        harvest: harvestValues<NotificationThread>((t) => t.repo),
+        predicate: (t, v) => t.repo === v,
+      },
+    ],
+    state: facetState,
+    items: [],
+    onChange: () => renderThreads(),
+  });
+
+  // Every sibling list has a search field; the Inbox's header was a title on
+  // the far left and a control cluster on the far right with a gap between.
+  if (!inPopover) {
+    header.querySelector(".gh-head-titlewrap")?.appendChild(
+      searchField({
+        placeholder: l10n.t("Search notifications…"),
+        initial: query,
+        onInput: (q) => {
+          query = q;
+          S.notifQuery = q;
+          renderThreads();
+        },
+      }),
+    );
+  }
+  if (inPopover) {
+    actions.append(toggleBtn, markAllBtn);
+  } else {
+    actions.classList.add("gh-head-tools");
+    const verbs = el("div", "gh-head-verbs");
+    verbs.appendChild(markAllBtn);
+    actions.append(toggleBtn, facets.el, verbs);
+    wireToolsWrap(actions);
+  }
+  // ghHeader returns a flex row: [title] [.gh-acct]. Insert the action cluster
+  // just before the account block so it reads: title … [actions] @login ↻.
+  const acct = header.querySelector(".gh-acct");
+  if (acct) header.insertBefore(actions, acct);
+  else header.appendChild(actions);
+
+  view.appendChild(header);
+  const body = el("div", "list-body notif-body");
+  view.appendChild(body);
+  wrap.replaceChildren(view);
+
+  // Keyboard triage: ↑/↓ move, Enter opens (wireListNav), and `e` archives —
+  // marks the focused row's thread read, the way every inbox does it.
+  wireListNav(body, ".notif-row");
+  const rowThreads = new Map<HTMLElement, NotificationThread>();
+  body.addEventListener("keydown", (ev) => {
+    if (ev.key !== "e" || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const target = ev.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+    const row = (document.activeElement as HTMLElement | null)?.closest?.(".notif-row") as HTMLElement | null;
+    const t = row ? rowThreads.get(row) : undefined;
+    if (!row || !t || !t.unread) return;
+    ev.preventDefault();
+    void markRead(t, row, body, refresh, syncCounts);
+  });
+
+  // Load.
+  body.replaceChildren(skeletonList(6));
+  let threads: NotificationThread[];
+  try {
+    threads = await host.invoke("notifications:list", { all: S.notifAll, participating: false });
+  } catch (e) {
+    // The gate already confirmed a connection; a throw here is a real API error
+    // (auth / rate limit / network) — show an error state with Retry, never a
+    // misleading "inbox zero".
+    if (!body.isConnected) return;
+    body.replaceChildren(
+      errorState(
+        l10n.t("Couldn't load notifications"),
+        cleanErr(e) || l10n.t("GitHub request failed."),
+        refresh,
+      ),
+    );
+    return;
+  }
+  if (!body.isConnected) return;
+
+  /**
+   * The counts that describe the whole inbox, not the filtered view of it.
+   *
+   * "Mark all read" is honest only if it knows whether anything is unread, and
+   * the top-bar bell must agree with the panel — the badge said 3 while the
+   * header said 4, 200px apart. Both are computed from `threads`, which is
+   * every thread loaded, so a filter can never leak into a global number.
+   */
+  const syncCounts = (): void => {
+    const unread = threads.filter((t) => t.unread).length;
+    (markAllBtn as HTMLButtonElement).disabled = unread === 0;
+    window.dispatchEvent(new CustomEvent("gs:unread", { detail: unread }));
+  };
+  syncCounts();
+  facets.sync(threads);
+
+  const renderThreads = (): void => {
+    const q = query.trim().toLowerCase();
+    const shown = threads.filter(
+      (t) =>
+        facets.passes(t) &&
+        (q
+          ? `${t.title} ${t.repo} ${notifReasonLabel(t.reason)} ${notifTypeLabel(t.type)}`
+              .toLowerCase()
+              .includes(q)
+          : true),
+    );
+    // Same contract as every other list: the badge counts what's on screen.
+    header.setCount?.(shown.length, threads.length);
+    body.replaceChildren();
+    if (shown.length === 0) {
+      const filtered = facets.activeCount() > 0 || !!q;
+      body.appendChild(
+        emptyState(
+          filtered
+            ? l10n.t("No matching notifications")
+            : S.notifAll
+              ? l10n.t("Inbox zero")
+              : l10n.t("You're all caught up"),
+          filtered
+            ? q
+              ? l10n.t("Nothing in your inbox matches “{0}”.", query.trim())
+              : l10n.t("Nothing in your inbox matches these filters.")
+            : S.notifAll
+              ? l10n.t("You have no notifications.")
+              : l10n.t("No unread notifications right now — nothing needs your attention."),
+          {
+            icon: filtered ? "filter" : "bell",
+            // A filtered-empty inbox answers a question you asked in the
+            // toolbar; an unfiltered-empty one is the whole view's state.
+            anchor: filtered ? "inline" : "hero",
+          secondary: facets.activeCount() > 0
+            ? { label: l10n.t("Clear filters"), icon: "clear-all", onClick: () => facets.clear() }
+            : undefined,
+          },
+        ),
+      );
+      return;
+    }
+    // (The "N threads · M unread" summary line used to live here; the header
+    // badge already says how many are shown, so it was the same fact twice.)
+    // ONE roving tab stop for the list: Tab reaches the Inbox and lands on the
+    // first thread, ↑/↓ move between them. Every row was `tabIndex = -1`, which
+    // made arrow traversal work but left the whole list unreachable from the
+    // keyboard in the first place — Tab skipped straight past it. Every other
+    // list in the app is enterable; this one was not.
+    shown.forEach((t, i) => {
+      const row = notificationRow(t, body, refresh, nav, currentRepo, syncCounts);
+      rowThreads.set(row, t);
+      row.tabIndex = i === 0 ? 0 : -1;
+      body.appendChild(row);
+    });
+  };
+
+  if (threads.length === 0) {
+    body.replaceChildren(
+      emptyState(
+        S.notifAll ? l10n.t("Inbox zero") : l10n.t("You're all caught up"),
+        S.notifAll
+          ? l10n.t("You have no notifications.")
+          : l10n.t("No unread notifications right now — nothing needs your attention."),
+        { icon: "bell" },
+      ),
+    );
+    return;
+  }
+
+  renderThreads();
+}
+
+// ── Top-bar notification center (the bell popover, next to the profile) ────────
+
+/**
+ * The unread-thread count for the bell badge in the top bar. Returns 0 when not
+ * connected or on any error — the badge simply stays hidden, never a broken state.
+ */
+export async function fetchUnreadCount(): Promise<number> {
+  try {
+    // The AMBIENT channel: it never unlocks the stored token, so the badge
+    // refreshing on launch cannot raise a keychain prompt. It reports 0 until
+    // something the user actually asked for has unlocked the token.
+    return await host.invoke("notifications:unreadCount", undefined);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Open (or, if already open, close) the notifications center as a floating panel
+ * anchored to the bell in the top bar. Reuses the full inbox renderer — list,
+ * per-row + inbox-wide mark-read, the show-all toggle — inside a popover, so the
+ * bell IS the notification center. `nav` routes the connect prompt to Settings;
+ * `onClose` lets the caller refresh the bell's unread badge after a dismiss.
+ */
+export function openNotificationsPanel(
+  anchor: HTMLElement,
+  nav: SectionNav,
+  onClose?: () => void,
+): void {
+  // Toggle: a second click on the bell (or while open) closes the panel.
+  if (closePanel) {
+    closePanel(true);
+    return;
+  }
+
+  const panel = el("div", "notif-pop");
+  // A floating panel of interactive rows that announced itself as a plain div:
+  // no role, no name, and focus left behind on the bell, so a keyboard user
+  // could open it and then Tab through the whole page before reaching it.
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-label", l10n.t("Notifications"));
+  panel.tabIndex = -1;
+  const inner = el("div", "notif-pop-inner");
+  panel.appendChild(inner);
+  document.body.appendChild(panel);
+
+  const position = (): void => {
+    const r = anchor.getBoundingClientRect();
+    const w = panel.offsetWidth || 424;
+    const left = Math.max(12, Math.min(r.right - w, window.innerWidth - w - 12));
+    panel.style.left = `${Math.round(left)}px`;
+    panel.style.top = `${Math.round(r.bottom + 6)}px`;
+  };
+
+  const onDoc = (e: MouseEvent): void => {
+    // While a dialog opened FROM this popover is up, the popover itself is
+    // `inert` — held back by `holdBackground` like the rest of the page. So a
+    // click anywhere in that dialog is "outside the panel" by the test below,
+    // and dismissed the popover the user was working from. Asking whether we
+    // are inert answers it for every layer, present and future, without a
+    // whitelist of class names to keep up to date.
+    if (panel.hasAttribute("inert")) return;
+    const t = e.target as Node;
+    if (!panel.contains(t) && t !== anchor && !anchor.contains(t)) close();
+  };
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.key === "Escape") {
+      // Whatever opened AFTER the popover owns Escape — otherwise one press
+      // closed the dialog AND the popover that opened it. Asked as "am I the
+      // top layer?"; see `registerLayer`.
+      // "Nothing opened after me." See `registerLayer`.
+      if (!layer.isTop()) return;
+      e.preventDefault();
+      close(true);
+    }
+  };
+  let closed = false;
+  const close = (restoreFocus = false): void => {
+    if (closed) return;
+    closed = true;
+    layer.release();
+    panel.remove();
+    document.removeEventListener("mousedown", onDoc, true);
+    document.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("resize", position);
+    anchor.setAttribute("aria-expanded", "false");
+    closePanel = null;
+    if (restoreFocus && anchor.isConnected) anchor.focus();
+    onClose?.();
+  };
+  closePanel = close;
+  const layer = registerLayer(close);
+
+  anchor.setAttribute("aria-haspopup", "dialog");
+  anchor.setAttribute("aria-expanded", "true");
+
+  // Render the inbox into the panel; the connect prompt's "Sign in" closes the
+  // panel before routing to Settings so we don't leave a popover floating.
+  renderNotifications(inner, (v, target) => {
+    close();
+    nav(v, target);
+  });
+
+  position();
+  // Move into the panel so the keyboard is where the eye is; Escape hands focus
+  // straight back to the bell.
+  (panel.querySelector<HTMLElement>("button, [tabindex='0'], a[href]") ?? panel).focus();
+  setTimeout(() => {
+    position();
+    document.addEventListener("mousedown", onDoc, true);
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("resize", position);
+  }, 0);
+}
+
+/** Open a read-only, in-app viewer for an issue/PR in ANY repo (so a notification
+ *  for a different repository still opens INSIDE GitStudio, not github.com). */
+export function openExternalItem(o: {
+  owner: string;
+  repo: string;
+  number: number;
+  kind: "issue" | "pull";
+  htmlUrl: string;
+}): void {
+  const card = el("div", "modal-card modal-card-form ext-item");
+  card.tabIndex = -1;
+  let close = (): void => {};
+  openModal((c) => {
+    close = c;
+    return {
+      card,
+      focusEl: card,
+      label: `${o.owner}/${o.repo} #${o.number}`,
+      onClose: () => {},
+    };
+  });
+
+  card.appendChild(loadingState(l10n.t("Loading…")));
+  void (async () => {
+    let item;
+    try {
+      item = await host.invoke("github:externalItem", {
+        owner: o.owner, repo: o.repo, number: o.number, kind: o.kind,
+      });
+    } catch {
+      /* fall through to the unavailable state */
+    }
+    if (!card.isConnected) return;
+    card.replaceChildren();
+    if (!item) {
+      card.appendChild(
+        errorState(
+          l10n.t("Couldn't load this item"),
+          l10n.t("{0}/{1} #{2} couldn't be fetched.", o.owner, o.repo, o.number),
+        ),
+      );
+      const foot = el("div", "modal-actions");
+      const gh = el("button", "mini-btn");
+      gh.append(glyph("link-external"), span(l10n.t("Open on GitHub")));
+      gh.addEventListener("click", () => { window.open(o.htmlUrl, "_blank", "noopener"); close(); });
+      const cls = el("button", "btn btn-primary modal-ok");
+      cls.appendChild(span(l10n.t("Close")));
+      cls.addEventListener("click", close);
+      foot.append(gh, cls);
+      card.appendChild(foot);
+      return;
+    }
+    // Header: state pill + repo · #number, then the title.
+    const head = el("div", "ext-item-head");
+    const stateKind = item.kind === "pull"
+      ? item.state === "merged" ? "merged" : item.state === "draft" ? "draft" : item.state === "closed" ? "closed" : "open-pr"
+      : item.state === "closed" ? "completed" : "open";
+    const stateLabel: Record<string, string> = {
+      open: l10n.t("Open"),
+      closed: l10n.t("Closed"),
+      merged: l10n.t("Merged"),
+      draft: l10n.t("Draft"),
+    };
+    head.appendChild(
+      statePill(
+        stateLabel[item.state] ?? item.state.charAt(0).toUpperCase() + item.state.slice(1),
+        stateKind,
+      ),
+    );
+    const sub = el("span", "ext-item-sub");
+    sub.textContent = `${item.repo} #${item.number}${item.author ? ` · ${item.author}` : ""}${item.createdAt ? ` · ${relTimeISO(item.createdAt)}` : ""}`;
+    if (item.createdAt) sub.title = absTimeISO(item.createdAt);
+    head.appendChild(sub);
+    const title = el("div", "ext-item-title");
+    title.textContent = item.title;
+    card.append(head, title);
+
+    // Body (markdown) + comments — read only.
+    const scroll = el("div", "ext-item-scroll");
+    const body = el("div", "gh-body-md");
+    if (item.body && item.body.trim()) body.innerHTML = renderMarkdown(item.body);
+    else { body.classList.add("gh-empty-body"); body.textContent = l10n.t("No description provided."); }
+    scroll.appendChild(body);
+    for (const c of item.comments) {
+      const cm = el("div", "gh-comment");
+      const ch = el("div", "gh-comment-head");
+      ch.append(
+        span(c.author ?? l10n.t("someone")),
+        span(l10n.t("commented · {0}", relTimeISO(c.createdAt)), "gh-comment-when"),
+      );
+      const cb = el("div", "gh-body-md");
+      cb.innerHTML = renderMarkdown(c.body || "");
+      cm.append(ch, cb);
+      scroll.appendChild(cm);
+    }
+    card.appendChild(scroll);
+
+    const foot = el("div", "modal-actions");
+    const gh = el("button", "mini-btn");
+    gh.append(glyph("link-external"), span(l10n.t("Open on GitHub")));
+    gh.addEventListener("click", () => { window.open(item!.htmlUrl, "_blank", "noopener"); });
+    const cls = el("button", "btn btn-primary modal-ok");
+    cls.appendChild(span(l10n.t("Close")));
+    cls.addEventListener("click", close);
+    foot.append(gh, cls);
+    card.appendChild(foot);
+  })();
+}
+
+/** One inbox row in the rich `ghRow` shape: an accent-wrapped subject-type icon
+ *  (prefixed by an unread dot), a bold/muted title, a `repo · reason · time` meta
+ *  line, a subject-type pill, and a hover-revealed Open / Mark-read cluster.
+ *  Unread rows lead with the accent dot + a foreground title; read rows recede. */
+function notificationRow(
+  t: NotificationThread,
+  body: HTMLElement,
+  refresh: () => void,
+  nav: SectionNav,
+  currentRepo: string | undefined,
+  syncCounts: () => void,
+): HTMLElement {
+  // Leading: unread dot (when unread) + the subject-type glyph. We reuse the
+  // existing .notif-lead/.notif-dot styling so unread emphasis + the read-state
+  // icon dimming keep working inside the gh-row lead slot.
+  const lead = el("span", "notif-lead");
+  // The unread dot ALWAYS takes its space — hidden, not absent, on read rows.
+  // Omitting it shifted every read row 14px left of its unread neighbours, so
+  // the list had two different left edges.
+  const dot = el("span", "notif-dot");
+  if (!t.unread) dot.classList.add("is-read");
+  lead.appendChild(dot);
+  lead.appendChild(glyph(notifIcon(t.type)));
+
+  const when = relTimeISO(t.updatedAt);
+  const aria = t.unread
+    ? l10n.t(
+        "{0} notification: {1} (unread)",
+        notifTypeLabel(t.type),
+        t.title || l10n.t("(untitled)"),
+      )
+    : l10n.t("{0} notification: {1}", notifTypeLabel(t.type), t.title || l10n.t("(untitled)"));
+  // The repo name is a door, not a label: browse that repo in-app.
+  const repoLink = (): HTMLElement =>
+    // The full Explore page, not the peek stack: from an inbox row, "what IS
+    // this repo?" deserves breadcrumbs, a README and a way to open it.
+    subLink(t.repo, l10n.t("Explore {0} in GitStudio", t.repo), () =>
+      nav ? nav("explore", { id: `repo/${t.repo}` }) : openRemoteRepoBrowser(t.repo),
+    );
+
+  // Two shapes, one behavior: the FULL inbox page gets a dense single line
+  // (title · type ······ repo · reason · time); the 424px bell POPOVER keeps
+  // the two-line card, which reads better at that width.
+  const compact = !!body.closest(".notif-pop");
+  let row: HTMLElement;
+  if (compact) {
+    const segments: Array<string | HTMLElement> = [repoLink()];
+    if (t.reason) segments.push(notifReasonLabel(t.reason));
+    if (when) segments.push(when);
+    row = ghRow({
+      lead,
+      title: t.title || l10n.t("(untitled)"),
+      titleSuffix: t.type ? [pill(notifTypeLabel(t.type), "notif-type")] : [],
+      metaSegments: segments,
+      metaTitle: t.updatedAt ? l10n.t("Updated {0}", absTimeISO(t.updatedAt)) : undefined,
+      ariaLabel: aria,
+    });
+  } else {
+    row = el("div", "notif-line");
+    row.setAttribute("aria-label", aria);
+    row.appendChild(lead);
+    const title = el("span", "notif-line-title");
+    title.textContent = t.title || l10n.t("(untitled)");
+    title.title = t.title;
+    row.appendChild(title);
+    // The leading glyph already encodes the type; a pill repeating it made
+    // every row say "Issue" twice. The glyph carries the word on hover.
+    lead.title = notifTypeLabel(t.type);
+    lead.setAttribute("aria-label", notifTypeLabel(t.type));
+    row.appendChild(el("span", "sec-row-spring"));
+    const meta = el("span", "sec-row-meta");
+    const repo = repoLink();
+    repo.classList.add("notif-repo");
+    meta.appendChild(repo);
+    // The reason keeps its column even when absent, or a thread without one
+    // slid its repo name out of line with the rows around it.
+    meta.appendChild(
+      blankable(span(t.reason ? notifReasonLabel(t.reason) : "", "notif-reason"), !!t.reason),
+    );
+    row.appendChild(meta);
+    const time = el("span", "sec-row-time");
+    time.textContent = when;
+    if (t.updatedAt) time.title = l10n.t("Updated {0}", absTimeISO(t.updatedAt));
+    row.appendChild(time);
+  }
+  // .notif-row = the inbox read/unread emphasis; .list-row = the shared
+  // `.list-row:hover .row-actions` reveal for the Open / Mark-read cluster.
+  row.classList.add("notif-row", "list-row");
+  if (!t.unread) row.classList.add("notif-read");
+
+  // Open the subject IN-APP.
+  //
+  // The thread now carries what it's ABOUT (subjectKind + subjectNumber/Sha,
+  // parsed from the API subject url in github/maps.ts), so Releases and
+  // Commits — which used to bounce to github.com because their web urls don't
+  // look like issue links — route in-app too:
+  //   issue / pull   → this repo's Issues|PRs page, or the read-only viewer
+  //                    for another repo
+  //   release        → the Releases detail page (subjectNumber IS the id)
+  //   commit         → reveal in the graph
+  // Anything genuinely unsupported (Discussions) still opens on GitHub, and
+  // the row SAYS so rather than promising an in-app open.
+  const item = parseGitHubItemUrl(t.htmlUrl);
+  const threadRepo = (t.repo || "").toLowerCase();
+  const sameRepo = !!currentRepo && threadRepo === currentRepo;
+  const kind = t.subjectKind;
+  const inAppRelease = sameRepo && kind === "release" && t.subjectNumber != null;
+  const inAppCommit = sameRepo && kind === "commit" && !!t.subjectSha;
+  const openable = !!item || inAppRelease || inAppCommit;
+  const open = (): void => {
+    // Every in-app open carries where it came from. Release and commit threads
+    // did not, so opening one from the Inbox retitled the back button
+    // "Releases", switched the rail under you, and Escape put you in a list you
+    // had never opened — with the thread you were reading nowhere in sight.
+    const origin = { view: "notifications", label: l10n.t("Inbox") };
+    if (inAppRelease) {
+      nav("releases", { number: t.subjectNumber, from: origin });
+    } else if (inAppCommit) {
+      // No `from` here on purpose: Commits is a SECTION, not a detail page, so
+      // there is no back bar to retitle — going back is the nav history's job
+      // (⌘[), exactly as it is for every other section-to-section move.
+      nav("commit", { sha: t.subjectSha });
+    } else if (item && sameRepo) {
+      // Same as My Work: back and Escape belong to the Inbox, not to whichever
+      // section happens to own the thread's subject.
+      nav(item.kind, { number: item.number, from: origin });
+    } else if (item) {
+      const [owner, repo] = item.repo.split("/");
+      openExternalItem({ owner, repo, number: item.number, kind: item.kind === "prs" ? "pull" : "issue", htmlUrl: t.htmlUrl });
+    } else if (t.htmlUrl) {
+      window.open(t.htmlUrl, "_blank", "noopener");
+    } else {
+      toast(l10n.t("This notification has no openable subject."), "info");
+    }
+  };
+
+  // Right-side action cluster (hover-revealed via .row-actions, like other rows).
+  const acts = el("div", "row-actions");
+  // NAME the thread, not just the verb. This is the densest list of identical
+  // row actions in the app — eleven buttons announcing "Open" seven times and
+  // "Mark read" four — and the one list with a roving tab stop, so for every
+  // row but the first these buttons are the ONLY things Tab lands on.
+  acts.appendChild(
+    textBtn(
+      l10n.t("Open"),
+      openable ? l10n.t("Open in GitStudio") : l10n.t("Open the subject on GitHub"),
+      open,
+      false,
+      t.title,
+    ),
+  );
+  if (t.unread) {
+    acts.appendChild(
+      textBtn(
+        l10n.t("Mark read"),
+        l10n.t("Mark this thread as read"),
+        () => void markRead(t, row, body, refresh, syncCounts),
+        false,
+        t.title,
+      ),
+    );
+  }
+  row.appendChild(acts);
+
+  // Whole-row click opens the subject (matches Actions / Projects rows). The
+  // action buttons stopPropagation (textBtn does), so they don't double-fire.
+  // Every other list in the app builds a row you can reach and operate; these
+  // were the only ones that were not. They already carried the hover, the
+  // pointer cursor and an accessible NAME — but no role, no tab stop and no
+  // keys, so a keyboard user could read the Inbox and not open anything in it.
+  // The row holds its own action buttons, so it takes the app's documented
+  // div[role="button"] shape rather than becoming a <button>.
+  row.setAttribute("role", "button");
+  row.tabIndex = 0;
+  row.classList.add("is-clickable");
+  row.addEventListener("click", open);
+  row.addEventListener("keydown", (e) => {
+    if (e.target !== row) return; // the row's own buttons keep their keys
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    open();
+  });
+
+  // Right-click → a context menu mirroring the row actions.
+  row.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openMenu(row, [
+      openable
+        ? { label: l10n.t("Open in GitStudio"), icon: "arrow-right", onClick: open }
+        : { label: l10n.t("Open on GitHub"), icon: "link-external", onClick: open },
+      ...(openable && t.htmlUrl
+        ? [
+            {
+              label: l10n.t("Open on GitHub"),
+              icon: "link-external",
+              onClick: () => window.open(t.htmlUrl, "_blank", "noopener"),
+            },
+          ]
+        : []),
+      ...(t.unread
+        ? [
+            {
+              label: l10n.t("Mark as read"),
+              icon: "mail-read",
+              onClick: () => void markRead(t, row, body, refresh, syncCounts),
+            },
+          ]
+        : []),
+    ]);
+  });
+
+  return row;
+}
+
+/** Mark one thread read: optimistic in place, then reconcile the empty state. */
+async function markRead(
+  t: NotificationThread,
+  row: HTMLElement,
+  body: HTMLElement,
+  refresh: () => void,
+  /** Recompute the counts from the FULL thread list — see below. */
+  syncCounts: () => void,
+): Promise<void> {
+  if (row.classList.contains("is-busy")) return;
+  row.classList.add("is-busy");
+  try {
+    const r = await host.invoke("notification:markRead", { id: t.id });
+    if (!r.ok) {
+      toast(r.message ?? l10n.t("Couldn't mark the notification read."), "error");
+      return;
+    }
+    t.unread = false;
+    // Whichever filter is on, the row stays where it is and simply changes
+    // style. Under "Unread only" it used to be REMOVED on the spot: the list
+    // collapsed under the pointer, and the next row's own Mark-read button slid
+    // into the exact pixel you had just clicked — so a second click marked a
+    // thread you never chose. It leaves on the next refresh instead, which is
+    // when you are looking at the list rather than at one row in it.
+    row.classList.add("notif-read");
+    // The dot is the read/unread MARKER, not decoration: removing it collapsed
+    // the 14px lead slot (so the row's text jumped left of every other row's)
+    // and destroyed the only thing the unread tally could be counted from.
+    row.querySelector(".notif-dot")?.classList.add("is-read");
+    row.querySelectorAll<HTMLElement>(".row-actions .row-btn").forEach((b) => {
+      if (b.textContent === l10n.t("Mark read")) b.setAttribute("hidden", "");
+    });
+    if (!inboxTab().notifAll) {
+      row.classList.add("notif-leaving");
+      row.title = l10n.t("Marked read — leaves this list on the next refresh");
+    }
+    // Counting is the caller's job, because only the caller can see the whole
+    // inbox. Counting the DOM here counted the RENDERED rows — i.e. whatever
+    // survived the current filter — so marking one thread read while filtered
+    // to a single repo wrote that repo's unread total into the global bell
+    // badge, and rewrote the header's "12 of 40" as "shown of shown".
+    syncCounts();
+    toast(l10n.t("Marked as read."), "success");
+  } catch (e) {
+    toast(cleanErr(e) || l10n.t("Couldn't mark the notification read."), "error");
+  } finally {
+    row.classList.remove("is-busy");
+  }
+}
+
+/** Mark the whole inbox read (confirmed; destructive-ish). */
+async function markAllRead(btn: HTMLElement, refresh: () => void): Promise<void> {
+  const button = btn as HTMLButtonElement;
+  if (button.disabled) return;
+  const ok = await confirmDialog({
+    title: l10n.t("Mark all notifications as read?"),
+    message: l10n.t("This marks every notification in your inbox as read on GitHub."),
+    confirmLabel: l10n.t("Mark all read"),
+  });
+  if (!ok) return;
+  button.disabled = true;
+  try {
+    const r = await host.invoke("notifications:markAllRead", undefined);
+    if (!r.ok) {
+      toast(r.message ?? l10n.t("Couldn't mark all read."), "error");
+      button.disabled = false;
+      return;
+    }
+    toast(l10n.t("Marked all notifications as read."), "success");
+    refresh();
+  } catch (e) {
+    toast(cleanErr(e) || l10n.t("Couldn't mark all read."), "error");
+    button.disabled = false;
+  }
+}
+
+// ── Pure mapping helpers (subject type / reason → glyph + human label) ─────────
+
+/** A codicon name for a notification subject type. */
+function notifIcon(type: string): string {
+  switch (type) {
+    case "PullRequest":
+      return "git-pull-request";
+    case "Issue":
+      return "issue-opened";
+    case "Release":
+      return "tag";
+    case "Discussion":
+      return "comment-discussion";
+    case "Commit":
+      return "git-commit";
+    default:
+      return "bell";
+  }
+}
+
+/** A short human label for a subject type. */
+export function notifTypeLabel(type: string): string {
+  switch (type) {
+    case "PullRequest":
+      return l10n.t("PR");
+    case "Issue":
+      return l10n.t("Issue");
+    case "Release":
+      return l10n.t("Release");
+    case "Discussion":
+      return l10n.t("Discussion");
+    case "Commit":
+      return l10n.t("Commit");
+    default:
+      return type || l10n.t("Thread");
+  }
+}
+
+/** A human label for GitHub's notification `reason`. */
+export function notifReasonLabel(reason: string): string {
+  switch (reason) {
+    case "assign":
+      return l10n.t("assigned");
+    case "author":
+      return l10n.t("you authored");
+    case "comment":
+      return l10n.t("new comment");
+    case "ci_activity":
+      return l10n.t("CI activity");
+    case "invitation":
+      return l10n.t("invitation");
+    case "manual":
+      return l10n.t("subscribed");
+    case "mention":
+      return l10n.t("mentioned");
+    case "review_requested":
+      return l10n.t("review requested");
+    case "security_alert":
+      return l10n.t("security alert");
+    case "state_change":
+      return l10n.t("state changed");
+    case "subscribed":
+      return l10n.t("watching");
+    case "team_mention":
+      return l10n.t("team mentioned");
+    default:
+      return reason.replace(/_/g, " ");
+  }
+}
