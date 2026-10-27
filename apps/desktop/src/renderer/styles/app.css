@@ -1319,6 +1319,53 @@ button.repo-folder-chip:focus-visible,
   background: var(--app-border);
 }
 
+/* The GitHub page: one rail entry, its sections as a tab strip over the
+   section. Lit like the rail, never underlined. */
+.github-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--app-border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.github-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--app-muted);
+  font-family: inherit;
+  font-size: var(--text-base);
+  font-weight: 550;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+.github-tab .glyph .codicon { font-size: 14px; }
+.github-tab:not(.active):not(:disabled):hover {
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--app-border) 50%, transparent);
+}
+.github-tab.active {
+  color: var(--vscode-foreground);
+  background: var(--sel-fill);
+  box-shadow: var(--sel-glow-soft);
+  font-weight: 650;
+}
+.github-tab.active .glyph { color: var(--gs-accent-ink, var(--gs-accent)); }
+.github-tab:disabled { opacity: 0.42; cursor: default; }
+.github-tab:focus-visible {
+  outline: 2px solid var(--gs-focus-ring);
+  outline-offset: -2px;
+}
+
 /* The routed main area + the graph view that fills it. */
 .view-host-inner {
   flex: 1 1 auto;

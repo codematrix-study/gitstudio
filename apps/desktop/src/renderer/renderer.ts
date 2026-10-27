@@ -713,7 +713,7 @@ class App {
     // teaches people their place isn't kept.
     const OFF_RAIL = new Set(["settings", "explore"]);
     const known = (v: unknown): v is string =>
-      typeof v === "string" && (App.TABS.some((t) => t.id === v) || OFF_RAIL.has(v));
+      typeof v === "string" && (App.TABS.some((t) => t.id === v) || App.GITHUB_VIEWS.has(v) || OFF_RAIL.has(v));
     // A tab starts where THIS repository was last left (a tab restored at
     // launch, or one reopened while its tab's view is still remembered), else
     // on the view the window was last on — which is the view of the tab you
@@ -1125,6 +1125,12 @@ class App {
     // the decision that precedes every other entry on this rail — filing it
     // under ACCOUNT, fifteen rows down, buried the front door's hallway.
     { id: "repositories", label: l10n.t("Repositories"), icon: "repo" },
+    // ONE door to everything on GitHub. Nine GitHub entries used to fill half
+    // the rail under their own divider; they now live on the GitHub page as a
+    // tab strip (GITHUB_SECTIONS), and the rail stays about this machine and
+    // this repository. Each section keeps its own route id, so deep links,
+    // history and ⌘K land exactly where they did.
+    { id: "github", label: l10n.t("GitHub"), icon: "github" },
     // Changes is a set of pending file diffs, not the SCM view's fork.
     // It leads the group of views ABOUT the open repository, and the divider
     // says so — the rail's principle is where the data lives: this machine,
@@ -1138,27 +1144,6 @@ class App {
     // truer picture than `git-merge`, which is a different operation besides.
     { id: "rebase", label: l10n.t("Rebase"), icon: "list-ordered" },
     { id: "code", label: l10n.t("Code"), icon: "code" },
-    // Inbox first in the GitHub group — the "what needs me" surface (Linear's
-    // Inbox translated): review requests, mentions, assignments, CI failures.
-    // The top-bar bell stays for a quick glance; this is the full triage page.
-    { id: "notifications", label: l10n.t("Inbox"), icon: "inbox", divider: true },
-    // "What needs me?" answered in one page: review requests, assignments,
-    // your own PRs, mentions — each row one click from acting on it.
-    { id: "mywork", label: l10n.t("My Work"), icon: "person" },
-    { id: "prs", label: l10n.t("Pull Requests"), icon: "git-pull-request" },
-    // `issues` (the list glyph) rather than `issue-opened`, which reads as a
-    // single issue's OPEN state and clashed with per-issue status icons.
-    { id: "issues", label: l10n.t("Issues"), icon: "issues" },
-    // CI pipelines read as "runs" — a play badge, not the abstract Actions logo.
-    { id: "actions", label: l10n.t("Actions"), icon: "play-circle" },
-    { id: "releases", label: l10n.t("Releases"), icon: "tag" },
-    { id: "projects", label: l10n.t("Projects"), icon: "project" },
-    // Organizations and Gists are GitHub surfaces like everything above them —
-    // the old "Account" group was a distinction between kinds of GitHub data
-    // that nobody shopping the rail was making, and with Search gone and
-    // Repositories promoted it held two orphans under a heading.
-    { id: "orgs", label: l10n.t("Organizations"), icon: "organization" },
-    { id: "gists", label: l10n.t("Gists"), icon: "gist" },
     // Search has NO rail entry — deliberately. It is a routed surface (the
     // view keeps its `explore` id, deep links and entity pages), but the way
     // IN is the search vocabulary the app already has everywhere: the topbar
@@ -1166,11 +1151,47 @@ class App {
     // filing cabinet; a search that is one keystroke from anywhere is a tool.
   ];
 
+  /**
+   * The GitHub page's sections, in its tab strip's order. They are routes of
+   * their own (not rail entries): the rail's single "GitHub" item lights up
+   * for any of them and reopens the one you were last on.
+   */
+  private static readonly GITHUB_SECTIONS: ReadonlyArray<{ id: string; icon: string }> = [
+    // Inbox first — the "what needs me" surface: review requests, mentions,
+    // assignments, CI failures. The top-bar bell stays for a quick glance.
+    { id: "notifications", icon: "inbox" },
+    { id: "mywork", icon: "person" },
+    { id: "prs", icon: "git-pull-request" },
+    // `issues` (the list glyph) rather than `issue-opened`, which reads as a
+    // single issue's OPEN state and clashed with per-issue status icons.
+    { id: "issues", icon: "issues" },
+    // CI pipelines read as "runs" — a play badge, not the abstract Actions logo.
+    { id: "actions", icon: "play-circle" },
+    { id: "releases", icon: "tag" },
+    { id: "projects", icon: "project" },
+    { id: "orgs", icon: "organization" },
+    { id: "gists", icon: "gist" },
+  ];
+
+  /** Every route that belongs to the GitHub page — its sections plus the
+   *  compose/log pages reached from them — so the rail's GitHub item stays lit. */
+  private static readonly GITHUB_VIEWS = new Set([
+    ...App.GITHUB_SECTIONS.map((s) => s.id),
+    "predit",
+    "issuenew",
+    "releasenew",
+    "joblog",
+  ]);
+
+  /** The GitHub section the rail's GitHub item reopens. */
+  private lastGithubSection = "notifications";
+
   /** TABS.label is compared against (dividerLabel) and kept as English keys;
    *  this is the literal, statically-extractable translation of each. */
   private static readonly NAV_LABELS: Record<string, string> = {
     dashboard: l10n.t("Home"),
     repositories: l10n.t("Repositories"),
+    github: l10n.t("GitHub"),
     changes: l10n.t("Changes"),
     deploy: l10n.t("Deploy"),
     graph: l10n.t("Commits"),
@@ -1726,10 +1747,17 @@ class App {
     // A view that needs a repository, with none open, is not a destination.
     // Reached by a deep link, a restored preference or a keyboard shortcut, it
     // would render a screen with nothing to render.
+    // The rail's GitHub item is a door, not a page: it reopens the section you
+    // were last on — or, with no repository open, one that works without one.
+    if (id === "github") {
+      id = this.lastGithubSection;
+      if (!this.currentRepo && App.NEEDS_REPO.has(id)) id = "orgs";
+    }
     if (!this.currentRepo && App.NEEDS_REPO.has(id)) {
       id = "dashboard";
       target = undefined;
     }
+    if (App.GITHUB_SECTIONS.some((s) => s.id === id)) this.lastGithubSection = id;
     const shaOnlyGraphReveal =
       id === "graph" &&
       !!target?.sha &&
@@ -1889,7 +1917,7 @@ class App {
     // stop needs a fallback, or it is not a tab stop.
     let anyActive = false;
     for (const btn of this.navButtons) {
-      const active = btn.dataset.view === id;
+      const active = btn.dataset.view === id || (btn.dataset.view === "github" && App.GITHUB_VIEWS.has(id));
       if (active) anyActive = true;
       btn.classList.toggle("active", active);
       btn.setAttribute("aria-selected", active ? "true" : "false");
@@ -2006,25 +2034,25 @@ class App {
     } else if (id === "assistant") {
       this.mountSection(renderAssistant);
     } else if (id === "prs") {
-      this.mountSection(renderPrs);
+      this.mountSection(renderPrs, id);
     } else if (id === "issues") {
-      this.mountSection(renderIssues);
+      this.mountSection(renderIssues, id);
     } else if (id === "notifications") {
-      this.mountSection(renderNotifications);
+      this.mountSection(renderNotifications, id);
     } else if (id === "mywork") {
-      this.mountSection(renderMyWork);
+      this.mountSection(renderMyWork, id);
     } else if (id === "actions") {
-      this.mountSection(renderActions);
+      this.mountSection(renderActions, id);
     } else if (id === "releases") {
-      this.mountSection(renderReleases);
+      this.mountSection(renderReleases, id);
     } else if (id === "explore") {
       this.mountSection(renderExplore);
     } else if (id === "orgs") {
-      this.mountSection(renderOrgs);
+      this.mountSection(renderOrgs, id);
     } else if (id === "projects") {
-      this.mountSection(renderProjects);
+      this.mountSection(renderProjects, id);
     } else if (id === "gists") {
-      this.mountSection(renderGists);
+      this.mountSection(renderGists, id);
     } else if (id === "repositories") {
       this.mountSection(renderRepositories);
     } else if (id === "dashboard") {
@@ -2039,13 +2067,15 @@ class App {
   /** Mount a per-section view module into a fresh container inside the view host.
    *  The module owns its container, so a stale async render writes into detached
    *  DOM (harmless) once the user navigates on. */
-  private mountSection(render: SectionRender): void {
+  private mountSection(render: SectionRender, githubSection?: string): void {
     const wrap = el("div", "view-host-inner");
     // Paint a content-shaped skeleton NOW — sections gate on github:status
     // before their first render, and that await used to leave a blank pane
     // (blank → skeleton → content, three stages on every visit).
     wrap.appendChild(skeletonList(6));
-    this.viewHost.replaceChildren(wrap);
+    // A GitHub section sits on the GitHub page: its tab strip above, the
+    // section below. The section owns `wrap`, so the strip lives outside it.
+    this.viewHost.replaceChildren(githubSection ? this.githubPage(githubSection, wrap) : wrap);
     const target = this.sectionTarget;
     this.sectionTarget = undefined;
     const nav = (v: string, t?: SectionTarget): void => this.routeView(v, false, t);
@@ -2054,6 +2084,34 @@ class App {
     // used to be wired only by the Organizations view itself.
     setPeekNav(nav);
     render(wrap, nav, target);
+  }
+
+  /** The GitHub page: a tab strip of GITHUB_SECTIONS over the section's body. */
+  private githubPage(active: string, body: HTMLElement): HTMLElement {
+    const page = el("div", "view-host-inner github-page");
+    const strip = el("div", "github-tabs");
+    strip.setAttribute("role", "tablist");
+    strip.setAttribute("aria-label", l10n.t("GitHub"));
+    for (const s of App.GITHUB_SECTIONS) {
+      const label = App.NAV_LABELS[s.id] ?? s.id;
+      const on = s.id === active;
+      const btn = el("button", "github-tab" + (on ? " active" : ""));
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("aria-selected", on ? "true" : "false");
+      btn.title = label;
+      const needsRepo = !this.currentRepo && App.NEEDS_REPO.has(s.id);
+      if (needsRepo) {
+        (btn as HTMLButtonElement).disabled = true;
+        btn.title = l10n.t("{0} — open a repository first", label);
+      }
+      btn.append(glyph(s.icon), span(label));
+      // Re-clicking the active tab returns a detail page to its list, like the
+      // rail item always did.
+      btn.addEventListener("click", () => this.routeView(s.id));
+      strip.appendChild(btn);
+    }
+    page.append(strip, body);
+    return page;
   }
 
   /** A real branch manager: local branches with upstream + ahead/behind + last
@@ -9379,6 +9437,9 @@ class App {
           keywords: t.id,
           run: () => go(t.id),
         }));
+        for (const s of App.GITHUB_SECTIONS) {
+          views.push({ icon: s.icon, label: App.NAV_LABELS[s.id] ?? s.id, keywords: `${s.id} github`, run: () => go(s.id) });
+        }
         views.push({ icon: "gear", label: l10n.t("Settings"), run: () => go("settings") });
         // The Assistant is a routed, keep-alive view like any other, but it
         // lives only behind a sparkle icon in the top bar — absent from the
