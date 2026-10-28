@@ -329,6 +329,8 @@ async function createWindow(): Promise<void> {
       spellcheck: false,
     },
   });
+  // Keep menu accelerators, but do not show the native menu row on Windows/Linux.
+  if (process.platform !== "darwin") mainWindow.setMenuBarVisibility(false);
 
   // The integrated terminal's PTY manager streams output to this window.
   terminal = new TerminalBridge((channel, payload) =>
@@ -622,6 +624,7 @@ function buildMenu(): void {
   ];
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+  if (process.platform !== "darwin") mainWindow?.setMenuBarVisibility(false);
 }
 
 // ── Repo lifecycle ───────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ import { host, currentSession } from "../bridge";
 import { confirmDialog, openModal, toast } from "../dialogs";
 import { copyText, el, emptyState, glyph, settingsCard } from "../ui";
 import type { MavenLogChunk, MavenModule, MavenSettingsView, MavenTaskState } from "../../shared/ipc";
+import { normalizePath } from "../../shared/repoGrouping";
 import type { SectionRender } from "./common";
 import { mavenConfigPanel, mavenSummary, type MavenConfigPanel } from "./mavenConfigFields";
 
@@ -22,6 +23,7 @@ export const renderMavenDeploy: SectionRender = (wrap) => { void mount(wrap); };
 async function mount(wrap: HTMLElement): Promise<void> {
   const root = currentSession()?.root;
   if (!root) return;
+  const normalizedRoot = normalizePath(root);
   const view = el("div", "maven-page");
   const header = el("div", "maven-header");
   const heading = el("div", "maven-heading");
@@ -39,13 +41,17 @@ async function mount(wrap: HTMLElement): Promise<void> {
 
   const moduleCard = settingsCard(l10n.t("Maven modules"), "package");
   const moduleTools = el("div", "maven-tools");
+  const moduleFilter = document.createElement("input");
+  moduleFilter.className = "settings-input maven-filter";
+  moduleFilter.type = "search";
+  moduleFilter.placeholder = l10n.t("Filter…");
+  moduleFilter.setAttribute("aria-label", `${l10n.t("Filter")} ${l10n.t("Maven modules")}`);
   const allBtn = button(l10n.t("Select all"));
   const noneBtn = button(l10n.t("Select none"));
   const refreshBtn = button(l10n.t("Refresh"));
-  moduleTools.append(allBtn, noneBtn, refreshBtn);
+  moduleTools.append(moduleFilter, allBtn, noneBtn, refreshBtn);
   const moduleList = el("div", "maven-modules");
   moduleCard.body.append(moduleTools, moduleList);
-  view.append(moduleCard.card);
 
   const operationCard = settingsCard(l10n.t("Maven actions"), "play");
   const actionRow = el("div", "maven-actions");
@@ -65,7 +71,9 @@ async function mount(wrap: HTMLElement): Promise<void> {
   const hint = el("div", "settings-sub");
   hint.textContent = l10n.t("Select a module to run Maven.");
   operationCard.body.append(actionRow, skipLabel, hint);
-  view.append(operationCard.card);
+  const main = el("div", "maven-main");
+  main.append(moduleCard.card, operationCard.card);
+  view.append(main);
 
   const logCard = settingsCard(l10n.t("Maven log"), "output");
   const logTools = el("div", "maven-tools");
@@ -90,6 +98,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
   let follow = true;
   const selected = new Set<string>();
   const available = new Map<string, MavenModule>();
+  const visibleSelectable = new Set<string>();
   const queued: MavenLogChunk[] = [];
   const carry: Record<MavenLogChunk["stream"], string> = { stdout: "", stderr: "", system: "" };
   let frame = 0;
@@ -106,7 +115,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
     allBtn.disabled = noneBtn.disabled = refreshBtn.disabled = busy;
     skip.disabled = busy;
     moduleList.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach((box) => {
-      box.disabled = busy || box.dataset.warning === "true";
+      box.disabled = busy || box.dataset.warning === "true" || box.dataset.context === "true";
     });
     gearBtn.disabled = busy;
     panel?.setDisabled(busy);
@@ -161,7 +170,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
   };
 
   const queueLog = (chunk: MavenLogChunk): void => {
-    if (chunk.root !== root || chunk.seq <= seenSeq) return;
+    if (normalizePath(chunk.root) !== normalizedRoot || chunk.seq <= seenSeq) return;
     queued.push(chunk);
     if (!initializing && !frame) frame = requestAnimationFrame(drain);
   };
@@ -174,20 +183,30 @@ async function mount(wrap: HTMLElement): Promise<void> {
 
   const paintModules = (): void => {
     available.clear();
+    visibleSelectable.clear();
     moduleList.replaceChildren();
     if (!tree) {
       moduleList.append(emptyState(l10n.t("No pom.xml"), l10n.t("This repository has no pom.xml at its root.")));
+      updateButtons();
       return;
     }
-    const build = (node: MavenModule): HTMLElement => {
+    const query = moduleFilter.value.trim().toLowerCase();
+    const build = (node: MavenModule): HTMLElement | undefined => {
+      if (!node.warning) available.set(node.path, node);
+      const children = node.children.map(build).filter((child): child is HTMLElement => !!child);
+      const matches = !query || node.artifactId.toLowerCase().includes(query)
+        || node.path.toLowerCase().includes(query);
+      if (!matches && !children.length) return undefined;
+      if (matches && !node.warning) visibleSelectable.add(node.path);
       const item = el("li", "maven-module");
       const label = el("label", "maven-module-label");
       const check = document.createElement("input");
       check.type = "checkbox";
-      check.disabled = !!node.warning;
+      check.disabled = !!node.warning || (!!query && !matches);
+      check.hidden = !!query && !matches;
       if (node.warning) check.dataset.warning = "true";
+      if (query && !matches) check.dataset.context = "true";
       check.checked = selected.has(node.path);
-      if (!node.warning) available.set(node.path, node);
       check.addEventListener("change", () => {
         if (check.checked) selected.add(node.path);
         else selected.delete(node.path);
@@ -204,16 +223,17 @@ async function mount(wrap: HTMLElement): Promise<void> {
         warning.textContent = node.warning;
         item.append(warning);
       }
-      if (node.children.length) {
+      if (children.length) {
         const list = el("ul", "maven-tree");
-        for (const child of node.children) list.append(build(child));
+        list.append(...children);
         item.append(list);
       }
       return item;
     };
     const list = el("ul", "maven-tree");
-    list.append(build(tree));
-    moduleList.append(list);
+    const rootItem = build(tree);
+    if (rootItem) { list.append(rootItem); moduleList.append(list); }
+    else moduleList.append(emptyState(l10n.t("No results"), l10n.t("Nothing matches “{0}”.", moduleFilter.value.trim())));
     for (const path of selected) if (!available.has(path)) selected.delete(path);
     updateButtons();
   };
@@ -225,11 +245,12 @@ async function mount(wrap: HTMLElement): Promise<void> {
     finally { refreshBtn.disabled = false; updateButtons(); }
   };
   allBtn.addEventListener("click", () => {
-    for (const path of available.keys()) selected.add(path);
+    for (const path of visibleSelectable) selected.add(path);
     paintModules();
   });
   noneBtn.addEventListener("click", () => { selected.clear(); paintModules(); });
   refreshBtn.addEventListener("click", () => void refreshModules());
+  moduleFilter.addEventListener("input", paintModules);
 
   const applyConfig = (next: MavenSettingsView): void => {
     config = next;
@@ -267,7 +288,7 @@ async function mount(wrap: HTMLElement): Promise<void> {
   gearBtn.addEventListener("click", openProjectSettings);
 
   const applyTask = (next: MavenTaskState): void => {
-    if (next.root !== root) return;
+    if (normalizePath(next.root) !== normalizedRoot) return;
     if (task && next.startedAt < task.startedAt) return;
     if (taskId && taskId !== next.id) { clearLog(); seenSeq = 0; }
     taskId = next.id;

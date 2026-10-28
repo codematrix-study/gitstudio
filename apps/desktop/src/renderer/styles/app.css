@@ -13924,18 +13924,22 @@ body.vscode-light .repo-tab.is-active {
 }
 
 /* Desktop Maven deployment. The log keeps its own scroll position while the
-   modules and settings remain reachable in the page's outer scroll. */
+   modules and actions remain reachable in the page's outer scroll. */
 .maven-page {
   flex: 1 1 auto;
   min-height: 0;
   width: 100%;
-  max-width: var(--measure-settings);
-  margin: 0 auto;
+  container-type: inline-size;
   padding: var(--sp-6) var(--sp-6) calc(var(--sp-6) + var(--dock-reserve, 0px));
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: var(--sp-4);
+}
+.maven-main { display: grid; grid-template-columns: minmax(0, 1fr) clamp(210px, 24%, 280px); gap: var(--sp-4); }
+.maven-main > .settings-card { min-width: 0; }
+@container (max-width: 680px) {
+  .maven-main { grid-template-columns: minmax(0, 1fr); }
 }
 .maven-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); }
 .maven-heading { min-width: 0; }
@@ -13955,6 +13959,8 @@ body.vscode-light .repo-tab.is-active {
 .maven-config-row .maven-config-field { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .maven-config-row .mini-btn[hidden] { display: none; }
 .maven-tools, .maven-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.maven-filter { flex: 1 1 180px; min-width: min(180px, 100%); }
+.maven-actions { flex-direction: column; align-items: stretch; }
 .maven-tools .maven-status { margin-left: auto; color: var(--app-muted); font-size: var(--text-sm); }
 .maven-actions .btn-danger[hidden] { display: none; }
 .maven-modules { max-height: 310px; overflow: auto; }
