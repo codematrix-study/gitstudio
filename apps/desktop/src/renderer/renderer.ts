@@ -608,8 +608,8 @@ class App {
   private railCollapsed = false;
   /** Changes view: persisted width (px) of the file list pane. */
   private changesListW = 340;
-  /** Changes view, split model: the share (%) of the list height the Unstaged
-   *  region gets; Staged takes the rest. Persisted. */
+  /** Changes view, split model: the share (%) of the list height the Staged
+   *  region gets; Unstaged takes the rest. Persisted. */
   private changesSplitPct = 60;
   private railEl?: HTMLElement;
   private railToggleEl?: HTMLElement;
@@ -7833,11 +7833,8 @@ class App {
       // diff away on every tick, in the one model whose whole interaction is
       // "tick boxes while reading the diff".
     } else {
-      // TWO REGIONS, the way IDEA's commit window lays them out: what is still
-      // to stage on top, what is staged below, each with its own header and its
-      // own scroll, and a divider between them. As one list the Staged group
-      // scrolled away under a long Unstaged one, so "what will this commit
-      // contain" was off screen exactly when the tree was busiest.
+      // TWO REGIONS: what this commit includes on top, what is still to stage
+      // below, each with its own header and scroll and a divider between them.
       //
       // Both regions are always present — an empty one says so — so the layout
       // does not jump as files move from one side to the other.
@@ -7850,9 +7847,32 @@ class App {
       ): { box: HTMLElement; scroller: HTMLElement } => {
         const box = el("div", `dc-region dc-region-${kind}`);
         const head = this.sectionHeader(title, kind, items, lists, selBar);
+        head.classList.add("dc-region-head");
+        head.appendChild(span(
+          kind === "staged" ? l10n.t("Included in the commit") : l10n.t("Not included"),
+          "dc-region-hint",
+        ));
         const scroller = el("div", "dc-region-body");
-        if (items.length) items.forEach((f) => scroller.appendChild(fileRow(f, kind)));
-        else scroller.appendChild(span(empty, "dc-region-empty"));
+        if (items.length) {
+          if (kind === "unstaged") {
+            const changed = items.filter((f) => f.status !== "?");
+            const untracked = items.filter((f) => f.status === "?");
+            if (changed.length) {
+              const label = groupLabel(l10n.t("Changed files"));
+              label.classList.add("dc-region-subhead");
+              scroller.appendChild(label);
+              changed.forEach((f) => scroller.appendChild(fileRow(f, kind)));
+            }
+            if (untracked.length) {
+              const label = groupLabel(l10n.t("untracked"));
+              label.classList.add("dc-region-subhead");
+              scroller.appendChild(label);
+              untracked.forEach((f) => scroller.appendChild(fileRow(f, kind)));
+            }
+          } else {
+            items.forEach((f) => scroller.appendChild(fileRow(f, kind)));
+          }
+        } else scroller.appendChild(span(empty, "dc-region-empty"));
         scroller.addEventListener("scroll", () => {
           this.changesRegionScroll[kind] = scroller.scrollTop;
         });
@@ -7863,16 +7883,16 @@ class App {
       // UNSTAGED half, and calling it "Changes" beside "Staged" made the two
       // read as unrelated rather than as a pair.
       const top = region(
-        "unstaged",
-        unstaged,
-        l10n.t("Unstaged ({0})", unstaged.length),
-        l10n.t("Nothing left to stage."),
-      );
-      const bottom = region(
         "staged",
         staged,
         l10n.t("Staged ({0})", staged.length),
         l10n.t("Nothing staged yet."),
+      );
+      const bottom = region(
+        "unstaged",
+        unstaged,
+        l10n.t("Unstaged ({0})", unstaged.length),
+        l10n.t("Nothing left to stage."),
       );
       const applySplit = (): void => {
         top.box.style.flex = `${this.changesSplitPct} 1 0`;
@@ -7916,8 +7936,8 @@ class App {
       });
 
       lists.append(top.box, hsplit, bottom.box);
-      top.scroller.scrollTop = this.changesRegionScroll.unstaged;
-      bottom.scroller.scrollTop = this.changesRegionScroll.staged;
+      top.scroller.scrollTop = this.changesRegionScroll.staged;
+      bottom.scroller.scrollTop = this.changesRegionScroll.unstaged;
     }
     this.reconcileSelection(lists, selBar);
 
