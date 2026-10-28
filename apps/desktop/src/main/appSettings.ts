@@ -9,12 +9,33 @@
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { AppSettingsView, MavenDetected, MavenPaths, MavenScope, MavenSettingsView } from "../shared/ipc";
+import type { AppSettingsView, GradleDetected, GradlePaths, GradleScope, GradleSettingsView, MavenDetected, MavenPaths, MavenScope, MavenSettingsView } from "../shared/ipc";
 
 export const EMPTY_MAVEN: MavenPaths = { mavenHome: "", settings: "", localRepository: "", javaHome: "" };
 const MAVEN_KEYS = Object.keys(EMPTY_MAVEN) as Array<keyof MavenPaths>;
 
 type MavenProject = MavenPaths & { useWrapper?: boolean };
+export const EMPTY_GRADLE: GradlePaths = { gradleHome: "", userHome: "", javaHome: "" };
+const GRADLE_KEYS = Object.keys(EMPTY_GRADLE) as Array<keyof GradlePaths>;
+type GradleProject = GradlePaths & { useWrapper?: boolean };
+
+export function resolveGradlePaths(project: GradlePaths, global: GradlePaths, fallback: GradlePaths): GradlePaths {
+  const out = { ...EMPTY_GRADLE };
+  for (const key of GRADLE_KEYS) out[key] = project[key].trim() || global[key].trim() || fallback[key];
+  return out;
+}
+
+function gradlePaths(value: unknown): GradlePaths {
+  const r = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const out = { ...EMPTY_GRADLE };
+  for (const key of GRADLE_KEYS) out[key] = typeof r[key] === "string" ? r[key] as string : "";
+  return out;
+}
+
+function gradleProject(value: unknown): GradleProject {
+  const useWrapper = value && typeof value === "object" ? (value as Record<string, unknown>).useWrapper : undefined;
+  return typeof useWrapper === "boolean" ? { ...gradlePaths(value), useWrapper } : gradlePaths(value);
+}
 
 /** Field by field: the project's value, else the global one, else `fallback`
  *  (what was detected on this machine). */
@@ -54,6 +75,8 @@ interface Persisted {
   graphRefFilters?: Record<string, string[]>;
   mavenGlobal?: MavenPaths;
   mavenProjects?: Record<string, MavenProject>;
+  gradleGlobal?: GradlePaths;
+  gradleProjects?: Record<string, GradleProject>;
 }
 
 export class AppSettings {
@@ -120,6 +143,15 @@ export class AppSettings {
         if (projects && typeof projects === "object" && !Array.isArray(projects)) {
           data.mavenProjects = Object.fromEntries(
             Object.entries(projects).map(([root, value]) => [root, mavenProject(value)]),
+          );
+        }
+        if (r.gradleGlobal && typeof r.gradleGlobal === "object" && !Array.isArray(r.gradleGlobal)) {
+          data.gradleGlobal = gradlePaths(r.gradleGlobal);
+        }
+        const gradleProjects = r.gradleProjects;
+        if (gradleProjects && typeof gradleProjects === "object" && !Array.isArray(gradleProjects)) {
+          data.gradleProjects = Object.fromEntries(
+            Object.entries(gradleProjects).map(([root, value]) => [root, gradleProject(value)]),
           );
         }
       }
@@ -261,6 +293,40 @@ export class AppSettings {
       if (patch.useWrapper === null) delete next.useWrapper;
       else if (typeof patch.useWrapper === "boolean") next.useWrapper = patch.useWrapper;
       this.data.mavenProjects = { ...this.data.mavenProjects, [key]: next };
+    } else return;
+    await this.persist();
+  }
+
+  gradleSettings(root: string | undefined, detected: GradleDetected, wrapperAvailable = false): GradleSettingsView {
+    const global = gradlePaths(this.data.gradleGlobal);
+    const stored = root ? this.data.gradleProjects?.[resolve(root)] : undefined;
+    const project = root ? gradlePaths(stored) : undefined;
+    const useWrapper = stored?.useWrapper;
+    return {
+      global,
+      project,
+      detected,
+      effective: resolveGradlePaths(project ?? EMPTY_GRADLE, global, detected.paths),
+      wrapperAvailable,
+      useWrapper,
+      wrapper: wrapperAvailable && useWrapper !== false,
+    };
+  }
+
+  async setGradleSettings(
+    root: string | undefined,
+    scope: GradleScope,
+    patch: Partial<GradlePaths> & { useWrapper?: boolean | null },
+  ): Promise<void> {
+    const clean: Partial<GradlePaths> = {};
+    for (const key of GRADLE_KEYS) if (typeof patch[key] === "string") clean[key] = patch[key]!.trim();
+    if (scope === "global") this.data.gradleGlobal = { ...gradlePaths(this.data.gradleGlobal), ...clean };
+    else if (root) {
+      const key = resolve(root);
+      const next: GradleProject = { ...gradleProject(this.data.gradleProjects?.[key]), ...clean };
+      if (patch.useWrapper === null) delete next.useWrapper;
+      else if (typeof patch.useWrapper === "boolean") next.useWrapper = patch.useWrapper;
+      this.data.gradleProjects = { ...this.data.gradleProjects, [key]: next };
     } else return;
     await this.persist();
   }

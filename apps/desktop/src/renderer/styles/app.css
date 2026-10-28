@@ -13928,6 +13928,14 @@ body.vscode-light .repo-tab.is-active {
 
 /* Desktop Maven deployment. The log keeps its own scroll position while the
    modules and actions remain reachable in the page's outer scroll. */
+.deploy-page, .deploy-pane, .deploy-content { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; min-width: 0; }
+.deploy-tabs { display: flex; flex: none; gap: var(--sp-2); padding: var(--sp-3) var(--sp-6) 0; border-bottom: 1px solid var(--app-border); }
+.deploy-tab { border: 0; border-bottom: 2px solid transparent; padding: var(--sp-2) var(--sp-3); background: transparent; color: var(--app-muted); cursor: pointer; font: inherit; }
+.deploy-tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+.deploy-tab:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+.deploy-pane > .empty-state { margin: var(--sp-6); }
+.gradle-custom-row { display: flex; gap: var(--sp-2); }
+.gradle-custom-row .settings-input { min-width: 0; flex: 1; }
 .maven-page {
   flex: 1 1 auto;
   min-height: 0;

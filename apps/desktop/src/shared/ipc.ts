@@ -1774,6 +1774,52 @@ export interface MavenLogChunk {
   text: string;
 }
 
+/** Gradle paths inherit project → global → detected, independently. */
+export interface GradlePaths {
+  gradleHome: string;
+  userHome: string;
+  javaHome: string;
+}
+export interface GradleDetected {
+  paths: GradlePaths;
+  sources: Record<keyof GradlePaths, string>;
+}
+export interface GradleSettingsView {
+  global: GradlePaths;
+  project?: GradlePaths;
+  detected: GradleDetected;
+  effective: GradlePaths;
+  wrapperAvailable: boolean;
+  useWrapper?: boolean;
+  wrapper: boolean;
+}
+export type GradleScope = "global" | "project";
+export interface GradleModule {
+  name: string;
+  /** Gradle project path, e.g. ":app" or ":feature:login". */
+  path: string;
+  tasks: string[];
+  warning?: string;
+  children: GradleModule[];
+}
+export interface GradleTaskState {
+  root: string;
+  id: string;
+  goal: string;
+  status: "running" | "success" | "failed" | "stopped";
+  startedAt: number;
+  endedAt?: number;
+  exitCode?: number;
+  command: string;
+}
+export interface GradleLogChunk {
+  root: string;
+  id: string;
+  seq: number;
+  stream: "stdout" | "stderr" | "system";
+  text: string;
+}
+
 /** Connection state for the GitHub-backed views. */
 export interface GitHubStatus {
   connected: boolean;
@@ -2573,6 +2619,18 @@ export interface IpcChannels {
   "maven:logs": [void, MavenLogChunk[]];
   "maven:start": [{ goal: MavenGoal; paths: string[]; skipTests: boolean }, { ok: boolean; message?: string; expected?: boolean; state?: MavenTaskState }];
   "maven:stop": [void, boolean];
+  // ── Desktop Gradle deployment ──
+  "deploy:detect": [void, { maven: boolean; gradle: boolean }];
+  "gradle:modules": [void, GradleModule | undefined];
+  "gradle:settings": [{ scope: GradleScope }, GradleSettingsView];
+  "gradle:saveSettings": [{ scope: GradleScope; patch: Partial<GradlePaths> & { useWrapper?: boolean | null } }, GradleSettingsView];
+  "gradle:detect": [{ scope: GradleScope }, GradleSettingsView];
+  "gradle:pickPath": [{ kind: keyof GradlePaths }, string | undefined];
+  "gradle:test": [{ scope: GradleScope }, { ok: boolean; output: string }];
+  "gradle:state": [void, GradleTaskState | undefined];
+  "gradle:logs": [void, GradleLogChunk[]];
+  "gradle:start": [{ goal: string; paths: string[] }, { ok: boolean; message?: string; expected?: boolean; state?: GradleTaskState }];
+  "gradle:stop": [void, boolean];
   // ── Accounts (Explore profile pages) ──
   "users:repos": [string, OrgRepo[]];
   "users:orgs": [string, OrgInfo[]];
@@ -3059,6 +3117,8 @@ export interface IpcEvents {
   "terminal:exit": TerminalExit;
   "maven:log": MavenLogChunk;
   "maven:state": MavenTaskState;
+  "gradle:log": GradleLogChunk;
+  "gradle:state": GradleTaskState;
   /** Progress during an in-flight clone. */
   "clone:progress": CloneProgress;
   /** A git command the app ran — streamed to the terminal dock's Output tab. */

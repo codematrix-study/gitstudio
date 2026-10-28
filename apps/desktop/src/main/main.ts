@@ -45,6 +45,11 @@ import { launchPaths } from "./mavenCommand";
 import { mavenDetection, mavenWrapper } from "./mavenDetect";
 import type { MavenScope, MavenSettingsView } from "../shared/ipc";
 import { discoverMavenModules } from "./mavenModules";
+import { GradleBridge } from "./gradleBridge";
+import { gradleDetection, gradleWrapper } from "./gradleDetect";
+import { gradlePathsForLaunch } from "./gradleCommand";
+import { detectBuildManagers } from "./buildManagerDetect";
+import type { GradleScope, GradleSettingsView } from "../shared/ipc";
 import { MergeSettingsStore } from "./mergeSettings";
 import {
   visibleRepoFolders,
@@ -109,6 +114,7 @@ let rebase: RebaseBridge;
 let ai: AiBridge;
 let terminal: TerminalBridge;
 let maven: MavenBridge;
+let gradle: GradleBridge;
 
 /** Maven settings for a repository, or the global layer alone (no root). */
 async function mavenSettingsFor(root: string | undefined): Promise<MavenSettingsView> {
@@ -118,6 +124,12 @@ async function mavenSettingsFor(root: string | undefined): Promise<MavenSettings
 /** Settings ▸ Maven sees the global scope; Deploy's gear the open repository. */
 function mavenView(scope: MavenScope): Promise<MavenSettingsView> {
   return mavenSettingsFor(scope === "project" ? repos.current()?.root : undefined);
+}
+async function gradleSettingsFor(root: string | undefined): Promise<GradleSettingsView> {
+  return appSettings.gradleSettings(root, await gradleDetection(), !!root && !!gradleWrapper(root));
+}
+function gradleView(scope: GradleScope): Promise<GradleSettingsView> {
+  return gradleSettingsFor(scope === "project" ? repos.current()?.root : undefined);
 }
 /** Filesystem watcher for the open repo; re-created whenever the repo changes. */
 let repoWatcher: RepoWatcher | undefined;
@@ -350,6 +362,7 @@ async function createWindow(): Promise<void> {
   mainWindow.on("closed", () => {
     terminal?.killAll();
     maven?.stopAll();
+    gradle?.stopAll();
     // Nothing left to notify, and holding a recursive watch on a directory after
     // the window is gone is how a quit ends up waiting on the filesystem.
     repoWatcher?.dispose();
@@ -1276,6 +1289,53 @@ function registerIpc(): void {
     const root = repos.current()?.root;
     return root ? maven.stop(root) : false;
   });
+  handle("deploy:detect", async () => {
+    const root = repos.current()?.root;
+    return root ? detectBuildManagers(root) : { maven: false, gradle: false };
+  });
+  handle("gradle:modules", async () => {
+    const root = repos.current()?.root;
+    return root ? gradle.modules(root) : undefined;
+  });
+  handle("gradle:settings", async ({ scope }) => gradleView(scope));
+  handle("gradle:saveSettings", async ({ scope, patch }) => {
+    await appSettings.setGradleSettings(scope === "project" ? repos.current()?.root : undefined, scope, patch);
+    return gradleView(scope);
+  });
+  handle("gradle:detect", async ({ scope }) => {
+    await gradleDetection(true);
+    return gradleView(scope);
+  });
+  handle("gradle:pickPath", async ({ kind }) => {
+    const picked = await dialog.showOpenDialog({
+      title: kind === "gradleHome" ? l10n.t("Choose Gradle directory")
+        : kind === "userHome" ? l10n.t("Choose Gradle user home")
+        : l10n.t("Choose JAVA_HOME"),
+      properties: ["openDirectory"],
+    });
+    return picked.canceled ? undefined : picked.filePaths[0];
+  });
+  handle("gradle:test", async ({ scope }) => {
+    if (scope === "global") return gradle.test(undefined);
+    const root = repos.current()?.root;
+    return root ? gradle.test(root) : { ok: false, output: l10n.t("Open a repository first") };
+  });
+  handle("gradle:state", async () => {
+    const root = repos.current()?.root;
+    return root ? gradle.state(root) : undefined;
+  });
+  handle("gradle:logs", async () => {
+    const root = repos.current()?.root;
+    return root ? gradle.logSnapshot(root) : [];
+  });
+  handle("gradle:start", async ({ goal, paths }) => {
+    const root = repos.current()?.root;
+    return root ? gradle.start(root, goal, paths) : { ok: false, expected: true, message: l10n.t("Open a repository first") };
+  });
+  handle("gradle:stop", async () => {
+    const root = repos.current()?.root;
+    return root ? gradle.stop(root) : false;
+  });
   handle("update:check", async () =>
     updates
       ? updates.check(true)
@@ -1632,9 +1692,17 @@ async function boot(): Promise<void> {
     if (event === "maven:log") send("maven:log", data as IpcEvents["maven:log"]);
     else send("maven:state", data as IpcEvents["maven:state"]);
   });
+  gradle = new GradleBridge(async (root) => {
+    const view = await gradleSettingsFor(root);
+    return { paths: gradlePathsForLaunch(view), wrapper: root && view.wrapper ? gradleWrapper(root) : undefined };
+  }, (event, data) => {
+    if (event === "gradle:log") send("gradle:log", data as IpcEvents["gradle:log"]);
+    else send("gradle:state", data as IpcEvents["gradle:state"]);
+  });
   // Detection asks the login shell once (~100 ms+); start it now so Settings
   // and Deploy open on a warm cache.
   void mavenDetection();
+  void gradleDetection();
   // Settings ▸ Merge, persisted by this process in userData.
   mergeSettings = await MergeSettingsStore.load(app.getPath("userData"));
   bridge = new GitBridge(

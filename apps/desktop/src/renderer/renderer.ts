@@ -151,8 +151,9 @@ import { renderExplore } from "./views/explore";
 import { parseRepoRoute, repoRouteId, searchTargetId } from "./exploreRoutes";
 import { renderOrgs, setPeekNav } from "./views/orgs";
 import { renderProjects } from "./views/projects";
-import { renderMavenDeploy } from "./views/mavenDeploy";
+import { renderDeploy } from "./views/deploy";
 import { mavenSettingsCard } from "./views/mavenSettingsCard";
+import { gradleSettingsCard } from "./views/gradleSettingsCard";
 import { renderGists } from "./views/gists";
 import { renderRepositories } from "./views/repositories";
 import { renderDashboard } from "./views/dashboard";
@@ -2038,7 +2039,7 @@ class App {
     } else if (id === "changes") {
       void this.showChangesView();
     } else if (id === "deploy") {
-      this.mountSection(renderMavenDeploy);
+      this.mountSection(renderDeploy);
     } else if (id === "compare") {
       void this.showCompareView();
     } else if (id === "rebase") {
@@ -5664,6 +5665,7 @@ class App {
       editorsCard(),
       mergeSettingsCard(),
       mavenSettingsCard(),
+      gradleSettingsCard(),
       aiModelsCard(),
       agentAccessCard(),
       this.settingsIdentityCard(),

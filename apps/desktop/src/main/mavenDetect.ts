@@ -171,7 +171,7 @@ export function detectMaven(d: MavenDetectDeps): MavenDetected {
 // ── The OS-touching half ────────────────────────────────────────────────────
 
 const MARK = "__GITSTUDIO_ENV__";
-const SHELL_KEYS = new Set(["PATH", "MAVEN_HOME", "M2_HOME", "JAVA_HOME"]);
+const SHELL_KEYS = new Set(["PATH", "MAVEN_HOME", "M2_HOME", "GRADLE_HOME", "GRADLE_USER_HOME", "JAVA_HOME"]);
 
 /** The variables Maven detection reads, out of `env` printed between marks
  *  (anything an rc file prints around them is ignored). */
@@ -197,7 +197,7 @@ function run(command: string, args: string[]): Promise<string | undefined> {
   });
 }
 
-async function loginShellEnv(): Promise<NodeJS.ProcessEnv> {
+export async function loginShellEnv(): Promise<NodeJS.ProcessEnv> {
   if (process.platform === "win32") return {};
   const out = await run(process.env.SHELL || "/bin/sh", ["-ilc", `echo ${MARK}; env; echo ${MARK}`]);
   return out ? parseShellEnv(out) : {};
