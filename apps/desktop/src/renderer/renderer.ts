@@ -285,7 +285,7 @@ class App {
   private changesOpenKey?: string;
   private changesScroll = 0;
   /** Split model: each region scrolls on its own, so each keeps its own place. */
-  private changesRegionScroll: Record<"staged" | "unstaged", number> = { staged: 0, unstaged: 0 };
+  private changesRegionScroll: Record<"tracked" | "untracked", number> = { tracked: 0, untracked: 0 };
   /**
    * The conflicts dashboard's controller. App-lifetime, not view-lifetime: the
    * Changes view is rebuilt on every repaint, and the outcome of a Continue,
@@ -608,8 +608,8 @@ class App {
   private railCollapsed = false;
   /** Changes view: persisted width (px) of the file list pane. */
   private changesListW = 340;
-  /** Changes view, split model: the share (%) of the list height the Staged
-   *  region gets; Unstaged takes the rest. Persisted. */
+  /** Changes view, split model: the share (%) of the list height the tracked
+   *  region gets; untracked files take the rest. Persisted. */
   private changesSplitPct = 60;
   private railEl?: HTMLElement;
   private railToggleEl?: HTMLElement;
@@ -7833,78 +7833,70 @@ class App {
       // diff away on every tick, in the one model whose whole interaction is
       // "tick boxes while reading the diff".
     } else {
-      // TWO REGIONS: what this commit includes on top, what is still to stage
-      // below, each with its own header and scroll and a divider between them.
+      // TWO REGIONS: tracked changes above, untracked files below. A tracked
+      // file can have staged and unstaged parts, so its two rows remain separate
+      // inside the upper region and show exactly what the commit will include.
       //
-      // Both regions are always present — an empty one says so — so the layout
-      // does not jump as files move from one side to the other.
+      // Keep both headers visible, but let an empty region shrink so its blank
+      // scroll area does not take half the view.
       lists.classList.add("is-split");
       const region = (
-        kind: "staged" | "unstaged",
+        kind: "tracked" | "untracked",
         items: ChangedFile[],
         title: string,
-        empty: string,
       ): { box: HTMLElement; scroller: HTMLElement } => {
         const box = el("div", `dc-region dc-region-${kind}`);
-        const head = this.sectionHeader(title, kind, items, lists, selBar);
+        const head = this.sectionHeader(title, items, lists, selBar);
         head.classList.add("dc-region-head");
-        head.appendChild(span(
-          kind === "staged" ? l10n.t("Included in the commit") : l10n.t("Not included"),
-          "dc-region-hint",
-        ));
+        if (kind === "untracked") head.appendChild(span(l10n.t("Not included"), "dc-region-hint"));
         const scroller = el("div", "dc-region-body");
-        if (items.length) {
-          if (kind === "unstaged") {
-            const changed = items.filter((f) => f.status !== "?");
-            const untracked = items.filter((f) => f.status === "?");
-            if (changed.length) {
-              const label = groupLabel(l10n.t("Changed files"));
-              label.classList.add("dc-region-subhead");
-              scroller.appendChild(label);
-              changed.forEach((f) => scroller.appendChild(fileRow(f, kind)));
-            }
-            if (untracked.length) {
-              const label = groupLabel(l10n.t("untracked"));
-              label.classList.add("dc-region-subhead");
-              scroller.appendChild(label);
-              untracked.forEach((f) => scroller.appendChild(fileRow(f, kind)));
-            }
-          } else {
-            items.forEach((f) => scroller.appendChild(fileRow(f, kind)));
+        if (kind === "tracked") {
+          const stagedTracked = items.filter((f) => f.staged);
+          const unstagedTracked = items.filter((f) => !f.staged);
+          for (const [group, label, hint] of [
+            [stagedTracked, l10n.t("Staged ({0})", stagedTracked.length), l10n.t("Included in the commit")],
+            [unstagedTracked, l10n.t("Unstaged ({0})", unstagedTracked.length), l10n.t("Not included")],
+          ] as const) {
+            if (group.length === 0) continue;
+            const subhead = groupLabel(label);
+            subhead.classList.add("dc-region-subhead");
+            subhead.appendChild(span(hint, "dc-region-hint"));
+            scroller.appendChild(subhead);
+            group.forEach((f) => scroller.appendChild(fileRow(f, f.staged ? "staged" : "unstaged")));
           }
-        } else scroller.appendChild(span(empty, "dc-region-empty"));
+        } else {
+          items.forEach((f) => scroller.appendChild(fileRow(f, "unstaged")));
+        }
         scroller.addEventListener("scroll", () => {
           this.changesRegionScroll[kind] = scroller.scrollTop;
         });
         box.append(head, scroller);
         return { box, scroller };
       };
-      // "Changes" already names the view and the pane; this group is the
-      // UNSTAGED half, and calling it "Changes" beside "Staged" made the two
-      // read as unrelated rather than as a pair.
+      const tracked = files.filter((f) => f.status !== "?");
+      const untracked = files.filter((f) => f.status === "?");
       const top = region(
-        "staged",
-        staged,
-        l10n.t("Staged ({0})", staged.length),
-        l10n.t("Nothing staged yet."),
+        "tracked",
+        tracked,
+        `${l10n.t("Changed files")} (${new Set(tracked.map((f) => f.path)).size})`,
       );
       const bottom = region(
-        "unstaged",
-        unstaged,
-        l10n.t("Unstaged ({0})", unstaged.length),
-        l10n.t("Nothing left to stage."),
+        "untracked",
+        untracked,
+        `${l10n.t("untracked")} (${untracked.length})`,
       );
       const applySplit = (): void => {
-        top.box.style.flex = `${this.changesSplitPct} 1 0`;
-        bottom.box.style.flex = `${100 - this.changesSplitPct} 1 0`;
+        top.box.style.flex = tracked.length === 0 ? "0 0 auto" : untracked.length === 0 ? "1 1 0" : `${this.changesSplitPct} 1 0`;
+        bottom.box.style.flex = untracked.length === 0 ? "0 0 auto" : tracked.length === 0 ? "1 1 0" : `${100 - this.changesSplitPct} 1 0`;
       };
       applySplit();
 
       const hsplit = el("div", "dc-hsplit");
+      if (tracked.length === 0 || untracked.length === 0) hsplit.style.display = "none";
       hsplit.append(el("div", "dc-hsplit-grip"));
       wireResizerKeys(hsplit, {
         orientation: "horizontal",
-        label: l10n.t("Resize staged and unstaged lists"),
+        label: l10n.t("Resize file list"),
         min: 15,
         max: () => 85,
         step: 5,
@@ -7936,8 +7928,8 @@ class App {
       });
 
       lists.append(top.box, hsplit, bottom.box);
-      top.scroller.scrollTop = this.changesRegionScroll.staged;
-      bottom.scroller.scrollTop = this.changesRegionScroll.unstaged;
+      top.scroller.scrollTop = this.changesRegionScroll.tracked;
+      bottom.scroller.scrollTop = this.changesRegionScroll.untracked;
     }
     this.reconcileSelection(lists, selBar);
 
@@ -8550,7 +8542,6 @@ class App {
    */
   private sectionHeader(
     text: string,
-    kind: "staged" | "unstaged",
     files: readonly ChangedFile[],
     lists: HTMLElement,
     selBar: HTMLElement,
@@ -8560,7 +8551,7 @@ class App {
     head.addEventListener("click", (ev) => {
       if (!(ev.ctrlKey || ev.metaKey)) return;
       ev.preventDefault();
-      const keys = files.map((f) => rowKey(kind, f.path));
+      const keys = files.map((f) => rowKey(f.staged ? "staged" : "unstaged", f.path));
       const allOn = keys.length > 0 && keys.every((k) => this.selectedRows.has(k));
       for (const k of keys) {
         if (allOn) this.selectedRows.delete(k);
